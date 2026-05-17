@@ -1,0 +1,24 @@
+# PHP 8.5 + Rust toolchain image used by `make test-docker`. Mirrors the CI matrix's
+# Linux side closely enough to catch portability bugs that macOS smoke tests miss.
+FROM php:8.5-cli-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        clang \
+        curl \
+        git \
+        libclang-dev \
+        libssl-dev \
+        pkg-config \
+        unzip \
+    && apt-get clean -qq \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sS https://getcomposer.org/installer \
+        | php -- --install-dir=/usr/local/bin --filename=composer
+
+# Pinned via rust-toolchain.toml in the project root — only install stable here.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app

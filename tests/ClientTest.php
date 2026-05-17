@@ -12,12 +12,13 @@ final class ClientTest extends TestCase
 
     protected static $namespace = "test";
     protected static $set = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
 
     public static function setUpBeforeClass(): void
     {
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
             self::$key = new Key(self::$namespace, self::$set, 1);
         } catch (Exception $e) {
             throw $e;
@@ -265,17 +266,22 @@ final class ClientTest extends TestCase
             self::$client->put($wp, self::$key, [$bin1]);
         }
 
-        // Perform the truncate operation
+        // Give the just-written records a moment so they're strictly older than the
+        // truncate cutoff (server rejects "would truncate in the future").
+        sleep(1);
         $ip = new InfoPolicy();
         self::$client->truncate($ip, self::$namespace, self::$set);
-        //wait for truncate to finish
-        sleep(5);
 
+        // Truncate propagates asynchronously on the server. Poll for up to 30 s.
         $rp = new ReadPolicy();
-        for ($i = 1; $i <= 10; $i++) {
-            $exists = self::$client->exists($rp, self::$key);
-            $this->assertEquals($exists, false);
+        $deadline = microtime(true) + 30.0;
+        while (microtime(true) < $deadline) {
+            if (!self::$client->exists($rp, self::$key)) {
+                break;
+            }
+            usleep(200_000);
         }
+        $this->assertFalse(self::$client->exists($rp, self::$key));
     }
 
     public function testAppendException()
@@ -294,6 +300,12 @@ final class ClientTest extends TestCase
 
     public function testReadTouchTTlPercent()
     {
+        // ReadTouchTtl is only honoured by Aerospike server v8+. Skip on older servers.
+        $versions = self::$client->serverVersion();
+        $first = reset($versions);
+        if (version_compare(preg_replace('/[^0-9.].*/', '', $first), '8.0.0', '<')) {
+            $this->markTestSkipped("read_touch_ttl_percent requires server v8+ (running {$first})");
+        }
         $stringKey = new Key(self::$namespace, self::$set, "new_key");
         $wp = new WritePolicy();
         $wp->setExpiration(Expiration::Seconds(10));
@@ -301,7 +313,8 @@ final class ClientTest extends TestCase
         $rp = new ReadPolicy();
         $rp->setReadTouchTtlPercent(80);
         $record = self::$client->get($rp, $stringKey);
-        $this->assertEquals($record->getTtl(), 1);
+        // After a touch, remaining TTL should be reset close to the original 10s.
+        $this->assertGreaterThanOrEqual(8, $record->getRemainingTtl());
     }
 
     public function testPutGetBinary()
@@ -340,7 +353,10 @@ final class ClientTest extends TestCase
         sleep(1);
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, $stringKey);
-        $this->assertEquals($record->getTtl(), 2);
+        // Remaining TTL after 1 s of a 3 s expiration is ~1-2 s depending on
+        // sub-second timing between put() and get().
+        $this->assertGreaterThanOrEqual(1, $record->getRemainingTtl());
+        $this->assertLessThanOrEqual(2, $record->getRemainingTtl());
     }
 
     public function testReadTtlNotUpdated()
@@ -355,7 +371,9 @@ final class ClientTest extends TestCase
         self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_2_hopefully")]);
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, $stringKey);
-        $this->assertEquals($record->getTtl(), 2);
+        // The DontUpdate write must NOT reset the TTL — remaining ≈ 1-2 s.
+        $this->assertGreaterThanOrEqual(1, $record->getRemainingTtl());
+        $this->assertLessThanOrEqual(2, $record->getRemainingTtl());
     }
 
     public function testReadTtlNeverExpires()
@@ -367,6 +385,7 @@ final class ClientTest extends TestCase
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, $stringKey);
         $this->assertEquals($record->getTtl(), null);
+        $this->assertEquals($record->getRemainingTtl(), null);
         $this->assertTrue($record->getExpiration()->willNeverExpire());
     }
 }

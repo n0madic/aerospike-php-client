@@ -1,7 +1,7 @@
 #!/bin/zsh -m
 # Aerospike PHP8 install and build script for MacOS (darwin)
 
-set +e
+set -e
 
 SCRIPT_PATH="${0:A:h}"
 PROJ_FOLDER="php-client"
@@ -92,6 +92,27 @@ else
 fi
 
 
+#install OpenSSL (libssl) via Homebrew — required by aerospike-client-rust TLS feature.
+if ! brew list openssl >/dev/null 2>&1; then
+  printf 'openssl was not installed.  Installing openssl...\n'
+  brew install openssl
+  wait
+else
+  printf 'openssl was already installed!\n'
+fi
+
+
+#install pkg-config (required by openssl-sys) via Homebrew, if needed
+which -s pkg-config
+if [[ $? != 0 ]] ; then
+  printf 'pkg-config was not installed.  Installing pkg-config...\n'
+  brew install pkg-config
+  wait
+else
+  printf 'pkg-config was already installed!\n'
+fi
+
+
 #install latest rustup via Homebrew, if needed
 which -s rustup
 if [[ $? != 0 ]] ; then
@@ -141,45 +162,13 @@ if ! cat ~/.cargo/config.toml | grep -q 'aarch64'; then
 fi
 
 
-#Install go and fix up env (zsh example shown), if needed:
-which -s go
-if [[ $? != 0 ]] ; then
-  printf 'go was not installed.  Installing go...\n'
-  brew install go
-  wait
-  echo 'export PATH="$PATH:$(go env GOPATH)/bin"' >> ~/.zshrc
-  source ~/.zshrc
-else
-  printf 'go was already installed!\n'
-fi
-
-
-# Install protocol buffer compiler & plugins & latest grpc package
-cd aerospike-connection-manager
-brew install protobuf
-wait
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-wait
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-wait
-go get -u google.golang.org/grpc
-wait
-go get github.com/aerospike/aerospike-client-go/v7@v7.9.0
-wait
-source ~/.zshrc
+# v2 (native client) no longer requires Go or protoc — the Rust extension
+# talks to Aerospike directly via the official aerospike-client-rust crate.
 
 
 #Build & install PHP client
-cd ..
-make
-#build and run the ACM
-cd aerospike-connection-manager
 make
 
 echo "Installation complete!"
 
-# TODO:
-# configure your Aerospike Server in php-client/aerospike-connection-manager/asld.toml
-# Once configured, run the ACM again with:
-# cd php-client/aerospike-connection-manager
-# make run
+# Configure your Aerospike connection in your PHP code via Client::connect(hosts, policy)

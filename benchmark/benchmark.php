@@ -8,11 +8,12 @@ class AerospikeBenchmark {
     protected static $client;
     protected static $namespace = "test";
     protected static $set = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
 
     public static function setUpBeforeClass(): void {
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
         } catch (\Exception $e) {
             throw $e;
         }

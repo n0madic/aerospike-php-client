@@ -11,9 +11,9 @@ use Aerospike\Statement;
 use Aerospike\IndexType;
 
 
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 // Establish connection to Aerospike server
-$client = Client::connect($socket);
+$client = Client::connect($hosts);
 
 // Define namespace and set
 $namespace = "test";
@@ -59,9 +59,9 @@ $queryResultSet = $client->query($queryPolicy, $pf, $statement);
 // Iterate over the query results
 while ($record = $queryResultSet->next()) {
     // Access bin values of each product
-    $productName = $record->bins["name"];
-    $productPrice = $record->bins["price"];
-    $productStock = $record->bins["stock"];
+    $productName = $record->getBins()["name"];
+    $productPrice = $record->getBins()["price"];
+    $productStock = $record->getBins()["stock"];
     
     // Display retrieved product data
     echo "Product: $productName, Price: $productPrice, Stock: $productStock\n";

@@ -1,9 +1,21 @@
-<testsuites>
-    <testsuite name="security_tests">
-        <file>tests/SecurityTest.php</file>
-    </testsuite>
-    <testsuite name="non_security_tests">
-        <directory>tests/*</directory>
-        <exclude>tests/SecurityTest.php</exclude>
-    </testsuite>
-</testsuites>
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/9.5/phpunit.xsd"
+         colors="true"
+         beStrictAboutOutputDuringTests="false"
+         failOnWarning="true">
+    <testsuites>
+        <testsuite name="security_tests">
+            <file>tests/SecurityTest.php</file>
+        </testsuite>
+        <testsuite name="non_security_tests">
+            <directory>tests</directory>
+            <directory>tests/CdtTests</directory>
+            <directory>tests/QueryAndScanTests</directory>
+            <exclude>tests/SecurityTest.php</exclude>
+        </testsuite>
+    </testsuites>
+    <php>
+        <env name="AEROSPIKE_HOSTS" value="127.0.0.1:3000"/>
+    </php>
+</phpunit>

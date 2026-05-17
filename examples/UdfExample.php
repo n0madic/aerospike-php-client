@@ -4,10 +4,10 @@ namespace Aerospike;
 
 $namespace = "test";
 $set = "test";
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
-$client = Client::connect($socket);
-echo "* Connected to the local aerospike-connection-manager: $client->socket \n";
+$client = Client::connect($hosts);
+echo "* Connected to Aerospike: $client->getHosts() \n";
 
 
 $udfBody = 'function testFunc1(rec, div)
@@ -48,7 +48,7 @@ usleep(300000);
 echo "\n Get record result: ";
 $rp = new ReadPolicy();
 $rec = $client->get($rp, $key);
-var_dump($rec->bins);
+var_dump($rec->getBins());
 
 //list all udf
 $listUdf = $client->listUdf($rp);

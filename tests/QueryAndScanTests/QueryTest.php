@@ -20,7 +20,7 @@ class QueryTest extends TestCase
 
     protected static $client;
     protected static $namespace = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
     protected static $keyCount = 1000;
     protected static $set = "queryTestSet";
     protected static $keys = [];
@@ -32,7 +32,8 @@ class QueryTest extends TestCase
     public static function setUpBeforeClass(): void
     {
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
         } catch (AerospikeException $e) {
             throw $e;
         }
@@ -54,7 +55,7 @@ class QueryTest extends TestCase
 
         for ($i = 0; $i < self::$keyCount; $i++) {
             $key = new Key(self::$namespace, self::$set, self::randomString(random_int(1, 50) + $i));
-            $keyString = $key->digest;
+            $keyString = $key->getDigest();
             self::$keys[$keyString] = $key;
 
             self::$bins[7] = new Bin("AerospikeBin7", $i % 3);
@@ -93,10 +94,10 @@ class QueryTest extends TestCase
     {
         $counter = 0;
         while ($rec = $recordSet->next()) {
-            $keyString = $rec->key->digest;
+            $keyString = $rec->getKey()->getDigest();
 
-            $this->assertEquals($rec->bins['AerospikeBin1'], 46);
-            $this->assertEquals($rec->bins['AerospikeBin2'], "randomString12");
+            $this->assertEquals($rec->getBins()['AerospikeBin1'], 46);
+            $this->assertEquals($rec->getBins()['AerospikeBin2'], "randomString12");
             unset(self::$keys[$keyString]);
 
             $counter++;
@@ -135,10 +136,10 @@ class QueryTest extends TestCase
         $recordSet = self::$client->query($qp, $pf, $statement);
         $counter = 0;
         while ($rec = $recordSet->next()) {
-            $keyString = $rec->key->digest;
+            $keyString = $rec->getKey()->getDigest();
 
-            $this->assertEquals($rec->bins['AerospikeBin1'], 46);
-            $this->assertEquals($rec->bins['AerospikeBin2'], "randomString12");
+            $this->assertEquals($rec->getBins()['AerospikeBin1'], 46);
+            $this->assertEquals($rec->getBins()['AerospikeBin2'], "randomString12");
             unset(self::$keys[$keyString]);
 
             $counter++;
@@ -210,7 +211,7 @@ class QueryTest extends TestCase
         $recordSet = self::$client->query($qp, $pf, $statement);
         $counter = 0;
         while ($rec = $recordSet->next()) {
-            $this->assertNotNull($rec->bins['AerospikeBin3']);
+            $this->assertNotNull($rec->getBins()['AerospikeBin3']);
             $counter++;
         }
         $this->assertGreaterThan(0, $counter);
@@ -230,7 +231,7 @@ class QueryTest extends TestCase
         $recordSet = self::$client->query($qp, $pf, $statement);
         $counter = 0;
         while ($rec = $recordSet->next()) {
-            $this->assertNotNull($rec->bins['AerospikeBin3']);
+            $this->assertNotNull($rec->getBins()['AerospikeBin3']);
             $counter++;
         }
         $this->assertGreaterThan(0, $counter);

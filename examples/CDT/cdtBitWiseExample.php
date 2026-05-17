@@ -2,11 +2,11 @@
 
 namespace Aerospike;
 
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 $namespace = "test";
 $set = "test-bit";
 
-$client = Client::connect($socket);
+$client = Client::connect($hosts);
 $key = new Key($namespace, $set, "key-bit");
 $ip = new InfoPolicy();
 $client->truncate($ip, $namespace, $set);
@@ -25,7 +25,7 @@ $client->put($wp, $key, $bins);
 $rp = new ReadPolicy();
 $record = $client->get($rp, $key);
 echo "Record Before: ";
-var_dump($record->bins["bitBin"]);
+var_dump($record->getBins()["bitBin"]);
 echo "\n";
 
 $bwp = new BatchWritePolicy();
@@ -36,5 +36,5 @@ $client->batch($bp, [$batchWrite]);
 
 $record = $client->get($rp, $key);
 echo "Record After: ";
-var_dump($record->bins["bitBin"]);
+var_dump($record->getBins()["bitBin"]);
 echo "\n";

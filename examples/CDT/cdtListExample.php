@@ -2,11 +2,11 @@
 
 namespace Aerospike;
 
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 $namespace = "test";
 $set = "test";
 
-$client = Client::connect($socket);
+$client = Client::connect($hosts);
 $key = new Key($namespace, $set, 1);
 $ip = new InfoPolicy();
 $client->truncate($ip, $namespace, $set);
@@ -25,7 +25,7 @@ for ($i = 1; $i <= 10; $i++) {
 usleep(100000);
 $rp = new ReadPolicy();
 $record = $client->get($rp, $key);
-var_dump($record->bins);
+var_dump($record->getBins());
 
 $listOp = ListOp::getByIndexRange("listBin", 1);
 $opsGetSize = [$listOp]; 

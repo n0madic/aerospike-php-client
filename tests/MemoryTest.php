@@ -10,11 +10,12 @@ final class MemoryTest extends TestCase
 
     protected static string $namespace = 'test';
     protected static string $set = 'test';
-    protected static string $socket = '/tmp/asld_grpc.sock';
+    protected static string $hosts = '';
 
     public static function setUpBeforeClass(): void
     {
-        self::$client = Client::connect(self::$socket);
+        self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+        self::$client = Client::connect(self::$hosts);
     }
 
     public function testBlobOnPut(): void

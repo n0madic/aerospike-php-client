@@ -7,7 +7,7 @@ use PHPUnit\Framework\TestCase;
 class UdfTest extends TestCase{
     protected static $client;
     protected static $namespace = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
     protected static $set;
     protected static $key;
     protected static $udfBody = 'function testFunc1(rec, div)
@@ -26,7 +26,8 @@ end';
     public static function setUpBeforeClass(): void
     {
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
         } catch (AerospikeException $e) {
             throw $e;
         }
@@ -58,8 +59,8 @@ end';
 
         $rp = new ReadPolicy();
         $rec = self::$client->get($rp, self::$key);
-        $this->assertEquals($rec->bins["bin2"], 10);
-        $this->assertEquals($rec->bins["bin1"], 20);
+        $this->assertEquals($rec->getBins()["bin2"], 10);
+        $this->assertEquals($rec->getBins()["bin1"], 20);
     }
 
     public function testListAllUdf(){

@@ -1,34 +1,43 @@
-# Aerospike PHP Client Package
+# Aerospike PHP Client — distribution packages
 
-This package contains Aerospike PHP client library installers for development
-and runtime.
-Version - 1.0.2
+This directory contains the templates the CI uses to assemble `.deb` and `.rpm`
+artefacts of the Aerospike PHP client library.
 
 ## Contents
 
-* aerospike-php-client-<version>-<arch>
-  Aerospike php client library
-
-## Prerequisites
-
-The following are the prerequistes for the PHP client library.
-1. Go v1.20.0 or newer
-2. PHP v8.0.0 or newer
-
-## Installation
-
-When the .deb or .rpm package is installed the php library (libaerospike.so) will be placed in the php extensions directory. The aerospike connection manager binary (asld) will be placed in /usr/bin/ by default. The config file (asld.toml) for the Aerospike connection manager will be placed /etc/ by default. 
-
-On succesful installation to run the aerospike connection manager run the following command:
-```bash
-asld -config-file <path-to-config-file>
+```
+pkg/
+├── deb/
+│   ├── control            # debian package metadata; @VERSION@ is substituted in CI
+│   └── scripts/postinst   # install hook: copy .so into PHP ext dir + add extension= line
+└── rpm/
+    ├── aerospike-php-client.spec
+    └── scripts/postinst
 ```
 
-### Architecture Support 
+Starting with v2.0.0 the package no longer ships the Go-based
+`aerospike-connection-manager` daemon — there is just one file in the payload:
+`libaerospike_php.so`, the native Rust extension.
 
-| Package Name                          	| Architecture 	| Supported Distros                               |
-|-----------------------------------------------|---------------|--------------------------------------|
-| aerospike-php-client_1.0.2_arm64.deb 		| arm64        	| debian10, debian11, debian12, ubuntu20.04, ubuntu22.04 |
-| aerospike-php-client_1.0.2_x86_64.deb 	| amd64        	| debian10, debian11, debian12, ubuntu20.04, ubuntu22.04 |
-| aerospike-php-client-1.0.2-1.noarch.rpm 	| noarch    	| el8, el9, amzn2023                              |
+## Prerequisites for installation
 
+* PHP 8.1 – 8.5 (with the matching `php-dev` headers if installing from source).
+
+## Built artefacts (built by `.github/workflows/build.yml`)
+
+| Package name                                  | Architecture | Distros                                                 |
+|-----------------------------------------------|--------------|---------------------------------------------------------|
+| `aerospike-php-client-<version>-x86_64.deb`   | amd64        | debian10–12, ubuntu20.04–24.04                          |
+| `aerospike-php-client-<version>-aarch64.deb`  | arm64        | debian11–12, ubuntu22.04–24.04                          |
+| `aerospike-php-client-<version>-1.noarch.rpm` | noarch       | el8, el9, amzn2023                                      |
+
+## Installing locally (deb)
+
+```shell
+sudo dpkg -i aerospike-php-client-2.0.0-x86_64.deb
+php -m | grep aerospike_php   # should print: aerospike_php
+```
+
+The `postinst` hook copies the `.so` into the active PHP extension directory
+and appends `extension=libaerospike_php.so` to the loaded `php.ini` if it
+isn't already present.

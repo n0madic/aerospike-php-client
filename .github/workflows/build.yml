@@ -6,109 +6,108 @@ on:
 
 jobs:
   build-php-client:
-    runs-on: ubuntu-latest
-    container: golang:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            cpu_arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            cpu_arch: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Check Go Version
-        run: |
-          go version
-          export GOPATH=$HOME/go
-          export PATH=$PATH:$GOPATH/bin
-          export PATH=$PATH:$GOPATH/bin:/usr/local/go/bin
-      - name: Install Go Dependencies
-        run: |
-          apt-get update
-          apt-get install -y protobuf-compiler
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-      - name: Stable with rustfmt and clippy
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
         with:
-          profile: minimal
-          toolchain: stable
-          components: rustfmt, clippy
+          fetch-depth: 0
 
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          . "$HOME/.cargo/env"
-          rustc --version
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-            php-version: '8.2'
-      - name: Check php Version
+          php-version: '8.3'
+
+      - name: Install build prerequisites
         run: |
-          php --version
-      - name: Install other dependencies
-        run: |
-          apt-get install -y clang
-          export LIBCLANG_PATH="/usr/lib/llvm-14/lib/"
-          apt-get install -y php-dev
-          apt-get install -y rpm
-      - name: Checkout aerospike php client
-        uses: actions/checkout@v4
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            php-dev \
+            rpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          repository: 'aerospike/php-client'
-          ref: 'main'
-      - name: Build Aerospike connection manager
-        run: |
-          git config --global --add safe.directory '*'
-          cd aerospike-connection-manager
-          make clean
-          make proto
-          make build
-      - name: Build aerospike php client library
-        run: |
-          ls
-          cargo build --release
+          components: rustfmt, clippy
+
+      - name: Build Aerospike PHP client library
+        run: cargo build --release
+
       - name: Fetch tags
         run: git fetch --tags
-
-      - name: List tags
-        run: git tag
 
       - name: Get latest tag
         id: get_tag
         run: |
-          latest_tag=$(git describe --tags --abbrev=0 | sed 's/v//')
-          if [ -z "$latest_tag" ]; then
-            echo "::set-output name=tag::1.1.0"
-          else
-            echo "::set-output name=tag::$latest_tag"
-          fi
+          latest_tag=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/v//') || latest_tag="2.0.0"
+          echo "tag=${latest_tag:-2.0.0}" >> "$GITHUB_OUTPUT"
 
-      - name: Replace version in control file
-        run: sed -i "s/@VERSION@/${{ steps.get_tag.outputs.tag }}/g" pkg/deb/control
-
-      - name: Package for deb
+      - name: Substitute placeholders in deb control
         run: |
-          mkdir -p pkg/deb/aerospike-php-client-deb
+          sed -i "s/@VERSION@/${{ steps.get_tag.outputs.tag }}/g" pkg/deb/control
+          sed -i "s/@ARCH@/${{ matrix.deb_arch }}/g" pkg/deb/control
+
+      - name: Package for deb (${{ matrix.deb_arch }})
+        run: |
           mkdir -p pkg/deb/aerospike-php-client-deb/DEBIAN
-          mkdir -p pkg/deb/aerospike-php-client-deb/etc
-          mkdir -p pkg/deb/aerospike-php-client-deb/usr/bin
           mkdir -p pkg/deb/aerospike-php-client-deb/usr/lib
 
-          cp aerospike-connection-manager/asld pkg/deb/aerospike-php-client-deb/usr/bin
-          cp aerospike-connection-manager/asld.toml pkg/deb/aerospike-php-client-deb/etc
           cp target/release/libaerospike_php.so pkg/deb/aerospike-php-client-deb/usr/lib
 
           cp pkg/deb/control pkg/deb/aerospike-php-client-deb/DEBIAN/
           cp pkg/deb/scripts/postinst pkg/deb/aerospike-php-client-deb/DEBIAN/
 
           dpkg-deb --build pkg/deb/aerospike-php-client-deb
-          cp pkg/deb/aerospike-php-client-deb.deb pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-x86_64.deb
-          cp pkg/deb/aerospike-php-client-deb.deb pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-aarch64.deb
-          ls pkg/deb/
-          rm -rf pkg/deb/aerospike-php-client-deb*
-      - name: Move DEB x86_64 to artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: aerospike-php-client-deb-x86_64
-          path: pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-x86_64.deb
+          mv pkg/deb/aerospike-php-client-deb.deb \
+             pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-${{ matrix.cpu_arch }}.deb
 
-      - name: Move DEB aarch64 to artifacts
+      - name: Upload DEB ${{ matrix.cpu_arch }} artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aerospike-php-client-deb-aarch64
-          path: pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-aarch64.deb
+          name: aerospike-php-client-deb-${{ matrix.cpu_arch }}
+          path: pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-${{ matrix.cpu_arch }}.deb
+
+      - name: Package for rpm (${{ matrix.rpm_arch }})
+        run: |
+          version="${{ steps.get_tag.outputs.tag }}"
+          rpm_arch="${{ matrix.rpm_arch }}"
+          src_root="${{ github.workspace }}/rpmbuild-src/aerospike-php-client-${version}"
+          mkdir -p "$src_root"
+          cp target/release/libaerospike_php.so "$src_root/"
+          cp pkg/rpm/scripts/postinst "$src_root/"
+
+          mkdir -p "${{ github.workspace }}/rpmbuild/SOURCES"
+          tar -C "${{ github.workspace }}/rpmbuild-src" -czf \
+              "${{ github.workspace }}/rpmbuild/SOURCES/aerospike-php-client-${version}.tar.gz" \
+              "aerospike-php-client-${version}"
+
+          rpmbuild \
+            --define "_topdir ${{ github.workspace }}/rpmbuild" \
+            --define "VERSION ${version}" \
+            --target "${rpm_arch}" \
+            -bb pkg/rpm/aerospike-php-client.spec
+
+          mkdir -p pkg/rpm/out
+          cp "${{ github.workspace }}/rpmbuild/RPMS/${rpm_arch}"/*.rpm \
+             "pkg/rpm/out/aerospike-php-client-${version}-${rpm_arch}.rpm"
+
+      - name: Upload RPM ${{ matrix.rpm_arch }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aerospike-php-client-rpm-${{ matrix.rpm_arch }}
+          path: pkg/rpm/out/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-${{ matrix.rpm_arch }}.rpm

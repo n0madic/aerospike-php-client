@@ -8,7 +8,7 @@ class CDTListOpTest extends TestCase{
 
     protected static $client;
     protected static $namespace = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
     protected static $set;
     protected static $key;
     protected static $cdtBinName;
@@ -16,7 +16,8 @@ class CDTListOpTest extends TestCase{
     public static function setUpBeforeClass(): void
     {
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
         } catch (AerospikeException $e) {
             throw $e;
         }
@@ -52,7 +53,7 @@ class CDTListOpTest extends TestCase{
     }
 
     protected function getSizeOfList($record, $binName) {
-        $array = $record->bins[$binName];
+        $array = $record->getBins()[$binName];
         return count($array);
     }
 
@@ -83,7 +84,7 @@ class CDTListOpTest extends TestCase{
         $brp = new BatchReadPolicy();
         $br = BatchRead::ops($brp, self::$key, $opsGetSize);
         $recs = self::$client->batch($bp, [$br]);
-        $this->assertEquals($recs[0]->record->bins[self::$cdtBinName], 10);
+        $this->assertEquals($recs[0]->getRecord()->getBins()[self::$cdtBinName], 10);
     }
 
     public function testShouldAppendElementToTail(){
@@ -97,7 +98,7 @@ class CDTListOpTest extends TestCase{
         
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, self::$key);
-        $list = $record->bins[self::$cdtBinName];
+        $list = $record->getBins()[self::$cdtBinName];
         $this->assertEquals($list[10], 11);
     }
 
@@ -112,7 +113,7 @@ class CDTListOpTest extends TestCase{
         
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, self::$key);
-        $list = $record->bins[self::$cdtBinName];
+        $list = $record->getBins()[self::$cdtBinName];
         $this->assertEquals($list[10], 11);
         $this->assertEquals($list[11], 12);
         $this->assertEquals($list[12], 13);
@@ -129,7 +130,7 @@ class CDTListOpTest extends TestCase{
         
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, self::$key);
-        $list = $record->bins[self::$cdtBinName];
+        $list = $record->getBins()[self::$cdtBinName];
         $this->assertEquals($list[0], -1);
     }
 
@@ -143,7 +144,7 @@ class CDTListOpTest extends TestCase{
         
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, self::$key);
-        $list = $record->bins[self::$cdtBinName];
+        $list = $record->getBins()[self::$cdtBinName];
         $this->assertEquals($list[0], 2);
     }
     
@@ -218,13 +219,13 @@ class CDTListOpTest extends TestCase{
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, self::$key);
         
-        $this->assertEquals($record->bins[self::$cdtBinName][0], 1);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][0], 1);
         $ops = [ListOp::increment(self::$cdtBinName, 0, 10)];
         $bw = new BatchWrite($bwp, self::$key, $ops);
         self::$client->batch($bp, [$bw]);
         
         $record = self::$client->get($rp, self::$key);
-        $this->assertEquals($record->bins[self::$cdtBinName][0], 11);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][0], 11);
     }
 
     public function testShouldSortListByValue(){
@@ -235,13 +236,13 @@ class CDTListOpTest extends TestCase{
 
         $record = self::$client->get($rp, self::$key);
         
-        $this->assertEquals($record->bins[self::$cdtBinName][0], 1);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][0], 1);
         $ops = [ListOp::sort(self::$cdtBinName, ListSortFlags::descending())];
         $bw = new BatchWrite($bwp, self::$key, $ops);
         self::$client->batch($bp, [$bw]);
         
         $record = self::$client->get($rp, self::$key);
-        $this->assertEquals($record->bins[self::$cdtBinName][0], 10);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][0], 10);
     }
 
     public function testShouldSetIndexToValue(){
@@ -252,13 +253,13 @@ class CDTListOpTest extends TestCase{
 
         $record = self::$client->get($rp, self::$key);
         
-        $this->assertEquals($record->bins[self::$cdtBinName][3], 4);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][3], 4);
         $ops = [ListOp::set(self::$cdtBinName, 3, "newElement")];
         $bw = new BatchWrite($bwp, self::$key, $ops);
         self::$client->batch($bp, [$bw]);
         
         $record = self::$client->get($rp, self::$key);
-        $this->assertEquals($record->bins[self::$cdtBinName][3], "newElement");
+        $this->assertEquals($record->getBins()[self::$cdtBinName][3], "newElement");
     }
 
     public function testShouldTrimList(){
@@ -269,7 +270,7 @@ class CDTListOpTest extends TestCase{
 
         $record = self::$client->get($rp, self::$key);
         
-        $this->assertEquals($record->bins[self::$cdtBinName][0], 1);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][0], 1);
         $ops = [ListOp::trim(self::$cdtBinName, 0, 5)];
         $bw = new BatchWrite($bwp, self::$key, $ops);
         self::$client->batch($bp, [$bw]);
@@ -286,7 +287,7 @@ class CDTListOpTest extends TestCase{
 
         $record = self::$client->get($rp, self::$key);
         
-        $this->assertEquals($record->bins[self::$cdtBinName][0], 1);
+        $this->assertEquals($record->getBins()[self::$cdtBinName][0], 1);
         $ops = [ListOp::clear(self::$cdtBinName)];
         $bw = new BatchWrite($bwp, self::$key, $ops);
         self::$client->batch($bp, [$bw]);

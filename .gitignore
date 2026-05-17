@@ -8,9 +8,9 @@ aerospike-rust-client.sublime-workspace
 /log
 .idea/
 .vscode/
+.claude/
 .DS_Store
-src/com.aerospike.daemon.rs
-aerospike-connection-manager/asld
 /vendor
 /_debug
 /bench
+.phpunit.result.cache

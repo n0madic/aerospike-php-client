@@ -7,7 +7,7 @@ use PHPUnit\Framework\TestCase;
 class CDTMapOpTest extends TestCase{
     protected static $client;
     protected static $namespace = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
     protected static $set;
     protected static $key;
     protected static $cdtBinName;
@@ -15,7 +15,8 @@ class CDTMapOpTest extends TestCase{
     public static function setUpBeforeClass(): void
     {
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
         } catch (AerospikeException $e) {
             throw $e;
         }
@@ -54,7 +55,7 @@ class CDTMapOpTest extends TestCase{
 
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, self::$key);
-        $this->assertEquals($record->bins[self::$cdtBinName], ["a" => 1, "b" => 2, "c" => 3, "d" => 4, "e" => 5, "f" => 6]);
+        $this->assertEquals($record->getBins()[self::$cdtBinName], ["a" => 1, "b" => 2, "c" => 3, "d" => 4, "e" => 5, "f" => 6]);
     }
 
     public function testShouldUnpackOrderedCDTMap(){
@@ -73,8 +74,8 @@ class CDTMapOpTest extends TestCase{
         $ops = [MapOp::getByKeys($mp, self::$cdtBinName, ["mk1"], MapReturnType::value())];
         $br = BatchRead::ops($brp, self::$key, $ops);
         $recs = self::$client->batch($bp, [$br]);
-        $this->assertEquals($recs[0]->record->bins[self::$cdtBinName][0], "v1.0");
-        $this->assertEquals($recs[0]->record->bins[self::$cdtBinName][1], "v1.1");
+        $this->assertEquals($recs[0]->getRecord()->getBins()[self::$cdtBinName][0][0], "v1.0");
+        $this->assertEquals($recs[0]->getRecord()->getBins()[self::$cdtBinName][0][1], "v1.1");
     }
 
 }

@@ -9,7 +9,7 @@ final class BatchOpsTest extends TestCase
 
     protected static $namespace = "test";
     protected static $set = "test";
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
 
     public static function generateRandomReport() {
         $shape = ["circle", "triangle", "square"];
@@ -30,7 +30,8 @@ final class BatchOpsTest extends TestCase
     {
         $numRecords = 10;
         try {
-            self::$client = Client::connect(self::$socket);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
         } catch (AerospikeException $e) {
             throw $e;
         }

@@ -12,7 +12,7 @@ For more info please visit  - "https://docs.aerospike.com/server/operations/conf
 final class SecurityTest extends TestCase
 {
 
-    protected static $socket = "/tmp/asld_grpc.sock";
+    protected static $hosts;
     protected static $client;
 
     protected static $cp;
@@ -21,34 +21,68 @@ final class SecurityTest extends TestCase
     protected static $namespace = "test";
     protected static $set = "test";
 
+    // Auto-enabled when AEROSPIKE_USER + AEROSPIKE_PASSWORD env vars are set.
+    protected static $authRequired = false;
+
     public static function setUpBeforeClass(): void
     {
-        try {
-            self::$client = Client::connect(self::$socket);
-            self::$key = new Key(self::$namespace, self::$set, 1);
-        } catch (Exception $e) {
-            throw $e;
+        self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+        $user = getenv('AEROSPIKE_USER');
+        $pass = getenv('AEROSPIKE_PASSWORD');
+        if ($user && $pass) {
+            self::$authRequired = true;
+            $policy = new ClientPolicy();
+            $policy->setAuth($user, $pass);
+            self::$client = Client::connect(self::$hosts, $policy);
+        } else {
+            self::$client = Client::connect(self::$hosts);
         }
+        self::$key = new Key(self::$namespace, self::$set, 1);
     }
-
-
-    //Change this to TRUE when you enable security and want to test connections.
-    protected static $authRequired = false;
 
     protected function isSecurityEnabled()
     {
         return self::$authRequired;
     }
 
+    /**
+     * Each test owns its own user — addresses test-ordering flakiness where
+     * a previously-run test left `user1` behind (UserAlreadyExists / InvalidUser).
+     * The name is derived from the test method, so parallel runs and re-runs don't
+     * collide.
+     */
+    private function uniqueUserName(): string
+    {
+        return 'phpunit_' . strtolower($this->getName());
+    }
+
+    protected function setUp(): void
+    {
+        if (!$this->isSecurityEnabled()) {
+            return;
+        }
+        // Best-effort cleanup in case a prior failed run left this test's user behind.
+        $ap = new AdminPolicy();
+        try { self::$client->dropUser($ap, $this->uniqueUserName()); } catch (\Throwable $e) {}
+    }
+
+    protected function tearDown(): void
+    {
+        if (!$this->isSecurityEnabled()) {
+            return;
+        }
+        $ap = new AdminPolicy();
+        try { self::$client->dropUser($ap, $this->uniqueUserName()); } catch (\Throwable $e) {}
+    }
+
     public function testAerospikeConnectionWithAuthEnabled()
     {
         if (!$this->isSecurityEnabled()) {
-            $this->markTestSkipped("Enable Security in Aerospike.conf");
+            $this->markTestSkipped("Set AEROSPIKE_USER/AEROSPIKE_PASSWORD to run security tests");
         }
-        self::$client = Client::connect(self::$socket);
-
-        // Assert that the Aerospike connection is successfully created
-        $this->assertNotNull(self::$client->socket);
+        // The connection with auth was already established in setUpBeforeClass();
+        // here we just verify the client is alive.
+        $this->assertNotEmpty(self::$client->getHosts());
     }
 
     public function testCreateUser()
@@ -58,9 +92,18 @@ final class SecurityTest extends TestCase
         }
         $this->expectNotToPerformAssertions();
         $ap = new AdminPolicy();
-        self::$client->createUser($ap, "user1", "password", ["read-write"]);
+        self::$client->createUser($ap, $this->uniqueUserName(), "password", ["read-write"]);
     }
 
+
+    /**
+     * Aerospike propagates ACL changes through SMD asynchronously: `createUser`
+     * returns as soon as the record hits the principal, but a follow-up
+     * `dropUser` / `changePassword` on the same line may briefly see InvalidUser.
+     * A short sleep is the upstream-recommended workaround in dev/CI single-node
+     * setups.
+     */
+    private const SMD_PROPAGATION_MS = 200;
 
     public function testDropUser()
     {
@@ -69,7 +112,10 @@ final class SecurityTest extends TestCase
         }
         $this->expectNotToPerformAssertions();
         $ap = new AdminPolicy();
-        self::$client->dropUser($ap, "user1");
+        $user = $this->uniqueUserName();
+        self::$client->createUser($ap, $user, "password", ["read-write"]);
+        usleep(self::SMD_PROPAGATION_MS * 1000);
+        self::$client->dropUser($ap, $user);
     }
 
     public function testChangePassword()
@@ -79,25 +125,29 @@ final class SecurityTest extends TestCase
         }
         $this->expectNotToPerformAssertions();
         $ap = new AdminPolicy();
-        self::$client->createUser($ap, "user1", "password", ["read-write"]);
-        self::$client->changePassword($ap, "user1", "newPassword");
-        self::$client->dropUser($ap, "user1");
+        $user = $this->uniqueUserName();
+        self::$client->createUser($ap, $user, "password", ["read-write"]);
+        usleep(self::SMD_PROPAGATION_MS * 1000);
+        self::$client->changePassword($ap, $user, "newPassword");
     }
 
     public function testChangePasswordOfUnknownUser()
     {
         if (!$this->isSecurityEnabled()) {
-            $this->markTestSkipped("Enable Security in Aerospike.conf");
+            $this->markTestSkipped("Set AEROSPIKE_USER/AEROSPIKE_PASSWORD to run security tests");
         }
 
         $ap = new AdminPolicy();
-        self::$client->createUser($ap, "user2", "password", ["read-write"]);
+        $caught = false;
         try {
-            $result = self::$client->changePassword($ap, "user1", "newPassword");
+            self::$client->changePassword($ap, "nonexistent_user_xyz", "newPassword");
         } catch (AerospikeException $e) {
-            $this->assertSame($e->message, "user name is invalid");
+            $caught = true;
+            // v2: server error message format is "Server error: InvalidUser, ..."
+            $this->assertSame(ResultCode::INVALID_USER, $e->code,
+                "expected INVALID_USER result code, got: {$e->message}");
         }
-        self::$client->dropUser($ap, "user2");
+        $this->assertTrue($caught, "expected AerospikeException for unknown user");
     }
 
     public function testQueryUsers()
@@ -107,8 +157,9 @@ final class SecurityTest extends TestCase
         }
         $this->expectNotToPerformAssertions();
         $ap = new AdminPolicy();
-        self::$client->createUser($ap, "user1", "password", ["read-write"]);
-        self::$client->changePassword($ap, "user1", "newPassword");
-        self::$client->dropUser($ap, "user1");
+        $user = $this->uniqueUserName();
+        self::$client->createUser($ap, $user, "password", ["read-write"]);
+        usleep(self::SMD_PROPAGATION_MS * 1000);
+        self::$client->changePassword($ap, $user, "newPassword");
     }
 }

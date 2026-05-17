@@ -1,6 +1,6 @@
 [package]
 name = "aerospike_php"
-version = "1.4.0"
+version = "2.0.0-dev"
 edition = "2021"
 authors = ["Khosrow Afroozeh <khosrow@aerospike.com>", "Sachin Venkatesha Murthy <smurthy@aerospike.com>"]
 
@@ -8,30 +8,23 @@ authors = ["Khosrow Afroozeh <khosrow@aerospike.com>", "Sachin Venkatesha Murthy
 crate-type = ["cdylib"]
 
 [dependencies]
-version-compare = "0.2.0"
+aerospike = { version = "2.1", features = ["sync", "rt-tokio", "tls", "serialization"], default-features = false }
+ext-php-rs = "0.15"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 ordered-float = { version = "3", default-features = false }
-ext-php-rs = "0.13.1"
-colored = "2.0.0"
 hex = "0.4"
 log = "0.4"
-env_logger = "0.9.3"
-chrono = "0.4"
-lazy_static = "1.1.1"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
-tokio-stream = { version = "0.1" }
-prost = "0.12"
-tonic = "0.10"
-tower = { version = "0.4.13", features = ["util"] }
-byteorder = "1.3"
-rand="0.8.5"
-ripemd160 = "0.8"
 
-[build-dependencies]
-tonic-build = { version = "0.10", features = ["prost"] }
+# TLS configuration (rustls + PEM file loading + Mozilla CA bundle).
+# tokio-rustls is pulled in transitively via `aerospike[tls]`; declaring it directly
+# (with matching default features so the same crypto provider — aws-lc-rs — is used)
+# lets us construct `ClientConfig` values in user-facing API.
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 uuid = { version = "1.2.2", features = ["v4", "fast-rng"] }
-futures-util = "0.3.25"
 anyhow = "1"
 
 [profile.release]

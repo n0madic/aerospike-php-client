@@ -4,10 +4,10 @@ namespace Aerospike;
 
 $namespace = "test";
 $set = "test";
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
-$client = Client::connect($socket);
-echo "* Connected to the local daemon: $client->hosts \n";
+$client = Client::connect($hosts);
+echo "* Connected to Aerospike: $client->getHosts() \n";
 $ip = new InfoPolicy();
 $client->truncate($ip, $namespace, $set);
 usleep(100);
@@ -29,7 +29,7 @@ $client->batch($batchPolicy, [$batchWrite]);
 
 $rp = new ReadPolicy();
 $recs = $client->get($rp, $key);
-var_dump(count($recs->bins));
+var_dump(count($recs->getBins()));
 
 //Filter Expression to delete only if the expression condition is met
 $batchDeletePolicy = new BatchDeletePolicy();
@@ -42,6 +42,6 @@ $client->batch($batchPolicy, [$batchWrite]);
 
 $rp = new ReadPolicy();
 $recs = $client->get($rp, $key);
-var_dump(count($recs->bins));
+var_dump(count($recs->getBins()));
 
 

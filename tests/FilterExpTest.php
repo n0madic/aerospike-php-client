@@ -9,12 +9,13 @@ final class FilterExpTest extends TestCase
     protected static $client;
     protected static $namespace = "test";
     protected static $set = "test";
-    protected static $host = "/tmp/asld_grpc.sock";
+    protected static $hosts;
 
     public static function setUpBeforeClass(): void
     {
         try {
-            self::$client = Client::connect(self::$host);
+            self::$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
+            self::$client = Client::connect(self::$hosts);
             $ip = new InfoPolicy();
             self::$client->truncate($ip, self::$namespace, self::$set);
         } catch (Exception $e) {
@@ -39,7 +40,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
     public function testNeFilter()
@@ -59,7 +60,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(2, count($recs->bins));
+        $this->assertEquals(2, count($recs->getBins()));
     }
 
     public function testLtFilter()
@@ -79,7 +80,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
     public function testGtFilter()
@@ -99,7 +100,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
     public function testLeFilter()
@@ -119,7 +120,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
     public function testGeFilter()
@@ -139,7 +140,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
 
@@ -162,7 +163,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
 
@@ -184,7 +185,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
     public function testNotFilter()
@@ -204,7 +205,7 @@ final class FilterExpTest extends TestCase
         $rp = new ReadPolicy();
         $recs = self::$client->get($rp, $key);
 
-        $this->assertEquals(3, count($recs->bins));
+        $this->assertEquals(3, count($recs->getBins()));
     }
 
 }

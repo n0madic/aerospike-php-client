@@ -2,11 +2,11 @@
 
 namespace Aerospike;
 
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 $namespace = "test";
 $set = "mapCDTTest";
 
-$client = Client::connect($socket);
+$client = Client::connect($hosts);
 $key = new Key($namespace, $set, 1);
 $ip = new InfoPolicy();
 $client->truncate($ip, $namespace, $set);

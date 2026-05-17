@@ -1,0 +1,11 @@
+# Pin the toolchain so cargo and IDE/rust-analyzer agree on the rustc ABI.
+# Proc-macro `.dylib`s in target/ are not stable across rustc minor versions —
+# if rust-analyzer uses a different rustc, you get errors like
+# "Cannot create expander ... mismatched ABI".
+#
+# Bump together with the Docker base image (`rust:1.x-slim-bookworm`) in
+# Dockerfile and Dockerfile.php85.
+
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

@@ -23,7 +23,7 @@ ifeq ($(shell awk 'BEGIN{ print ("$(PHP_VERSION)" >= "8.0") }'), 0)
     $(error PHP version must be greater than or equal to 8.0)
 endif
 
-.PHONY: build install test clean
+.PHONY: build install test test-docker clean
 all: lint build install
 
 lint:
@@ -57,6 +57,20 @@ test-dev: install-dev
 test: install
 	@which phpunit > /dev/null || (echo "PHPUnit is not installed. Please install PHPUnit before running tests." && exit 1)
 	phpunit tests/
+
+# Runs the full suite inside disposable containers — no host PHP / Rust / Aerospike
+# install needed. See docker/docker-compose.test.yml for the topology.
+#
+# Force native arch for both build and run. Without this Docker Compose on Apple
+# Silicon happily builds an amd64 tester image and then runs cargo + gcc under
+# QEMU emulation, which segfaults `cc1` mid-aws-lc-sys build.
+HOST_ARCH := $(shell uname -m | sed -e 's/aarch64/arm64/' -e 's/x86_64/amd64/')
+
+test-docker:
+	DOCKER_DEFAULT_PLATFORM=linux/$(HOST_ARCH) \
+		docker compose -f docker/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from tester
+	DOCKER_DEFAULT_PLATFORM=linux/$(HOST_ARCH) \
+		docker compose -f docker/docker-compose.test.yml down -v
 
 clean:
 	cargo clean

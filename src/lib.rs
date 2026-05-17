@@ -17,21 +17,20 @@
 
 #![cfg_attr(windows, feature(abi_vectorcall))]
 #![allow(non_snake_case)]
+// PHP-exposed surface dictates names (`Recordset::next`) and signatures (CDT operation
+// builders with 8+ parameters) that clippy would flag; suppress at crate level.
+#![allow(clippy::should_implement_trait, clippy::too_many_arguments)]
 
-mod grpc;
+use aerospike::{self as aero};
 
-use grpc::proto::{self};
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 
-use byteorder::{ByteOrder, NetworkEndian};
-use ripemd160::digest::Digest;
-use ripemd160::Ripemd160;
-use version_compare::{Cmp, Version};
+use aero::Task as AeroTask;
 
 use ext_php_rs::binary::Binary;
 use ext_php_rs::boxed::ZBox;
@@ -51,21 +50,64 @@ use ext_php_rs::types::ZendObject;
 use ext_php_rs::types::Zval;
 use ext_php_rs::zend::ModuleEntry;
 
-use byteorder::{LittleEndian, ReadBytesExt};
-use rand::prelude::*;
-
-use lazy_static::lazy_static;
 use log::trace;
 
-lazy_static! {
-    static ref CLIENTS: Mutex<HashMap<String, Arc<Mutex<grpc::BlockingClient>>>> =
-        Mutex::new(HashMap::new());
+struct ClientEntry {
+    client: Arc<aero::Client>,
+    hosts: String,
+    /// Retained for diagnostics; cache eviction already happens via the cache key.
+    #[allow(dead_code)]
+    policy_fingerprint: String,
+}
+
+static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create Tokio runtime")
+});
+
+static CLIENTS: LazyLock<Mutex<HashMap<String, ClientEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Convert an aerospike error to a PHP exception and throw it. Always returns `Ok(default)`
+/// after throwing so the surrounding function returns a sentinel value and PHP sees the
+/// exception. Use this in place of the repetitive
+/// `let error: AerospikeException = (&e).into(); throw_object(error.into_zval(true)?)?;`
+/// pattern.
+fn throw_aero_error<T>(e: &aero::Error, default: T) -> PhpResult<T> {
+    let error: AerospikeException = e.into();
+    throw_object(error.into_zval(true)?)?;
+    Ok(default)
+}
+
+/// Convert a u64 millisecond value to u32, throwing an `AerospikeException` if it
+/// exceeds `u32::MAX`. Used by setter methods that take milliseconds — the underlying
+/// aerospike crate stores timeouts as `u32`, and a silent `as u32` truncation would
+/// turn `u32::MAX + 1` into `0` (which the aerospike client interprets as no timeout),
+/// making large nonsensical values dangerously permissive.
+fn millis_u64_to_u32(timeout_millis: u64) -> PhpResult<u32> {
+    if timeout_millis > u32::MAX as u64 {
+        return throw_msg(
+            &format!(
+                "timeout_millis {timeout_millis} exceeds u32::MAX ({}); aerospike timeouts are u32 milliseconds",
+                u32::MAX
+            ),
+            0u32,
+        );
+    }
+    Ok(timeout_millis as u32)
+}
+
+/// Convert a plain error message to a PHP exception and throw it. Returns `Ok(default)`
+/// after throwing.
+fn throw_msg<T>(msg: &str, default: T) -> PhpResult<T> {
+    let error = AerospikeException::new(msg);
+    throw_object(error.into_zval(true)?)?;
+    Ok(default)
 }
 
 pub type AsResult<T = ()> = std::result::Result<T, AerospikeException>;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const PARTITIONS: u16 = 4096;
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -74,9 +116,11 @@ const PARTITIONS: u16 = 4096;
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// ExpType defines the expression's data type.
-#[php_class(name = "Aerospike\\ExpType")]
+#[php_class]
+#[php(name = "Aerospike\\ExpType")]
+#[derive(Clone, Copy)]
 pub struct ExpType {
-    _as: proto::ExpType,
+    _as: aero::expressions::ExpType,
 }
 
 impl FromZval<'_> for ExpType {
@@ -85,98 +129,86 @@ impl FromZval<'_> for ExpType {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &ExpType = zval.extract()?;
 
-        Some(ExpType { _as: f._as.clone() })
+        Some(ExpType { _as: f._as })
     }
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ExpType {
     /// ExpTypeNIL is NIL Expression Type
     pub fn Nil() -> Self {
         ExpType {
-            _as: proto::ExpType::Nil,
+            _as: aero::expressions::ExpType::NIL,
         }
     }
 
     /// ExpTypeBOOL is BOOLEAN Expression Type
     pub fn Bool() -> Self {
         ExpType {
-            _as: proto::ExpType::Bool,
+            _as: aero::expressions::ExpType::BOOL,
         }
     }
 
     /// ExpTypeINT is INTEGER Expression Type
     pub fn Int() -> Self {
         ExpType {
-            _as: proto::ExpType::Int,
+            _as: aero::expressions::ExpType::INT,
         }
     }
 
     /// ExpTypeSTRING is STRING Expression Type
     pub fn String() -> Self {
         ExpType {
-            _as: proto::ExpType::String,
+            _as: aero::expressions::ExpType::STRING,
         }
     }
 
     /// ExpTypeLIST is LIST Expression Type
     pub fn List() -> Self {
         ExpType {
-            _as: proto::ExpType::List,
+            _as: aero::expressions::ExpType::LIST,
         }
     }
 
     /// ExpTypeMAP is MAP Expression Type
     pub fn Map() -> Self {
         ExpType {
-            _as: proto::ExpType::Map,
+            _as: aero::expressions::ExpType::MAP,
         }
     }
 
     /// ExpTypeBLOB is BLOB Expression Type
     pub fn Blob() -> Self {
         ExpType {
-            _as: proto::ExpType::Blob,
+            _as: aero::expressions::ExpType::BLOB,
         }
     }
 
     /// ExpTypeFLOAT is FLOAT Expression Type
     pub fn Float() -> Self {
         ExpType {
-            _as: proto::ExpType::Float,
+            _as: aero::expressions::ExpType::FLOAT,
         }
     }
 
     /// ExpTypeGEO is GEO String Expression Type
     pub fn Geo() -> Self {
         ExpType {
-            _as: proto::ExpType::Geo,
+            _as: aero::expressions::ExpType::GEO,
         }
     }
 
     /// ExpTypeHLL is HLL Expression Type
     pub fn Hll() -> Self {
         ExpType {
-            _as: proto::ExpType::Hll,
+            _as: aero::expressions::ExpType::HLL,
         }
     }
 }
 
 impl From<ExpType> for i32 {
     fn from(input: ExpType) -> Self {
-        match &input._as {
-            proto::ExpType::Nil => 0,
-            proto::ExpType::Bool => 1,
-            proto::ExpType::Int => 2,
-            proto::ExpType::String => 3,
-            proto::ExpType::List => 4,
-            proto::ExpType::Map => 5,
-            proto::ExpType::Blob => 6,
-            proto::ExpType::Float => 7,
-            proto::ExpType::Geo => 8,
-            proto::ExpType::Hll => 9,
-        }
+        input._as as i32
     }
 }
 
@@ -188,9 +220,11 @@ impl From<ExpType> for i32 {
 
 /// Filter expression, which can be applied to most commands, to control which records are
 /// affected by the command.
-#[php_class(name = "Aerospike\\Expression")]
+#[php_class]
+#[php(name = "Aerospike\\Expression")]
+#[derive(Clone)]
 pub struct Expression {
-    _as: proto::Expression,
+    _as: aero::expressions::Expression,
 }
 
 impl FromZval<'_> for Expression {
@@ -203,936 +237,572 @@ impl FromZval<'_> for Expression {
     }
 }
 
-#[php_impl]
-#[derive(ZvalConvert)]
-impl Expression {
-    pub fn new(
-        cmd: Option<i32>,
-        val: Option<PHPValue>,
-        bin: Option<&Expression>,
-        flags: Option<i64>,
-        module: Option<ExpType>,
-        exps: Vec<&Expression>,
-    ) -> Self {
-        Expression {
-            _as: proto::Expression {
-                cmd: cmd.map(|v| v.into()),
-                val: val.map(|v| v.into()),
-                bin: bin.map(|v| Box::new(v._as.clone())),
-                flags: flags,
-                module: module.map(|v| v.into()),
-                exps: exps.iter().map(|e| e._as.clone()).collect(),
-            },
-        }
-    }
+/// Clone a `Vec<&Expression>` into an owned `Vec<aero::expressions::Expression>` for the
+/// variadic aero builders (`and`, `or`, `cond`, `num_add`, ...).
+fn aero_exps(exps: Vec<&Expression>) -> Vec<aero::expressions::Expression> {
+    exps.iter().map(|e| e._as.clone()).collect()
+}
 
+#[php_impl]
+impl Expression {
     /// Create a record key expression of specified type.
     pub fn key(exp_type: ExpType) -> Self {
-        let exp_type: i32 = exp_type.into();
-        Expression::new(
-            Some(proto::ExpOp::Key.into()),
-            Some(PHPValue::Int(exp_type as i64).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::key(exp_type._as),
+        }
     }
 
     /// Create function that returns if the primary key is stored in the record meta data
     /// as a boolean expression. This would occur when `send_key` is true on record write.
     pub fn key_exists() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::KeyExists.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::key_exists(),
+        }
     }
 
     /// Create 64 bit int bin expression.
     pub fn int_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::Int()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::int_bin(name),
+        }
     }
 
     /// Create string bin expression.
     pub fn string_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::String()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::string_bin(name),
+        }
     }
 
     /// Create blob bin expression.
     pub fn blob_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::Blob()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::blob_bin(name),
+        }
     }
 
     /// Create 64 bit float bin expression.
     pub fn float_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::Float()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::float_bin(name),
+        }
     }
 
     /// Create geo bin expression.
     pub fn geo_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::Geo()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::geo_bin(name),
+        }
     }
 
     /// Create list bin expression.
     pub fn list_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::List()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::list_bin(name),
+        }
     }
 
     /// Create map bin expression.
     pub fn map_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::Map()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::map_bin(name),
+        }
     }
 
-    /// Create a HLL bin expression
+    /// Create a HLL bin expression.
     pub fn hll_bin(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Bin.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            Some(ExpType::Hll()),
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::hll_bin(name),
+        }
     }
 
     /// Create function that returns if bin of specified name exists.
     pub fn bin_exists(name: String) -> Self {
-        Expression::ne(
-            &Expression::bin_type(name),
-            &Expression::int_val(ParticleType::Null().into()),
-        )
+        Expression {
+            _as: aero::expressions::bin_exists(name),
+        }
     }
 
     /// ExpBinType creates a function that returns bin's integer particle type. Valid values are:
     ///
-    ///	NULL    = 0
-    ///	INTEGER = 1
-    ///	FLOAT   = 2
-    ///	STRING  = 3
-    ///	BLOB    = 4
-    ///	DIGEST  = 6
-    ///	BOOL    = 17
-    ///	HLL     = 18
-    ///	MAP     = 19
-    ///	LIST    = 20
-    ///	LDT     = 21
-    ///	GEOJSON = 23
+    /// NULL    = 0
+    /// INTEGER = 1
+    /// FLOAT   = 2
+    /// STRING  = 3
+    /// BLOB    = 4
+    /// DIGEST  = 6
+    /// BOOL    = 17
+    /// HLL     = 18
+    /// MAP     = 19
+    /// LIST    = 20
+    /// LDT     = 21
+    /// GEOJSON = 23
     pub fn bin_type(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::BinType.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::bin_type(name),
+        }
     }
 
     /// Create function that returns record set name string.
     pub fn set_name() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::SetName.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::set_name(),
+        }
+    }
+
+    /// Create expression that returns record size on disk (server 7.0+).
+    pub fn record_size() -> Self {
+        Expression {
+            _as: aero::expressions::record_size(),
+        }
     }
 
     /// Create function that returns record size on disk.
     /// If server storage-engine is memory, then zero is returned.
     ///
     /// This expression should only be used for server versions less than 7.0. Use
-    /// record_size for server version 7.0+.
+    /// `record_size` for server version 7.0+.
     pub fn device_size() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::DeviceSize.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        #[allow(deprecated)]
+        let v = aero::expressions::device_size();
+        Expression { _as: v }
     }
 
-    /// Create expression that returns record size in memory. If server storage-engine is
-    /// not memory nor data-in-memory, then zero is returned. This expression usually evaluates
-    /// quickly because record meta data is cached in memory.
-    ///
-    /// Requires server version between 5.3 inclusive and 7.0 exclusive.
-    /// Use record_size for server version 7.0+.
+    /// Create expression that returns record size in memory (server 5.3..7.0).
     pub fn memory_size() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::MemorySize.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        #[allow(deprecated)]
+        let v = aero::expressions::memory_size();
+        Expression { _as: v }
     }
 
     /// Create function that returns record last update time expressed as 64 bit integer
     /// nanoseconds since 1970-01-01 epoch.
     pub fn last_update() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::LastUpdate.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::last_update(),
+        }
     }
 
     /// Create expression that returns milliseconds since the record was last updated.
-    /// This expression usually evaluates quickly because record meta data is cached in memory.
     pub fn since_update() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::SinceUpdate.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::since_update(),
+        }
     }
 
     /// Create function that returns record expiration time expressed as 64 bit integer
     /// nanoseconds since 1970-01-01 epoch.
     pub fn void_time() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::VoidTime.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::void_time(),
+        }
     }
 
-    /// Create function that returns record expiration time (time to live) in integer seconds.
+    /// Create function that returns record expiration time (TTL) in integer seconds.
     pub fn ttl() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Ttl.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::ttl(),
+        }
     }
 
     /// Create expression that returns if record has been deleted and is still in tombstone state.
-    /// This expression usually evaluates quickly because record meta data is cached in memory.
     pub fn is_tombstone() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IsTombstone.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::is_tombstone(),
+        }
     }
 
     /// Create function that returns record digest modulo as integer.
     pub fn digest_modulo(modulo: i64) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::DigestModulo.into()),
-            Some(PHPValue::Int(modulo).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::digest_modulo(modulo),
+        }
     }
 
     /// Create function like regular expression string operation.
     pub fn regex_compare(regex: String, flags: i64, bin: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Regex.into()),
-            Some(PHPValue::String(regex).into()),
-            Some(bin),
-            Some(flags),
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::regex_compare(regex, flags, bin._as.clone()),
+        }
     }
 
     /// Create compare geospatial operation.
     pub fn geo_compare(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Geo.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
-    }
-
-    /// Creates 64 bit integer value
-    pub fn int_val(val: i64) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::Int(val).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
-    }
-
-    /// Creates a Boolean value
-    pub fn bool_val(val: bool) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::Bool(val).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
-    }
-
-    /// Creates String bin value
-    pub fn string_val(val: String) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::String(val).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
-    }
-
-    /// Creates 64 bit float bin value
-    pub fn float_val(val: f64) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::Float(ordered_float::OrderedFloat(val)).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
-    }
-
-    /// Creates Blob bin value
-    pub fn blob_val(val: Vec<u8>) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::Blob(val).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
-    }
-
-    /// Create List bin PHPValue
-    /// Not Supported in pre-alpha release
-    pub fn list_val(val: Vec<PHPValue>) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::List(val).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
-    }
-
-    /// Create Map bin PHPValue
-    /// Value must be a map
-    pub fn map_val(val: PHPValue) -> Option<Self> {
-        if !assert_map(&val) {
-            return None;
+        Expression {
+            _as: aero::expressions::geo_compare(left._as.clone(), right._as.clone()),
         }
-
-        Some(Expression::new(
-            None,
-            Some(val.clone()),
-            None,
-            None,
-            None,
-            vec![],
-        ))
     }
 
-    /// Create geospatial json string value.
+    /// Creates 64 bit integer value.
+    pub fn int_val(val: i64) -> Self {
+        Expression {
+            _as: aero::expressions::int_val(val),
+        }
+    }
+
+    /// Creates a Boolean value.
+    pub fn bool_val(val: bool) -> Self {
+        Expression {
+            _as: aero::expressions::bool_val(val),
+        }
+    }
+
+    /// Creates String bin value.
+    pub fn string_val(val: String) -> Self {
+        Expression {
+            _as: aero::expressions::string_val(val),
+        }
+    }
+
+    /// Creates 64 bit float bin value.
+    pub fn float_val(val: f64) -> Self {
+        Expression {
+            _as: aero::expressions::float_val(val),
+        }
+    }
+
+    /// Creates Blob bin value.
+    pub fn blob_val(val: Vec<u8>) -> Self {
+        Expression {
+            _as: aero::expressions::blob_val(val),
+        }
+    }
+
+    /// Create List bin value.
+    pub fn list_val(val: Vec<PHPValue>) -> Self {
+        Expression {
+            _as: aero::expressions::list_val(php_values_to_aero(val)),
+        }
+    }
+
+    /// Create Map bin value. Returns `None` if `val` is not a PHP associative array (HashMap/Json).
+    pub fn map_val(val: PHPValue) -> Option<Self> {
+        let m: HashMap<aero::Value, aero::Value> = match val {
+            PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            PHPValue::Json(h) => h
+                .into_iter()
+                .map(|(k, v)| (aero::Value::String(k), v.into()))
+                .collect(),
+            _ => return None,
+        };
+        Some(Expression {
+            _as: aero::expressions::map_val(m),
+        })
+    }
+
+    /// Create geospatial JSON string value.
     pub fn geo_val(val: String) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::GeoJSON(val).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::geo_val(val),
+        }
     }
 
-    /// Create a Nil PHPValue
+    /// Create a Nil value.
     pub fn nil() -> Self {
-        Expression::new(None, Some(PHPValue::Nil.into()), None, None, None, vec![])
+        Expression {
+            _as: aero::expressions::nil(),
+        }
     }
 
-    /// Create a Infinity PHPValue
+    /// Create an Infinity value.
     pub fn infinity() -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::Infinity.into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::infinity(),
+        }
     }
 
-    /// Create a WildCard PHPValue
+    /// Create a Wildcard value.
     pub fn wildcard() -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::Wildcard.into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::wildcard(),
+        }
     }
 
     /// Create "not" operator expression.
     pub fn not(exp: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Not.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![exp],
-        )
+        Expression {
+            _as: aero::expressions::not(exp._as.clone()),
+        }
     }
 
     /// Create "and" (&&) operator that applies to a variable number of expressions.
-    /// /// (a > 5 || a == 0) && b < 3
     pub fn and(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::And.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::and(aero_exps(exps)),
+        }
     }
 
     /// Create "or" (||) operator that applies to a variable number of expressions.
     pub fn or(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Or.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::or(aero_exps(exps)),
+        }
     }
 
-    /// Create "xor" (^) operator that applies to a variable number of expressions.
+    /// Create integer "xor" (^) operator that applies to a variable number of expressions.
+    ///
+    /// v1-compatible alias for `int_xor` (the proto/v1 implementation also mapped to
+    /// integer XOR). For boolean XOR, call `bool_xor` instead.
     pub fn xor(exps: Vec<&Expression>) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntXor.into()),
-            None,
-            None,
-            None,
-            None,
-            exps,
-        )
+        Expression {
+            _as: aero::expressions::int_xor(aero_exps(exps)),
+        }
+    }
+
+    /// Create boolean "xor" (^) operator that applies to a variable number of expressions.
+    /// New in v2 — exposes aero's boolean XOR builder (opcode 19). Use `int_xor` /
+    /// `xor` for the integer-bitmask variant.
+    pub fn bool_xor(exps: Vec<&Expression>) -> Self {
+        Expression {
+            _as: aero::expressions::xor(aero_exps(exps)),
+        }
     }
 
     /// Create equal (==) expression.
     pub fn eq(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Eq.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
+        Expression {
+            _as: aero::expressions::eq(left._as.clone(), right._as.clone()),
+        }
     }
 
-    /// Create not equal (!=) expression
+    /// Create not equal (!=) expression.
     pub fn ne(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Ne.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
+        Expression {
+            _as: aero::expressions::ne(left._as.clone(), right._as.clone()),
+        }
     }
 
     /// Create greater than (>) operation.
     pub fn gt(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Gt.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
+        Expression {
+            _as: aero::expressions::gt(left._as.clone(), right._as.clone()),
+        }
     }
 
     /// Create greater than or equal (>=) operation.
     pub fn ge(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Ge.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
+        Expression {
+            _as: aero::expressions::ge(left._as.clone(), right._as.clone()),
+        }
     }
 
     /// Create less than (<) operation.
     pub fn lt(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Lt.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
+        Expression {
+            _as: aero::expressions::lt(left._as.clone(), right._as.clone()),
+        }
     }
 
     /// Create less than or equals (<=) operation.
     pub fn le(left: &Expression, right: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Le.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![left, right],
-        )
+        Expression {
+            _as: aero::expressions::le(left._as.clone(), right._as.clone()),
+        }
     }
 
     /// Create "add" (+) operator that applies to a variable number of expressions.
-    /// Return sum of all `FilterExpressions` given. All arguments must resolve to the same type (integer or float).
     /// Requires server version 5.6.0+.
     pub fn num_add(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Add.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::num_add(aero_exps(exps)),
+        }
     }
 
     /// Create "subtract" (-) operator that applies to a variable number of expressions.
-    /// If only one `FilterExpressions` is provided, return the negation of that argument.
-    /// Otherwise, return the sum of the 2nd to Nth `FilterExpressions` subtracted from the 1st
-    /// `FilterExpressions`. All `FilterExpressions` must resolve to the same type (integer or float).
-    /// Requires server version 5.6.0+.
     pub fn num_sub(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Sub.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::num_sub(aero_exps(exps)),
+        }
     }
 
     /// Create "multiply" (*) operator that applies to a variable number of expressions.
-    /// Return the product of all `FilterExpressions`. If only one `FilterExpressions` is supplied, return
-    /// that `FilterExpressions`. All `FilterExpressions` must resolve to the same type (integer or float).
-    /// Requires server version 5.6.0+.
     pub fn num_mul(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Mul.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::num_mul(aero_exps(exps)),
+        }
     }
 
     /// Create "divide" (/) operator that applies to a variable number of expressions.
-    /// If there is only one `FilterExpressions`, returns the reciprocal for that `FilterExpressions`.
-    /// Otherwise, return the first `FilterExpressions` divided by the product of the rest.
-    /// All `FilterExpressions` must resolve to the same type (integer or float).
-    /// Requires server version 5.6.0+.
     pub fn num_div(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Div.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::num_div(aero_exps(exps)),
+        }
     }
 
     /// Create "power" operator that raises a "base" to the "exponent" power.
-    /// All arguments must resolve to floats.
-    /// Requires server version 5.6.0+.
     pub fn num_pow(base: &Expression, exponent: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Pow.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![base, exponent],
-        )
+        Expression {
+            _as: aero::expressions::num_pow(base._as.clone(), exponent._as.clone()),
+        }
     }
 
     /// Create "log" operator for logarithm of "num" with base "base".
-    /// All arguments must resolve to floats.
-    /// Requires server version 5.6.0+.
     pub fn num_log(num: &Expression, base: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Log.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![num, base],
-        )
+        Expression {
+            _as: aero::expressions::num_log(num._as.clone(), base._as.clone()),
+        }
     }
 
-    /// Create "modulo" (%) operator that determines the remainder of "numerator"
-    /// divided by "denominator". All arguments must resolve to integers.
-    /// Requires server version 5.6.0+.
+    /// Create "modulo" (%) operator.
     pub fn num_mod(numerator: &Expression, denominator: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Mod.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![numerator, denominator],
-        )
+        Expression {
+            _as: aero::expressions::num_mod(numerator._as.clone(), denominator._as.clone()),
+        }
     }
 
     /// Create operator that returns absolute value of a number.
-    /// All arguments must resolve to integer or float.
-    /// Requires server version 5.6.0+.
     pub fn num_abs(value: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Abs.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![value],
-        )
+        Expression {
+            _as: aero::expressions::num_abs(value._as.clone()),
+        }
     }
 
     /// Create expression that rounds a floating point number down to the closest integer value.
-    /// The return type is float.
-    /// Requires server version 5.6.0+.
     pub fn num_floor(num: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Floor.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![num],
-        )
+        Expression {
+            _as: aero::expressions::num_floor(num._as.clone()),
+        }
     }
 
     /// Create expression that rounds a floating point number up to the closest integer value.
-    /// The return type is float.
-    /// Requires server version 5.6.0+.
     pub fn num_ceil(num: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Ceil.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![num],
-        )
-    }
-
-    /// Create expression that converts an integer to a float.
-    /// Requires server version 5.6.0+.
-    pub fn to_int(num: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::ToInt.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![num],
-        )
+        Expression {
+            _as: aero::expressions::num_ceil(num._as.clone()),
+        }
     }
 
     /// Create expression that converts a float to an integer.
-    /// Requires server version 5.6.0+.
+    pub fn to_int(num: &Expression) -> Self {
+        Expression {
+            _as: aero::expressions::to_int(num._as.clone()),
+        }
+    }
+
+    /// Create expression that converts an integer to a float.
     pub fn to_float(num: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::ToFloat.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![num],
-        )
+        Expression {
+            _as: aero::expressions::to_float(num._as.clone()),
+        }
     }
 
-    /// Create integer "and" (&) operator that is applied to two or more integers.
-    /// All arguments must resolve to integers.
-    /// Requires server version 5.6.0+.
+    /// Create integer "and" (&) operator.
     pub fn int_and(exps: Vec<&Expression>) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntAnd.into()),
-            None,
-            None,
-            None,
-            None,
-            exps,
-        )
+        Expression {
+            _as: aero::expressions::int_and(aero_exps(exps)),
+        }
     }
 
-    /// Create integer "or" (|) operator that is applied to two or more integers.
-    /// All arguments must resolve to integers.
-    /// Requires server version 5.6.0+.
+    /// Create integer "or" (|) operator.
     pub fn int_or(exps: Vec<&Expression>) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntOr.into()),
-            None,
-            None,
-            None,
-            None,
-            exps,
-        )
+        Expression {
+            _as: aero::expressions::int_or(aero_exps(exps)),
+        }
     }
 
-    /// Create integer "xor" (^) operator that is applied to two or more integers.
-    /// All arguments must resolve to integers.
-    /// Requires server version 5.6.0+.
+    /// Create integer "xor" (^) operator.
     pub fn int_xor(exps: Vec<&Expression>) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntXor.into()),
-            None,
-            None,
-            None,
-            None,
-            exps,
-        )
+        Expression {
+            _as: aero::expressions::int_xor(aero_exps(exps)),
+        }
     }
 
     /// Create integer "not" (~) operator.
-    /// Requires server version 5.6.0+.
     pub fn int_not(exp: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntNot.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![exp],
-        )
+        Expression {
+            _as: aero::expressions::int_not(exp._as.clone()),
+        }
     }
 
     /// Create integer "left shift" (<<) operator.
-    /// Requires server version 5.6.0+.
     pub fn int_lshift(value: &Expression, shift: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntLShift.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![value, shift],
-        )
+        Expression {
+            _as: aero::expressions::int_lshift(value._as.clone(), shift._as.clone()),
+        }
     }
 
     /// Create integer "logical right shift" (>>>) operator.
-    /// Requires server version 5.6.0+.
     pub fn int_rshift(value: &Expression, shift: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntRShift.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![value, shift],
-        )
+        Expression {
+            _as: aero::expressions::int_rshift(value._as.clone(), shift._as.clone()),
+        }
     }
 
     /// Create integer "arithmetic right shift" (>>) operator.
-    /// The sign bit is preserved and not shifted.
-    /// Requires server version 5.6.0+.
     pub fn int_arshift(value: &Expression, shift: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntArShift.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![value, shift],
-        )
+        Expression {
+            _as: aero::expressions::int_arshift(value._as.clone(), shift._as.clone()),
+        }
     }
 
     /// Create expression that returns count of integer bits that are set to 1.
-    /// Requires server version 5.6.0+
     pub fn int_count(exp: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntCount.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![exp],
-        )
+        Expression {
+            _as: aero::expressions::int_count(exp._as.clone()),
+        }
     }
 
-    /// Create expression that scans integer bits from left (most significant bit) to
-    /// right (least significant bit), looking for a search bit value. When the
-    /// search value is found, the index of that bit (where the most significant bit is
-    /// index 0) is returned. If "search" is true, the scan will search for the bit
-    /// value 1. If "search" is false it will search for bit value 0.
-    /// Requires server version 5.6.0+.
+    /// Create expression that scans integer bits left-to-right for a search bit value.
     pub fn int_lscan(value: &Expression, search: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntLScan.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![value, search],
-        )
+        Expression {
+            _as: aero::expressions::int_lscan(value._as.clone(), search._as.clone()),
+        }
     }
 
-    /// Create expression that scans integer bits from right (least significant bit) to
-    /// left (most significant bit), looking for a search bit value. When the
-    /// search value is found, the index of that bit (where the most significant bit is
-    /// index 0) is returned. If "search" is true, the scan will search for the bit
-    /// value 1. If "search" is false it will search for bit value 0.
-    /// Requires server version 5.6.0+.
+    /// Create expression that scans integer bits right-to-left for a search bit value.
     pub fn int_rscan(value: &Expression, search: &Expression) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::IntRScan.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![value, search],
-        )
+        Expression {
+            _as: aero::expressions::int_rscan(value._as.clone(), search._as.clone()),
+        }
     }
 
     /// Create expression that returns the minimum value in a variable number of expressions.
-    /// All arguments must be the same type (integer or float).
-    /// Requires server version 5.6.0+.
     pub fn min(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Min.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::min(aero_exps(exps)),
+        }
     }
 
     /// Create expression that returns the maximum value in a variable number of expressions.
-    /// All arguments must be the same type (integer or float).
-    /// Requires server version 5.6.0+.
     pub fn max(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Max.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::max(aero_exps(exps)),
+        }
     }
-
-    ///--------------------------------------------------
-    /// Variables
-    ///--------------------------------------------------
 
     /// Conditionally select an expression from a variable number of expression pairs
     /// followed by default expression action.
-    /// Requires server version 5.6.0+.
-    /// ```
-    /// /// Args Format: bool exp1, action exp1, bool exp2, action exp2, ..., action-default
-    /// /// Apply operator based on type.
     pub fn cond(exps: Vec<&Expression>) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Cond.into()),
-            None,
-            None,
-            None,
-            None,
-            exps,
-        )
+        Expression {
+            _as: aero::expressions::cond(aero_exps(exps)),
+        }
     }
 
     /// Define variables and expressions in scope.
-    /// Requires server version 5.6.0+.
-    /// ```
-    /// /// 5 < a < 10
     pub fn exp_let(exps: Vec<&Expression>) -> Self {
-        Expression::new(Some(proto::ExpOp::Let.into()), None, None, None, None, exps)
+        Expression {
+            _as: aero::expressions::exp_let(aero_exps(exps)),
+        }
     }
 
     /// Assign variable to an expression that can be accessed later.
-    /// Requires server version 5.6.0+.
-    /// ```
-    /// /// 5 < a < 10
     pub fn def(name: String, value: &Expression) -> Self {
-        Expression::new(
-            None,
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            None,
-            vec![value],
-        )
+        Expression {
+            _as: aero::expressions::def(name, value._as.clone()),
+        }
     }
 
     /// Retrieve expression value from a variable.
-    /// Requires server version 5.6.0+.
     pub fn var(name: String) -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Var.into()),
-            Some(PHPValue::String(name).into()),
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::var(name),
+        }
     }
 
     /// Create unknown value. Used to intentionally fail an expression.
-    /// The failure can be ignored with `ExpWriteFlags` `EVAL_NO_FAIL`
-    /// or `ExpReadFlags` `EVAL_NO_FAIL`.
-    /// Requires server version 5.6.0+.
     pub fn unknown() -> Self {
-        Expression::new(
-            Some(proto::ExpOp::Unknown.into()),
-            None,
-            None,
-            None,
-            None,
-            vec![],
-        )
+        Expression {
+            _as: aero::expressions::unknown(),
+        }
     }
 }
 
@@ -1145,18 +815,21 @@ impl Expression {
 /// ReadModeAP is the read policy in AP (availability) mode namespaces.
 /// It indicates how duplicates should be consulted in a read operation.
 /// Only makes a difference during migrations and only applicable in AP mode.
-#[php_class(name = "Aerospike\\ReadModeAP")]
+///
+/// Backed by `aerospike::ConsistencyLevel` since the Rust client merges AP read mode
+/// into the unified consistency-level concept.
+#[php_class]
+#[php(name = "Aerospike\\ReadModeAP")]
 pub struct ReadModeAP {
-    _as: proto::ReadModeAp,
+    _as: aero::ConsistencyLevel,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ReadModeAP {
     /// ReadModeAPOne indicates that a single node should be involved in the read operation.
     pub fn One() -> Self {
         ReadModeAP {
-            _as: proto::ReadModeAp::One,
+            _as: aero::ConsistencyLevel::ConsistencyOne,
         }
     }
 
@@ -1164,31 +837,20 @@ impl ReadModeAP {
     /// the read operation.
     pub fn All() -> Self {
         ReadModeAP {
-            _as: proto::ReadModeAp::All,
+            _as: aero::ConsistencyLevel::ConsistencyAll,
         }
     }
 }
 
-impl From<&ReadModeAP> for i32 {
-    fn from(v: &ReadModeAP) -> i32 {
-        match v._as {
-            proto::ReadModeAp::One => 0,
-            proto::ReadModeAp::All => 1,
-        }
+impl From<&ReadModeAP> for aero::ConsistencyLevel {
+    fn from(v: &ReadModeAP) -> aero::ConsistencyLevel {
+        v._as.clone()
     }
 }
 
-impl From<i32> for ReadModeAP {
-    fn from(v: i32) -> ReadModeAP {
-        match v {
-            0 => ReadModeAP {
-                _as: proto::ReadModeAp::One,
-            },
-            1 => ReadModeAP {
-                _as: proto::ReadModeAp::All,
-            },
-            _ => unreachable!(),
-        }
+impl From<aero::ConsistencyLevel> for ReadModeAP {
+    fn from(v: aero::ConsistencyLevel) -> ReadModeAP {
+        ReadModeAP { _as: v }
     }
 }
 
@@ -1210,74 +872,53 @@ impl FromZval<'_> for ReadModeAP {
 
 /// ReadModeSC is the read policy in SC (strong consistency) mode namespaces.
 /// Determines SC read consistency options.
-#[php_class(name = "Aerospike\\ReadModeSC")]
+///
+/// NOTE: aerospike-client-rust v2 does not yet model SC read modes separately; the
+/// chosen value is stored on the policy for forward compatibility but currently has
+/// no runtime effect.
+#[php_class]
+#[php(name = "Aerospike\\ReadModeSC")]
+#[derive(Clone, Copy)]
 pub struct ReadModeSC {
-    _as: proto::ReadModeSc,
+    mode: ReadModeScMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadModeScMode {
+    Session,
+    Linearize,
+    AllowReplica,
+    AllowUnavailable,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ReadModeSC {
     /// ReadModeSCSession ensures this client will only see an increasing sequence of record versions.
-    /// Server only reads from master.  This is the default.
     pub fn Session() -> Self {
         ReadModeSC {
-            _as: proto::ReadModeSc::Session,
+            mode: ReadModeScMode::Session,
         }
     }
 
     /// ReadModeSCLinearize ensures ALL clients will only see an increasing sequence of record versions.
-    /// Server only reads from master.
     pub fn Linearize() -> Self {
         ReadModeSC {
-            _as: proto::ReadModeSc::Linearize,
+            mode: ReadModeScMode::Linearize,
         }
     }
 
     /// ReadModeSCAllowReplica indicates that the server may read from master or any full (non-migrating) replica.
-    /// Increasing sequence of record versions is not guaranteed.
     pub fn AllowReplica() -> Self {
         ReadModeSC {
-            _as: proto::ReadModeSc::AllowReplica,
+            mode: ReadModeScMode::AllowReplica,
         }
     }
 
     /// ReadModeSCAllowUnavailable indicates that the server may read from master or any full (non-migrating) replica or from unavailable
-    /// partitions.  Increasing sequence of record versions is not guaranteed.
+    /// partitions.
     pub fn AllowUnavailable() -> Self {
         ReadModeSC {
-            _as: proto::ReadModeSc::AllowUnavailable,
-        }
-    }
-}
-
-impl From<&ReadModeSC> for i32 {
-    fn from(v: &ReadModeSC) -> i32 {
-        match &v._as {
-            proto::ReadModeSc::Session => 0,
-            proto::ReadModeSc::Linearize => 1,
-            proto::ReadModeSc::AllowReplica => 2,
-            proto::ReadModeSc::AllowUnavailable => 3,
-        }
-    }
-}
-
-impl From<i32> for ReadModeSC {
-    fn from(v: i32) -> ReadModeSC {
-        match v {
-            0 => ReadModeSC {
-                _as: proto::ReadModeSc::Session,
-            },
-            1 => ReadModeSC {
-                _as: proto::ReadModeSc::Linearize,
-            },
-            2 => ReadModeSC {
-                _as: proto::ReadModeSc::AllowReplica,
-            },
-            3 => ReadModeSC {
-                _as: proto::ReadModeSc::AllowUnavailable,
-            },
-            _ => unreachable!(),
+            mode: ReadModeScMode::AllowUnavailable,
         }
     }
 }
@@ -1288,7 +929,7 @@ impl FromZval<'_> for ReadModeSC {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &ReadModeSC = zval.extract()?;
 
-        Some(ReadModeSC { _as: f._as.clone() })
+        Some(ReadModeSC { mode: f.mode })
     }
 }
 
@@ -1300,9 +941,10 @@ impl FromZval<'_> for ReadModeSC {
 
 /// RecordExistsAction determines how to handle writes when
 /// the record already exists.
-#[php_class(name = "Aerospike\\RecordExistsAction")]
+#[php_class]
+#[php(name = "Aerospike\\RecordExistsAction")]
 pub struct RecordExistsAction {
-    _as: proto::RecordExistsAction,
+    _as: aero::RecordExistsAction,
 }
 
 impl FromZval<'_> for RecordExistsAction {
@@ -1316,48 +958,41 @@ impl FromZval<'_> for RecordExistsAction {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl RecordExistsAction {
     /// Update means: Create or update record.
     /// Merge write command bins with existing bins.
     pub fn Update() -> Self {
         RecordExistsAction {
-            _as: proto::RecordExistsAction::Update,
+            _as: aero::RecordExistsAction::Update,
         }
     }
 
     /// UpdateOnly means: Update record only. Fail if record does not exist.
-    /// Merge write command bins with existing bins.
     pub fn Update_Only() -> Self {
         RecordExistsAction {
-            _as: proto::RecordExistsAction::UpdateOnly,
+            _as: aero::RecordExistsAction::UpdateOnly,
         }
     }
 
     /// Replace means: Create or replace record.
     /// Delete existing bins not referenced by write command bins.
-    /// Supported by Aerospike 2 server versions >= 2.7.5 and
-    /// Aerospike 3 server versions >= 3.1.6.
     pub fn Replace() -> Self {
         RecordExistsAction {
-            _as: proto::RecordExistsAction::Replace,
+            _as: aero::RecordExistsAction::Replace,
         }
     }
 
     /// ReplaceOnly means: Replace record only. Fail if record does not exist.
-    /// Delete existing bins not referenced by write command bins.
-    /// Supported by Aerospike 2 server versions >= 2.7.5 and
-    /// Aerospike 3 server versions >= 3.1.6.
     pub fn Replace_Only() -> Self {
         RecordExistsAction {
-            _as: proto::RecordExistsAction::ReplaceOnly,
+            _as: aero::RecordExistsAction::ReplaceOnly,
         }
     }
 
     /// CreateOnly means: Create only. Fail if record exists.
     pub fn Create_Only() -> Self {
         RecordExistsAction {
-            _as: proto::RecordExistsAction::CreateOnly,
+            _as: aero::RecordExistsAction::CreateOnly,
         }
     }
 }
@@ -1369,9 +1004,10 @@ impl RecordExistsAction {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// QueryDuration represents the expected duration for a query operation in the Aerospike database.
-#[php_class(name = "Aerospike\\QueryDuration")]
+#[php_class]
+#[php(name = "Aerospike\\QueryDuration")]
 pub struct QueryDuration {
-    _as: proto::QueryDuration,
+    _as: aero::QueryDuration,
 }
 
 impl FromZval<'_> for QueryDuration {
@@ -1385,59 +1021,32 @@ impl FromZval<'_> for QueryDuration {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl QueryDuration {
-    /// LONG specifies that the query is expected to return more than 100 records per node. The server optimizes for a large record set in
-    /// the following ways:
-    ///
-    /// Allow query to be run in multiple threads using the server's query threading configuration.
-    /// Do not relax read consistency for AP namespaces.
-    /// Add the query to the server's query monitor.
-    /// Do not add the overall latency to the server's latency histogram.
-    /// Do not allow server timeouts.    
+    /// LONG specifies that the query is expected to return more than 100 records per node.
     pub fn Long() -> Self {
         QueryDuration {
-            _as: proto::QueryDuration::Long,
+            _as: aero::QueryDuration::Long,
         }
     }
 
-    /// Short specifies that the query is expected to return less than 100 records per node. The server optimizes for a small record set in
-    /// the following ways:
-    /// Always run the query in one thread and ignore the server's query threading configuration.
-    /// Allow query to be inlined directly on the server's service thread.
-    /// Relax read consistency for AP namespaces.
-    /// Do not add the query to the server's query monitor.
-    /// Add the overall latency to the server's latency histogram.
-    /// Allow server timeouts. The default server timeout for a short query is 1 second.
+    /// Short specifies that the query is expected to return less than 100 records per node.
     pub fn Short() -> Self {
         QueryDuration {
-            _as: proto::QueryDuration::Short,
+            _as: aero::QueryDuration::Short,
         }
     }
 
     /// LongRelaxAP will treat query as a LONG query, but relax read consistency for AP namespaces.
-    /// This value is treated exactly like LONG for server versions < 7.1.
     pub fn LongRelaxAP() -> Self {
         QueryDuration {
-            _as: proto::QueryDuration::LongRelaxAp,
+            _as: aero::QueryDuration::LongRelaxAP,
         }
     }
 }
 
-impl From<&proto::QueryDuration> for QueryDuration {
-    fn from(input: &proto::QueryDuration) -> Self {
+impl From<&aero::QueryDuration> for QueryDuration {
+    fn from(input: &aero::QueryDuration) -> Self {
         QueryDuration { _as: input.clone() }
-    }
-}
-
-impl From<i32> for QueryDuration {
-    fn from(input: i32) -> Self {
-        match input {
-            0 => QueryDuration::Long(),
-            1 => QueryDuration::Short(),
-            2 => QueryDuration::LongRelaxAP(),
-            _ => unreachable!(),
-        }
     }
 }
 
@@ -1448,9 +1057,10 @@ impl From<i32> for QueryDuration {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// CommitLevel indicates the desired consistency guarantee when committing a transaction on the server.
-#[php_class(name = "Aerospike\\CommitLevel")]
+#[php_class]
+#[php(name = "Aerospike\\CommitLevel")]
 pub struct CommitLevel {
-    _as: proto::CommitLevel,
+    _as: aero::CommitLevel,
 }
 
 impl FromZval<'_> for CommitLevel {
@@ -1464,20 +1074,18 @@ impl FromZval<'_> for CommitLevel {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CommitLevel {
-    /// CommitAll indicates the server should wait until successfully committing master and all
-    /// replicas.
+    /// CommitAll indicates the server should wait until successfully committing master and all replicas.
     pub fn Commit_All() -> Self {
         CommitLevel {
-            _as: proto::CommitLevel::CommitAll,
+            _as: aero::CommitLevel::CommitAll,
         }
     }
 
     /// CommitMaster indicates the server should wait until successfully committing master only.
     pub fn Commit_Master() -> Self {
         CommitLevel {
-            _as: proto::CommitLevel::CommitMaster,
+            _as: aero::CommitLevel::CommitMaster,
         }
     }
 }
@@ -1496,7 +1104,8 @@ pub enum _ConsistencyLevel {
     ConsistencyAll,
 }
 
-#[php_class(name = "Aerospike\\ConsistencyLevel")]
+#[php_class]
+#[php(name = "Aerospike\\ConsistencyLevel")]
 pub struct ConsistencyLevel {
     v: _ConsistencyLevel,
 }
@@ -1512,7 +1121,6 @@ impl FromZval<'_> for ConsistencyLevel {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ConsistencyLevel {
     /// ConsistencyOne indicates only a single replica should be consulted in
     /// the read operation.
@@ -1531,25 +1139,26 @@ impl ConsistencyLevel {
     }
 }
 
-impl From<&ConsistencyLevel> for proto::ConsistencyLevel {
+impl From<&ConsistencyLevel> for aero::ConsistencyLevel {
     fn from(input: &ConsistencyLevel) -> Self {
         match &input.v {
-            _ConsistencyLevel::ConsistencyOne => proto::ConsistencyLevel::ConsistencyOne,
-            _ConsistencyLevel::ConsistencyAll => proto::ConsistencyLevel::ConsistencyAll,
+            _ConsistencyLevel::ConsistencyOne => aero::ConsistencyLevel::ConsistencyOne,
+            _ConsistencyLevel::ConsistencyAll => aero::ConsistencyLevel::ConsistencyAll,
         }
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
-///
-///  GenerationPolicy
-///
+//
+//  GenerationPolicy
+//
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// `GenerationPolicy` determines how to handle record writes based on record generation.
-#[php_class(name = "Aerospike\\GenerationPolicy")]
+#[php_class]
+#[php(name = "Aerospike\\GenerationPolicy")]
 pub struct GenerationPolicy {
-    _as: proto::GenerationPolicy,
+    _as: aero::GenerationPolicy,
 }
 
 impl FromZval<'_> for GenerationPolicy {
@@ -1563,28 +1172,25 @@ impl FromZval<'_> for GenerationPolicy {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl GenerationPolicy {
     /// None means: Do not use record generation to restrict writes.
     pub fn None() -> Self {
         GenerationPolicy {
-            _as: proto::GenerationPolicy::None,
+            _as: aero::GenerationPolicy::None,
         }
     }
 
-    /// ExpectGenEqual means: Update/delete record if expected generation is equal to server
-    /// generation. Otherwise, fail.
+    /// ExpectGenEqual means: Update/delete record if expected generation is equal to server generation.
     pub fn Expect_Gen_Equal() -> Self {
         GenerationPolicy {
-            _as: proto::GenerationPolicy::ExpectGenEqual,
+            _as: aero::GenerationPolicy::ExpectGenEqual,
         }
     }
 
-    /// ExpectGenGreater means: Update/delete record if expected generation greater than the server
-    /// generation. Otherwise, fail. This is useful for restore after backup.
+    /// ExpectGenGreater means: Update/delete record if expected generation greater than the server generation.
     pub fn Expect_Gen_Greater() -> Self {
         GenerationPolicy {
-            _as: proto::GenerationPolicy::ExpectGenGt,
+            _as: aero::GenerationPolicy::ExpectGenGreater,
         }
     }
 }
@@ -1599,18 +1205,10 @@ const NAMESPACE_DEFAULT: u32 = 0x0000_0000;
 const NEVER_EXPIRE: u32 = 0xFFFF_FFFF; // -1 as i32
 const DONT_UPDATE: u32 = 0xFFFF_FFFE;
 
-/// Record expiration, also known as time-to-live (TTL).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum _Expiration {
-    Seconds(u32),
-    NamespaceDefault,
-    Never,
-    DontUpdate,
-}
-
-#[php_class(name = "Aerospike\\Expiration")]
+#[php_class]
+#[php(name = "Aerospike\\Expiration")]
 pub struct Expiration {
-    _as: _Expiration,
+    _as: aero::Expiration,
 }
 
 impl FromZval<'_> for Expiration {
@@ -1619,90 +1217,68 @@ impl FromZval<'_> for Expiration {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &Expiration = zval.extract()?;
 
-        Some(Expiration { _as: f._as.clone() })
+        Some(Expiration { _as: f._as })
     }
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Expiration {
     /// Set the record to expire X seconds from now.  See also `getTtl()`.
     pub fn Seconds(seconds: u32) -> Self {
         Expiration {
-            _as: _Expiration::Seconds(seconds),
+            _as: aero::Expiration::Seconds(seconds),
         }
     }
 
-    /// Answers with the expiration's current time to live in units of
-    /// seconds, excluding any special values.  If the expiration is set to
-    /// the namespace default, is configured to never update, or is configured
-    /// to never expire, this method returns null.  See also `Seconds()`.
-    #[getter]
+    /// Answers with the expiration's current time to live in units of seconds.
+    /// Returns null for any non-Seconds variant.
     pub fn get_ttl(&self) -> Option<u32> {
         match self._as {
-            _Expiration::Seconds(secs) => Some(secs),
+            aero::Expiration::Seconds(secs) => Some(secs),
             _ => None,
         }
     }
 
-    /// Set the record's expiry time using the default time-to-live (TTL) value
-    /// for the namespace.  See also `isNamespaceDefault()`.
+    /// Set the record's expiry time using the default TTL for the namespace.
     pub fn Namespace_Default() -> Self {
         Expiration {
-            _as: _Expiration::NamespaceDefault,
+            _as: aero::Expiration::NamespaceDefault,
         }
     }
 
     /// Answers true only if the expiration is set to use the namespace default.
-    /// See also `NamespaceDefault()`.
-    #[getter]
     pub fn is_namespace_default(&self) -> bool {
-        self._as == _Expiration::NamespaceDefault
+        matches!(self._as, aero::Expiration::NamespaceDefault)
     }
 
-    /// Set the record to never expire. Requires Aerospike 2 server version 2.7.2 or later or
-    /// Aerospike 3 server version 3.1.4 or later. Do not use with older servers.
-    /// See also `willNeverExpire()`.
+    /// Set the record to never expire.
     pub fn Never() -> Self {
         Expiration {
-            _as: _Expiration::Never,
+            _as: aero::Expiration::Never,
         }
     }
 
     /// Answers true only if the expiration is set to never expire.
-    /// See also `Never()`.
     pub fn will_never_expire(&self) -> bool {
-        self._as == _Expiration::Never
+        matches!(self._as, aero::Expiration::Never)
     }
 
-    /// Do not change the record's expiry time when updating the record;
-    /// requires Aerospike server version 3.10.1 or later.
-    /// See also `willUpdateExpiration()`.
+    /// Do not change the record's expiry time when updating the record.
     pub fn Dont_Update() -> Self {
         Expiration {
-            _as: _Expiration::DontUpdate,
+            _as: aero::Expiration::DontUpdate,
         }
     }
 
-    /// Answers *true* if the expiration is configured to somehow change during
-    /// a record update.  This can be as simple as an explicit time-to-live, or
-    /// an instruction to use the namespace's default expiration, etc.  Answers
-    /// *false* if the expiration will *not* be changed during a record update
-    /// (e.g., the expiration was constructed with DontUpdate().)
-    #[getter]
+    /// True if the expiration is configured to change during a record update.
     pub fn will_update_expiration(&self) -> bool {
-        self._as != _Expiration::DontUpdate
+        !matches!(self._as, aero::Expiration::DontUpdate)
     }
 }
 
 impl From<&Expiration> for u32 {
     fn from(exp: &Expiration) -> u32 {
-        match &exp._as {
-            _Expiration::Seconds(secs) => *secs,
-            _Expiration::NamespaceDefault => NAMESPACE_DEFAULT,
-            _Expiration::Never => NEVER_EXPIRE,
-            _Expiration::DontUpdate => DONT_UPDATE,
-        }
+        u32::from(exp._as)
     }
 }
 
@@ -1733,7 +1309,8 @@ pub enum _Concurrency {
     MaxThreads(u32),
 }
 
-#[php_class(name = "Aerospike\\Concurrency")]
+#[php_class]
+#[php(name = "Aerospike\\Concurrency")]
 pub struct Concurrency {
     v: _Concurrency,
 }
@@ -1749,7 +1326,6 @@ impl FromZval<'_> for Concurrency {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Concurrency {
     /// Issue commands sequentially. This mode has a performance advantage for small to
     /// medium sized batch sizes because requests can be issued in the main transaction thread.
@@ -1804,10 +1380,11 @@ impl From<&Concurrency> for u32 {
 /// Specifies whether a command, that needs to be executed on multiple cluster nodes, should be
 /// executed sequentially, one node at a time, or in parallel on multiple nodes using the client's
 /// thread pool.
-#[php_class(name = "Aerospike\\ListOrderType")]
-#[derive(PartialEq)]
+#[php_class]
+#[php(name = "Aerospike\\ListOrderType")]
+#[derive(Clone, Copy)]
 pub struct ListOrderType {
-    _as: proto::ListOrderType,
+    _as: aero::ListOrderType,
 }
 
 impl FromZval<'_> for ListOrderType {
@@ -1821,26 +1398,25 @@ impl FromZval<'_> for ListOrderType {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ListOrderType {
     fn flag(&self) -> i32 {
         match self._as {
-            proto::ListOrderType::Unordered => 0,
-            proto::ListOrderType::Ordered => 1,
+            aero::ListOrderType::Unordered => 0,
+            aero::ListOrderType::Ordered => 1,
         }
     }
 
     /// ListOrderOrdered signifies that list is Ordered.
     pub fn Ordered() -> Self {
         ListOrderType {
-            _as: proto::ListOrderType::Ordered,
+            _as: aero::ListOrderType::Ordered,
         }
     }
 
     /// ListOrderUnordered signifies that list is not ordered. This is the default.
     pub fn Unordered() -> Self {
         ListOrderType {
-            _as: proto::ListOrderType::Unordered,
+            _as: aero::ListOrderType::Unordered,
         }
     }
 }
@@ -1854,9 +1430,11 @@ impl ListOrderType {
 /// Specifies whether a command, that needs to be executed on multiple cluster nodes, should be
 /// executed sequentially, one node at a time, or in parallel on multiple nodes using the client's
 /// thread pool.
-#[php_class(name = "Aerospike\\MapOrderType")]
+#[php_class]
+#[php(name = "Aerospike\\MapOrderType")]
+#[derive(Clone, Copy)]
 pub struct MapOrderType {
-    _as: proto::MapOrderType,
+    _as: aero::operations::maps::MapOrder,
 }
 
 impl FromZval<'_> for MapOrderType {
@@ -1870,42 +1448,41 @@ impl FromZval<'_> for MapOrderType {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl MapOrderType {
     fn attr(&self) -> i32 {
         match self._as {
-            proto::MapOrderType::Unordered => 0,
-            proto::MapOrderType::KeyOrdered => 1,
-            proto::MapOrderType::KeyValueOrdered => 3,
+            aero::operations::maps::MapOrder::Unordered => 0,
+            aero::operations::maps::MapOrder::KeyOrdered => 1,
+            aero::operations::maps::MapOrder::KeyValueOrdered => 3,
         }
     }
 
     fn flag(&self) -> i32 {
         match self._as {
-            proto::MapOrderType::Unordered => 0x40,
-            proto::MapOrderType::KeyOrdered => 0x80,
-            proto::MapOrderType::KeyValueOrdered => 0xc0,
+            aero::operations::maps::MapOrder::Unordered => 0x40,
+            aero::operations::maps::MapOrder::KeyOrdered => 0x80,
+            aero::operations::maps::MapOrder::KeyValueOrdered => 0xc0,
         }
     }
 
     /// Map is not ordered. This is the default.
     pub fn Unordered() -> Self {
         MapOrderType {
-            _as: proto::MapOrderType::Unordered,
+            _as: aero::operations::maps::MapOrder::Unordered,
         }
     }
 
     /// Order map by key.
     pub fn Key_Ordered() -> Self {
         MapOrderType {
-            _as: proto::MapOrderType::KeyOrdered,
+            _as: aero::operations::maps::MapOrder::KeyOrdered,
         }
     }
 
     /// Order map by key, then value.
     pub fn Key_Value_Ordered() -> Self {
         MapOrderType {
-            _as: proto::MapOrderType::KeyValueOrdered,
+            _as: aero::operations::maps::MapOrder::KeyValueOrdered,
         }
     }
 }
@@ -1916,46 +1493,28 @@ impl MapOrderType {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-enum CDTContextType {
-    ListIndex = 0x10,
-    ListRank = 0x11,
-    ListValue = 0x13,
-    MapIndex = 0x20,
-    MapRank = 0x21,
-    MapKey = 0x22,
-    MapValue = 0x23,
-}
-
 /// CDTContext defines Nested CDT context. Identifies the location of nested list/map to apply the operation.
 /// for the current level.
 /// An array of CTX identifies location of the list/map on multiple
 /// levels on nesting.
-#[php_class(name = "Aerospike\\Context")]
+#[php_class]
+#[php(name = "Aerospike\\Context")]
 pub struct CDTContext {
-    _as: proto::CdtContext,
+    _as: aero::operations::cdt_context::CdtContext,
 }
 
-/// `CDTContext` excapsulates parameters for transaction policy attributes
+/// `CDTContext` encapsulates parameters for transaction policy attributes
 /// used in all database operation calls.
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CDTContext {
     pub fn __construct() -> Self {
         CDTContext {
-            _as: proto::CdtContext::default(),
+            _as: aero::operations::cdt_context::CdtContext {
+                id: 0,
+                flags: 0,
+                value: aero::Value::Nil,
+            },
         }
-    }
-
-    fn list_order_flag(order: ListOrderType, pad: bool) -> i32 {
-        if order.flag() == 1 {
-            return 0xc0;
-        }
-
-        if pad {
-            return 0x80;
-        }
-
-        return 0x40;
     }
 
     /// CtxListIndex defines Lookup list by index offset.
@@ -1968,20 +1527,18 @@ impl CDTContext {
     /// -3: Third to last item.
     pub fn ListIndex(index: i32) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::ListIndex as i32,
-                value: Some(PHPValue::Int(index.into()).into()),
-            },
+            _as: aero::operations::cdt_context::ctx_list_index(i64::from(index)),
         }
     }
 
     /// CtxListIndexCreate list with given type at index offset, given an order and pad.
     pub fn ListIndexCreate(index: i32, order: ListOrderType, pad: bool) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::ListIndex as i32 | Self::list_order_flag(order, pad),
-                value: Some(PHPValue::Int(index.into()).into()),
-            },
+            _as: aero::operations::cdt_context::ctx_list_index_create(
+                i64::from(index),
+                order._as,
+                pad,
+            ),
         }
     }
 
@@ -1991,20 +1548,14 @@ impl CDTContext {
     /// -1 = largest value
     pub fn ListRank(rank: i32) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::ListRank as i32,
-                value: Some(PHPValue::Int(rank.into()).into()),
-            },
+            _as: aero::operations::cdt_context::ctx_list_rank(i64::from(rank)),
         }
     }
 
     /// CtxListValue defines Lookup list by value.
     pub fn ListValue(key: PHPValue) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::ListValue as i32,
-                value: Some(key.into()),
-            },
+            _as: aero::operations::cdt_context::ctx_list_value(key.into()),
         }
     }
 
@@ -2018,10 +1569,7 @@ impl CDTContext {
     /// -3: Third to last item.
     pub fn MapIndex(index: i32) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::MapIndex as i32,
-                value: Some(PHPValue::Int(index.into()).into()),
-            },
+            _as: aero::operations::cdt_context::ctx_map_index(aero::Value::Int(i64::from(index))),
         }
     }
 
@@ -2031,40 +1579,28 @@ impl CDTContext {
     /// -1 = largest value
     pub fn MapRank(rank: i32) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::MapRank as i32,
-                value: Some(PHPValue::Int(rank.into()).into()),
-            },
+            _as: aero::operations::cdt_context::ctx_map_rank(i64::from(rank)),
         }
     }
 
     /// CtxMapKey defines Lookup map by key.
     pub fn MapKey(key: PHPValue) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::MapKey as i32,
-                value: Some(key.into()),
-            },
+            _as: aero::operations::cdt_context::ctx_map_key(key.into()),
         }
     }
 
     /// CtxMapKeyCreate creates map with given type at map key.
     pub fn MapKeyCreate(key: PHPValue, order: MapOrderType) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::MapKey as i32 | order.flag(),
-                value: Some(key.into()),
-            },
+            _as: aero::operations::cdt_context::ctx_map_key_create(key.into(), order._as),
         }
     }
 
     /// CtxMapValue defines Lookup map by value.
     pub fn MapValue(key: PHPValue) -> Self {
         CDTContext {
-            _as: proto::CdtContext {
-                id: CDTContextType::MapValue as i32,
-                value: Some(key.into()),
-            },
+            _as: aero::operations::cdt_context::ctx_map_value(key.into()),
         }
     }
 }
@@ -2077,250 +1613,88 @@ impl CDTContext {
 
 /// `ReadPolicy` encapsulates parameters for transaction policy attributes
 /// used in all database operation calls.
-#[php_class(name = "Aerospike\\ReadPolicy")]
+///
+/// v2 BREAKING: `sleep_multiplier`, `use_compression`, `exit_fast_on_exhausted_connection_pool`,
+/// `send_key` and `read_mode_sc` are not supported by the native aerospike-client-rust crate
+/// and have been removed. `read_mode_ap` maps to the new `consistency_level` concept.
+#[php_class]
+#[php(name = "Aerospike\\ReadPolicy")]
+#[derive(Default)]
 pub struct ReadPolicy {
-    _as: proto::ReadPolicy,
+    _as: aero::ReadPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ReadPolicy {
     pub fn __construct() -> Self {
         ReadPolicy::default()
     }
 
     /// MaxRetries determines the maximum number of retries before aborting the current transaction.
-    /// The initial attempt is not counted as a retry.
-    ///
-    /// If MaxRetries is exceeded, the transaction will abort with an error.
-    ///
-    /// WARNING: Database writes that are not idempotent (such as AddOp)
-    /// should not be retried because the write operation may be performed
-    /// multiple times if the client timed out previous transaction attempts.
-    /// It's important to use a distinct WritePolicy for non-idempotent
-    /// writes which sets maxRetries = 0;
-    ///
-    /// Default for read: 2 (initial attempt + 2 retries = 3 attempts)
-    ///
-    /// Default for write: 0 (no retries)
-    ///
-    /// Default for partition scan or query with nil filter: 5
-    /// (6 attempts. See ScanPolicy comments.)
-    #[getter]
     pub fn get_max_retries(&self) -> u32 {
-        self._as.max_retries
+        self._as.base_policy.max_retries as u32
     }
-
-    #[setter]
     pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as.max_retries = max_retries;
+        self._as.base_policy.max_retries = max_retries as usize;
     }
 
-    /// SleepMultiplier specifies the multiplying factor to be used for exponential backoff during retries.
-    /// Default to (1.0); Only values greater than 1 are valid.
-    #[getter]
-    pub fn get_sleep_multiplier(&self) -> f64 {
-        self._as.sleep_multiplier
-    }
-
-    #[setter]
-    pub fn set_sleep_multiplier(&mut self, sleep_multiplier: f64) {
-        self._as.sleep_multiplier = sleep_multiplier;
-    }
-
-    /// TotalTimeout specifies total transaction timeout.
-    ///
-    /// The TotalTimeout is tracked on the client and also sent to the server along
-    /// with the transaction in the wire protocol. The client will most likely
-    /// timeout first, but the server has the capability to Timeout the transaction.
-    ///
-    /// If TotalTimeout is not zero and TotalTimeout is reached before the transaction
-    /// completes, the transaction will abort with TotalTimeout error.
-    ///
-    /// If TotalTimeout is zero, there will be no time limit and the transaction will retry
-    /// on network timeouts/errors until MaxRetries is exceeded. If MaxRetries is exceeded, the
-    /// transaction also aborts with Timeout error.
-    ///
-    /// Default for scan/query: 0 (no time limit and rely on MaxRetries)
-    ///
-    /// Default for all other commands: 1000ms
-    #[getter]
+    /// TotalTimeout specifies total transaction timeout in milliseconds.
     pub fn get_total_timeout(&self) -> u64 {
-        self._as.total_timeout
+        u64::from(self._as.base_policy.total_timeout)
+    }
+    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
 
-    #[setter]
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) {
-        self._as.total_timeout = timeout_millis;
-    }
-
-    /// SocketTimeout determines network timeout for each attempt.
-    ///
-    /// If SocketTimeout is not zero and SocketTimeout is reached before an attempt completes,
-    /// the Timeout above is checked. If Timeout is not exceeded, the transaction
-    /// is retried. If both SocketTimeout and Timeout are non-zero, SocketTimeout must be less
-    /// than or equal to Timeout, otherwise Timeout will also be used for SocketTimeout.
-    ///
-    /// Default: 30s
-    #[getter]
+    /// SocketTimeout determines network timeout for each attempt in milliseconds.
     pub fn get_socket_timeout(&self) -> u64 {
-        self._as.socket_timeout
+        u64::from(self._as.base_policy.socket_timeout)
+    }
+    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
 
-    #[setter]
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) {
-        self._as.socket_timeout = timeout_millis;
-    }
-
-    /// ReadTouchTTLPercent determines how record TTL (time to live) is affected on reads. When enabled, the server can
-    /// efficiently operate as a read-based LRU cache where the least recently used records are expired.
-    /// The value is expressed as a percentage of the TTL sent on the most recent write such that a read
-    /// within this interval of the record’s end of life will generate a touch.
-    ///
-    /// For example, if the most recent write had a TTL of 10 hours and read_touch_ttl_percent is set to
-    /// 80, the next read within 8 hours of the record's end of life (equivalent to 2 hours after the most
-    /// recent write) will result in a touch, resetting the TTL to another 10 hours.
-    ///
-    /// Values:
-    ///
-    /// 0 : Use server config default-read-touch-ttl-pct for the record's namespace/set.
-    /// -1 : Do not reset record TTL on reads.
-    /// 1 - 100 : Reset record TTL on reads when within this percentage of the most recent write TTL.
-    /// Default: 0
-    #[getter]
+    /// ReadTouchTTLPercent determines how record TTL is affected on reads.
+    /// 0 = use server default, -1 = don't reset, 1..=100 = percentage. Supported in server v8+.
     pub fn get_read_touch_ttl_percent(&self) -> i32 {
-        self._as.read_touch_ttl_percent
+        match self._as.base_policy.read_touch_ttl {
+            aero::policy::ReadTouchTTL::Percent(p) => i32::from(p),
+            aero::policy::ReadTouchTTL::ServerDefault => 0,
+            aero::policy::ReadTouchTTL::DontReset => -1,
+        }
     }
-
-    #[setter]
     pub fn set_read_touch_ttl_percent(&mut self, percent: i32) {
-        self._as.read_touch_ttl_percent = percent;
-    }
-
-    /// SendKey determines to whether send user defined key in addition to hash digest on both reads and writes.
-    /// If the key is sent on a write, the key will be stored with the record on
-    /// the server.
-    /// The default is to not send the user defined key.
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as.send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as.send_key = send_key;
-    }
-
-    /// UseCompression uses zlib compression on command buffers sent to the server and responses received
-    /// from the server when the buffer size is greater than 128 bytes.
-    ///
-    /// This option will increase cpu and memory usage (for extra compressed buffers),but
-    /// decrease the size of data sent over the network.
-    ///
-    /// Default: false
-    #[getter]
-    pub fn get_use_compression(&self) -> bool {
-        self._as.use_compression
-    }
-
-    #[setter]
-    pub fn set_use_compression(&mut self, use_compression: bool) {
-        self._as.use_compression = use_compression;
-    }
-
-    /// ExitFastOnExhaustedConnectionPool determines if a command that tries to get a
-    /// connection from the connection pool will wait and retry in case the pool is
-    /// exhausted until a connection becomes available (or the TotalTimeout is reached).
-    /// If set to true, an error will be return immediately.
-    /// If set to false, getting a connection will be retried.
-    /// This only applies if LimitConnectionsToQueueSize is set to true and the number of open connections to a node has reached ConnectionQueueSize.
-    /// The default is false
-    #[getter]
-    pub fn get_exit_fast_on_exhausted_connection_pool(&self) -> bool {
-        self._as.exit_fast_on_exhausted_connection_pool
-    }
-
-    #[setter]
-    pub fn set_exit_fast_on_exhausted_connection_pool(
-        &mut self,
-        exit_fast_on_exhausted_connection_pool: bool,
-    ) {
-        self._as.exit_fast_on_exhausted_connection_pool = exit_fast_on_exhausted_connection_pool;
+        self._as.base_policy.read_touch_ttl = match percent {
+            0 => aero::policy::ReadTouchTTL::ServerDefault,
+            -1 => aero::policy::ReadTouchTTL::DontReset,
+            p if (1..=100).contains(&p) => aero::policy::ReadTouchTTL::Percent(p as u8),
+            _ => aero::policy::ReadTouchTTL::ServerDefault,
+        };
     }
 
     /// ReadModeAP indicates read policy for AP (availability) namespaces.
-    #[getter]
+    /// Maps to the underlying consistency_level (ConsistencyOne/ConsistencyAll).
     pub fn get_read_mode_ap(&self) -> ReadModeAP {
         ReadModeAP {
-            _as: match self._as.read_mode_ap {
-                0 => proto::ReadModeAp::One,
-                1 => proto::ReadModeAp::All,
-                _ => unreachable!(),
-            },
+            _as: self._as.base_policy.consistency_level.clone(),
         }
     }
-
-    #[setter]
     pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.read_mode_ap = read_mode_ap._as.into();
-    }
-
-    /// ReadModeSC indicates read policy for SC (strong consistency) namespaces.
-    #[getter]
-    pub fn get_read_mode_sc(&self) -> ReadModeSC {
-        ReadModeSC {
-            _as: match self._as.read_mode_ap {
-                0 => proto::ReadModeSc::Session,
-                1 => proto::ReadModeSc::Linearize,
-                2 => proto::ReadModeSc::AllowReplica,
-                3 => proto::ReadModeSc::AllowUnavailable,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_sc(&mut self, read_mode_sc: ReadModeSC) {
-        self._as.read_mode_sc = read_mode_sc._as.into();
+        self._as.base_policy.consistency_level = read_mode_ap._as;
     }
 
     /// FilterExpression is the optional Filter Expression. Supported on Server v5.2+
-    #[getter]
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
+            .base_policy
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self._as.filter_expression = Some(fe._as),
-            None => self._as.filter_expression = None,
-        }
-    }
-}
-
-impl Default for ReadPolicy {
-    fn default() -> Self {
-        ReadPolicy {
-            _as: proto::ReadPolicy {
-                max_retries: 3,
-                sleep_multiplier: 1.0,
-                total_timeout: 1000,
-                socket_timeout: 500,
-                send_key: false,
-                use_compression: false,
-                exit_fast_on_exhausted_connection_pool: false,
-                read_mode_ap: proto::ReadModeAp::One.into(),
-                read_mode_sc: proto::ReadModeSc::Session.into(),
-                filter_expression: None,
-                sleep_between_retries: 1,
-                replica_policy: 1,
-                read_touch_ttl_percent: 0,
-            },
-        }
+        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -2331,26 +1705,22 @@ impl Default for ReadPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// `AdminPolicy` encapsulates parameters for all admin operations.
-#[php_class(name = "Aerospike\\AdminPolicy")]
+#[php_class]
+#[php(name = "Aerospike\\AdminPolicy")]
 pub struct AdminPolicy {
-    _as: proto::AdminPolicy,
+    _as: aero::AdminPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl AdminPolicy {
     pub fn __construct() -> Self {
         AdminPolicy::default()
     }
 
-    /// User administration command socket timeout.
-    /// Default is 2 seconds.
-    #[getter]
+    /// User administration command socket timeout (milliseconds). Default: 3000.
     pub fn get_timeout(&self) -> u32 {
         self._as.timeout
     }
-
-    #[setter]
     pub fn set_timeout(&mut self, timeout_millis: u32) {
         self._as.timeout = timeout_millis;
     }
@@ -2359,7 +1729,7 @@ impl AdminPolicy {
 impl Default for AdminPolicy {
     fn default() -> Self {
         AdminPolicy {
-            _as: proto::AdminPolicy { timeout: 3000 },
+            _as: aero::AdminPolicy { timeout: 3000 },
         }
     }
 }
@@ -2370,25 +1740,31 @@ impl Default for AdminPolicy {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// `InfoPolicy` encapsulates parameters for all info operations.
-#[php_class(name = "Aerospike\\InfoPolicy")]
+/// `InfoPolicy` encapsulates parameters for all info-command operations.
+/// (Standalone in v2 — aerospike-client-rust does not expose a dedicated info policy.)
+#[php_class]
+#[php(name = "Aerospike\\InfoPolicy")]
+#[derive(Clone, Copy)]
 pub struct InfoPolicy {
-    _as: proto::InfoPolicy,
+    pub timeout: u32,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl InfoPolicy {
     pub fn __construct() -> Self {
         InfoPolicy::default()
+    }
+    pub fn get_timeout(&self) -> u32 {
+        self.timeout
+    }
+    pub fn set_timeout(&mut self, timeout_millis: u32) {
+        self.timeout = timeout_millis;
     }
 }
 
 impl Default for InfoPolicy {
     fn default() -> Self {
-        InfoPolicy {
-            _as: proto::InfoPolicy { timeout: 3000 },
-        }
+        InfoPolicy { timeout: 3000 }
     }
 }
 
@@ -2399,356 +1775,132 @@ impl Default for InfoPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// `WritePolicy` encapsulates parameters for all write operations.
-#[php_class(name = "Aerospike\\WritePolicy")]
+///
+/// v2 BREAKING: legacy fields `sleep_multiplier`, `use_compression`,
+/// `exit_fast_on_exhausted_connection_pool`, `read_mode_sc` have been removed.
+#[php_class]
+#[php(name = "Aerospike\\WritePolicy")]
+#[derive(Default)]
 pub struct WritePolicy {
-    _as: proto::WritePolicy,
+    _as: aero::WritePolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl WritePolicy {
     pub fn __construct() -> Self {
         WritePolicy::default()
     }
 
     /// RecordExistsAction qualifies how to handle writes where the record already exists.
-    #[getter]
     pub fn get_record_exists_action(&self) -> RecordExistsAction {
         RecordExistsAction {
-            _as: match &self._as.record_exists_action {
-                0 => proto::RecordExistsAction::Update,
-                1 => proto::RecordExistsAction::UpdateOnly,
-                2 => proto::RecordExistsAction::Replace,
-                3 => proto::RecordExistsAction::ReplaceOnly,
-                4 => proto::RecordExistsAction::CreateOnly,
-                _ => unreachable!(),
-            },
+            _as: self._as.record_exists_action.clone(),
         }
     }
-
-    #[setter]
     pub fn set_record_exists_action(&mut self, record_exists_action: RecordExistsAction) {
-        self._as.record_exists_action = record_exists_action._as.into();
+        self._as.record_exists_action = record_exists_action._as;
     }
 
-    /// GenerationPolicy qualifies how to handle record writes based on record generation. The default (NONE)
-    /// indicates that the generation is not used to restrict writes.
-    #[getter]
+    /// GenerationPolicy qualifies how to handle record writes based on record generation.
     pub fn get_generation_policy(&self) -> GenerationPolicy {
         GenerationPolicy {
-            _as: match &self._as.generation_policy {
-                0 => proto::GenerationPolicy::None,
-                1 => proto::GenerationPolicy::ExpectGenEqual,
-                2 => proto::GenerationPolicy::ExpectGenGt,
-                _ => unreachable!(),
-            },
+            _as: self._as.generation_policy.clone(),
         }
     }
-
-    #[setter]
     pub fn set_generation_policy(&mut self, generation_policy: GenerationPolicy) {
-        self._as.generation_policy = generation_policy._as.into();
+        self._as.generation_policy = generation_policy._as;
     }
 
-    /// Desired consistency guarantee when committing a transaction on the server. The default
-    /// (COMMIT_ALL) indicates that the server should wait for master and all replica commits to
-    /// be successful before returning success to the client.
-    #[getter]
+    /// Desired consistency guarantee when committing a transaction on the server.
     pub fn get_commit_level(&self) -> CommitLevel {
         CommitLevel {
-            _as: match &self._as.commit_level {
-                0 => proto::CommitLevel::CommitAll,
-                1 => proto::CommitLevel::CommitMaster,
-                _ => unreachable!(),
-            },
+            _as: self._as.commit_level.clone(),
         }
     }
-
-    #[setter]
     pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
-        self._as.commit_level = commit_level._as.into();
+        self._as.commit_level = commit_level._as;
     }
 
-    /// Generation determines expected generation.
-    /// Generation is the number of times a record has been
-    /// modified (including creation) on the server.
-    /// If a write operation is creating a record, the expected generation would be 0.
-    #[getter]
+    /// Generation: expected generation count when generation_policy is set.
     pub fn get_generation(&self) -> u32 {
         self._as.generation
     }
-
-    #[setter]
     pub fn set_generation(&mut self, generation: u32) {
         self._as.generation = generation;
     }
 
-    /// Expiration determines record expiration in seconds. Also known as TTL (Time-To-Live).
-    /// Seconds record will live before being removed by the server.
-    /// Expiration values:
-    /// TTLServerDefault (0): Default to namespace configuration variable "default-ttl" on the server.
-    /// TTLDontExpire (MaxUint32): Never expire for Aerospike 2 server versions >= 2.7.2 and Aerospike 3+ server
-    /// TTLDontUpdate (MaxUint32 - 1): Do not change ttl when record is written. Supported by Aerospike server versions >= 3.10.1
-    /// > 0: Actual expiration in seconds.
-    #[getter]
+    /// Expiration / time-to-live for the record.
     pub fn get_expiration(&self) -> Expiration {
-        match self._as.expiration {
-            NAMESPACE_DEFAULT => Expiration::Namespace_Default(),
-            NEVER_EXPIRE => Expiration::Never(),
-            DONT_UPDATE => Expiration::Dont_Update(),
-            secs => Expiration::Seconds(secs),
+        Expiration {
+            _as: self._as.expiration,
         }
     }
-
-    #[setter]
     pub fn set_expiration(&mut self, expiration: Expiration) {
-        self._as.expiration = (&expiration).into();
+        self._as.expiration = expiration._as;
     }
 
-    /// RespondPerEachOp defines for client.Operate() method, return a result for every operation.
-    /// Some list operations do not return results by default (ListClearOp() for example).
-    /// This can sometimes make it difficult to determine the desired result offset in the returned
-    /// bin's result list.
-    ///
-    /// Setting RespondPerEachOp to true makes it easier to identify the desired result offset
-    /// (result offset equals bin's operate sequence). This only makes sense when multiple list
-    /// operations are used in one operate call and some of those operations do not return results
-    /// by default.
-    #[getter]
+    /// RespondPerEachOp: return a result for every operation in an operate() call.
     pub fn get_respond_per_each_op(&self) -> bool {
         self._as.respond_per_each_op
     }
-
-    #[setter]
     pub fn set_respond_per_each_op(&mut self, respond_per_each_op: bool) {
         self._as.respond_per_each_op = respond_per_each_op;
     }
 
-    /// DurableDelete leaves a tombstone for the record if the transaction results in a record deletion.
-    /// This prevents deleted records from reappearing after node failures.
-    /// Valid for Aerospike Server Enterprise Edition 3.10+ only.
-    #[getter]
+    /// DurableDelete leaves a tombstone for the record on deletion. Enterprise only.
     pub fn get_durable_delete(&self) -> bool {
-        self._as.respond_per_each_op
+        self._as.durable_delete
     }
-
-    #[setter]
     pub fn set_durable_delete(&mut self, durable_delete: bool) {
         self._as.durable_delete = durable_delete;
     }
 
-    /// ***************************************************************************
-    /// ReadPolicy Attrs
-    /// ***************************************************************************
-
-    #[getter]
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.policy.as_ref().unwrap().max_retries
-    }
-
-    #[setter]
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.max_retries = max_retries);
-    }
-
-    #[getter]
-    pub fn get_sleep_multiplier(&self) -> f64 {
-        self._as.policy.as_ref().unwrap().sleep_multiplier
-    }
-
-    #[setter]
-    pub fn set_sleep_multiplier(&mut self, sleep_multiplier: f64) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.sleep_multiplier = sleep_multiplier);
-    }
-
-    #[getter]
-    pub fn get_total_timeout(&self) -> u64 {
-        self._as.policy.as_ref().unwrap().total_timeout
-    }
-
-    #[setter]
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.total_timeout = timeout_millis);
-    }
-
-    #[getter]
-    pub fn get_socket_timeout(&self) -> u64 {
-        self._as.policy.as_ref().unwrap().socket_timeout
-    }
-
-    #[setter]
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.socket_timeout = timeout_millis);
-    }
-
-    #[getter]
+    /// SendKey: store the user-defined key with the record on the server.
     pub fn get_send_key(&self) -> bool {
-        self._as.policy.as_ref().unwrap().send_key
+        self._as.send_key
     }
-
-    #[setter]
     pub fn set_send_key(&mut self, send_key: bool) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.send_key = send_key);
+        self._as.send_key = send_key;
     }
 
-    #[getter]
-    pub fn get_use_compression(&self) -> bool {
-        self._as.policy.as_ref().unwrap().use_compression
+    // ----- base policy attributes -----
+    pub fn get_max_retries(&self) -> u32 {
+        self._as.base_policy.max_retries as u32
     }
-
-    #[setter]
-    pub fn set_use_compression(&mut self, use_compression: bool) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.use_compression = use_compression);
+    pub fn set_max_retries(&mut self, max_retries: u32) {
+        self._as.base_policy.max_retries = max_retries as usize;
     }
-
-    #[getter]
-    pub fn get_exit_fast_on_exhausted_connection_pool(&self) -> bool {
-        self._as
-            .policy
-            .as_ref()
-            .unwrap()
-            .exit_fast_on_exhausted_connection_pool
+    pub fn get_total_timeout(&self) -> u64 {
+        u64::from(self._as.base_policy.total_timeout)
     }
-
-    #[setter]
-    pub fn set_exit_fast_on_exhausted_connection_pool(
-        &mut self,
-        exit_fast_on_exhausted_connection_pool: bool,
-    ) {
-        self._as.policy.as_mut().map(|ref mut p| {
-            p.exit_fast_on_exhausted_connection_pool = exit_fast_on_exhausted_connection_pool
-        });
+    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
-
-    #[getter]
+    pub fn get_socket_timeout(&self) -> u64 {
+        u64::from(self._as.base_policy.socket_timeout)
+    }
+    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
+    }
     pub fn get_read_mode_ap(&self) -> ReadModeAP {
         ReadModeAP {
-            _as: match self._as.policy.as_ref().unwrap().read_mode_ap {
-                0 => proto::ReadModeAp::One,
-                1 => proto::ReadModeAp::All,
-                _ => unreachable!(),
-            },
+            _as: self._as.base_policy.consistency_level.clone(),
         }
     }
-
-    #[setter]
     pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_ap = read_mode_ap._as.into());
+        self._as.base_policy.consistency_level = read_mode_ap._as;
     }
-
-    #[getter]
-    pub fn get_read_mode_sc(&self) -> ReadModeSC {
-        ReadModeSC {
-            _as: match self._as.policy.as_ref().unwrap().read_mode_ap {
-                0 => proto::ReadModeSc::Session,
-                1 => proto::ReadModeSc::Linearize,
-                2 => proto::ReadModeSc::AllowReplica,
-                3 => proto::ReadModeSc::AllowUnavailable,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_sc(&mut self, read_mode_sc: ReadModeSC) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_sc = read_mode_sc._as.into());
-    }
-
-    #[getter]
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
-            .policy
-            .as_ref()
-            .unwrap()
+            .base_policy
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self
-                ._as
-                .policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = Some(fe._as)),
-            None => self
-                ._as
-                .policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = None),
-        };
-    }
-}
-
-impl Default for WritePolicy {
-    fn default() -> Self {
-        WritePolicy {
-            _as: proto::WritePolicy {
-                policy: Some(proto::ReadPolicy::default()),
-                record_exists_action: proto::RecordExistsAction::Update.into(),
-                generation_policy: proto::GenerationPolicy::None.into(),
-                commit_level: proto::CommitLevel::CommitAll.into(),
-                generation: 0,
-                expiration: 0,
-                respond_per_each_op: false,
-                durable_delete: false,
-            },
-        }
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////
-//
-//  MultiPolicy
-//
-////////////////////////////////////////////////////////////////////////////////////////////
-
-/// MultiPolicy contains parameters for policy attributes used in
-/// query and scan operations.
-pub struct MultiPolicy {
-    _as: proto::MultiPolicy,
-}
-
-impl Default for MultiPolicy {
-    fn default() -> Self {
-        let mut rp = ReadPolicy::default();
-        rp.set_total_timeout(0);
-        MultiPolicy {
-            _as: proto::MultiPolicy {
-                read_policy: Some(rp._as),
-                max_concurrent_nodes: 0,
-                records_per_second: 0,
-                record_queue_size: 50,
-                include_bin_data: true,
-                max_records: 0,
-            },
-        }
+        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -2759,345 +1911,86 @@ impl Default for MultiPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// QueryPolicy encapsulates parameters for policy attributes used in query operations.
-#[php_class(name = "Aerospike\\QueryPolicy")]
+///
+/// v2 BREAKING: legacy fields `sleep_multiplier`, `send_key`, `use_compression`,
+/// `exit_fast_on_exhausted_connection_pool`, `read_mode_sc` have been removed.
+#[php_class]
+#[php(name = "Aerospike\\QueryPolicy")]
+#[derive(Default)]
 pub struct QueryPolicy {
-    _as: proto::QueryPolicy,
+    _as: aero::QueryPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl QueryPolicy {
     pub fn __construct() -> Self {
         QueryPolicy::default()
     }
 
-    /// QueryDuration represents the expected duration for a query operation in the Aerospike database.
-    /// It provides options for specifying whether a query is expected to return a large number of records per node (Long),
-    /// a small number of records per node (Short), or a long query with relaxed read consistency for AP namespaces (LongRelaxAP).
-    /// These options influence how the server optimizes query execution to meet the expected duration requirements.
-    #[getter]
+    /// Expected query duration (Long, Short, LongRelaxAP). Server v6.0+.
     pub fn get_expected_duration(&self) -> QueryDuration {
-        self._as.expected_duration.into()
+        QueryDuration {
+            _as: self._as.expected_duration.clone(),
+        }
     }
-
-    #[setter]
     pub fn set_expected_duration(&mut self, expected_duration: QueryDuration) {
-        self._as.expected_duration = expected_duration._as.into();
+        self._as.expected_duration = expected_duration._as;
     }
 
-    /// ***************************************************************************
-    /// MultiPolicy Attrs
-    /// ***************************************************************************
-
-    /// Maximum number of concurrent requests to server nodes at any point in time.
-    /// If there are 16 nodes in the cluster and maxConcurrentNodes is 8, then queries
-    /// will be made to 8 nodes in parallel.  When a query completes, a new query will
-    /// be issued until all 16 nodes have been queried.
-    /// Default (0) is to issue requests to all server nodes in parallel.
-    /// 1 will to issue requests to server nodes one by one avoiding parallel queries.
-    #[getter]
+    /// Maximum number of concurrent requests to server nodes.
     pub fn get_max_concurrent_nodes(&self) -> u32 {
-        self._as.multi_policy.as_ref().unwrap().max_concurrent_nodes
+        self._as.max_concurrent_nodes as u32
     }
-
-    #[setter]
     pub fn set_max_concurrent_nodes(&mut self, max_concurrent_nodes: u32) {
-        self._as.multi_policy.as_mut().unwrap().max_concurrent_nodes = max_concurrent_nodes;
+        self._as.max_concurrent_nodes = max_concurrent_nodes as usize;
     }
 
     /// Number of records to place in queue before blocking.
-    /// Records received from multiple server nodes will be placed in a queue.
-    /// A separate goroutine consumes these records in parallel.
-    /// If the queue is full, the producer goroutines will block until records are consumed.
-    #[getter]
     pub fn get_record_queue_size(&self) -> u32 {
-        self._as.multi_policy.as_ref().unwrap().record_queue_size
+        self._as.record_queue_size as u32
     }
-
-    #[setter]
     pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
-        self._as.multi_policy.as_mut().unwrap().record_queue_size = record_queue_size;
+        self._as.record_queue_size = record_queue_size as usize;
     }
 
-    /// ***************************************************************************
-    /// ReadPolicy Attrs
-    /// ***************************************************************************
-
-    #[getter]
+    // ----- base policy attributes -----
     pub fn get_max_retries(&self) -> u32 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .max_retries
+        self._as.base_policy.max_retries as u32
     }
-
-    #[setter]
     pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.max_retries = max_retries);
+        self._as.base_policy.max_retries = max_retries as usize;
     }
-
-    #[getter]
-    pub fn get_sleep_multiplier(&self) -> f64 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .sleep_multiplier
-    }
-
-    #[setter]
-    pub fn set_sleep_multiplier(&mut self, sleep_multiplier: f64) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.sleep_multiplier = sleep_multiplier);
-    }
-
-    #[getter]
     pub fn get_total_timeout(&self) -> u64 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .total_timeout
+        u64::from(self._as.base_policy.total_timeout)
     }
-
-    #[setter]
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.total_timeout = timeout_millis);
+    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
-
-    #[getter]
     pub fn get_socket_timeout(&self) -> u64 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .socket_timeout
+        u64::from(self._as.base_policy.socket_timeout)
     }
-
-    #[setter]
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.socket_timeout = timeout_millis);
+    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
-
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.send_key = send_key);
-    }
-
-    #[getter]
-    pub fn get_use_compression(&self) -> bool {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .use_compression
-    }
-
-    #[setter]
-    pub fn set_use_compression(&mut self, use_compression: bool) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.use_compression = use_compression);
-    }
-
-    #[getter]
-    pub fn get_exit_fast_on_exhausted_connection_pool(&self) -> bool {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .exit_fast_on_exhausted_connection_pool
-    }
-
-    #[setter]
-    pub fn set_exit_fast_on_exhausted_connection_pool(
-        &mut self,
-        exit_fast_on_exhausted_connection_pool: bool,
-    ) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| {
-                p.exit_fast_on_exhausted_connection_pool = exit_fast_on_exhausted_connection_pool
-            });
-    }
-
-    #[getter]
     pub fn get_read_mode_ap(&self) -> ReadModeAP {
         ReadModeAP {
-            _as: match self
-                ._as
-                .multi_policy
-                .as_ref()
-                .unwrap()
-                .read_policy
-                .as_ref()
-                .unwrap()
-                .read_mode_ap
-            {
-                0 => proto::ReadModeAp::One,
-                1 => proto::ReadModeAp::All,
-                _ => unreachable!(),
-            },
+            _as: self._as.base_policy.consistency_level.clone(),
         }
     }
-
-    #[setter]
     pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_ap = read_mode_ap._as.into());
+        self._as.base_policy.consistency_level = read_mode_ap._as;
     }
-
-    #[getter]
-    pub fn get_read_mode_sc(&self) -> ReadModeSC {
-        ReadModeSC {
-            _as: match self
-                ._as
-                .multi_policy
-                .as_ref()
-                .unwrap()
-                .read_policy
-                .as_ref()
-                .unwrap()
-                .read_mode_ap
-            {
-                0 => proto::ReadModeSc::Session,
-                1 => proto::ReadModeSc::Linearize,
-                2 => proto::ReadModeSc::AllowReplica,
-                3 => proto::ReadModeSc::AllowUnavailable,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_sc(&mut self, read_mode_sc: ReadModeSC) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_sc = read_mode_sc._as.into());
-    }
-
-    #[getter]
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
+            .base_policy
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self
-                ._as
-                .multi_policy
-                .as_mut()
-                .unwrap()
-                .read_policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = Some(fe._as)),
-            None => self
-                ._as
-                .multi_policy
-                .as_mut()
-                .unwrap()
-                .read_policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = None),
-        };
-    }
-}
-
-impl Default for QueryPolicy {
-    fn default() -> Self {
-        QueryPolicy {
-            _as: proto::QueryPolicy {
-                multi_policy: Some(MultiPolicy::default()._as),
-                expected_duration: QueryDuration::Long()._as.into(),
-            },
-        }
+        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -3108,330 +2001,93 @@ impl Default for QueryPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// `ScanPolicy` encapsulates optional parameters used in scan operations.
-#[php_class(name = "Aerospike\\ScanPolicy")]
+///
+/// v2 BREAKING: scan was unified into query in aerospike-client-rust v2.
+/// `ScanPolicy` is now backed by `aerospike::QueryPolicy`. Legacy fields
+/// `sleep_multiplier`, `send_key`, `use_compression`, `exit_fast_on_exhausted_connection_pool`,
+/// `read_mode_sc` have been removed.
+#[php_class]
+#[php(name = "Aerospike\\ScanPolicy")]
 pub struct ScanPolicy {
-    _as: proto::ScanPolicy,
+    _as: aero::QueryPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ScanPolicy {
     pub fn __construct() -> Self {
         ScanPolicy::default()
     }
 
-    /// ***************************************************************************
-    /// MultiPolicy Attrs
-    /// ***************************************************************************
-
-    #[getter]
+    /// Number of records to scan per node (0 = no limit).
     pub fn get_max_records(&self) -> u64 {
-        self._as.multi_policy.as_ref().unwrap().max_records
+        self._as.max_records
     }
-
-    #[setter]
     pub fn set_max_records(&mut self, max_records: u64) {
-        self._as.multi_policy.as_mut().unwrap().max_records = max_records;
+        self._as.max_records = max_records;
     }
 
-    #[getter]
+    /// Maximum number of concurrent requests to server nodes.
     pub fn get_max_concurrent_nodes(&self) -> u32 {
-        self._as.multi_policy.as_ref().unwrap().max_concurrent_nodes
+        self._as.max_concurrent_nodes as u32
     }
-
-    #[setter]
     pub fn set_max_concurrent_nodes(&mut self, max_concurrent_nodes: u32) {
-        self._as.multi_policy.as_mut().unwrap().max_concurrent_nodes = max_concurrent_nodes;
+        self._as.max_concurrent_nodes = max_concurrent_nodes as usize;
     }
 
-    #[getter]
+    /// Number of records to place in queue before blocking.
     pub fn get_record_queue_size(&self) -> u32 {
-        self._as.multi_policy.as_ref().unwrap().record_queue_size
+        self._as.record_queue_size as u32
     }
-
-    #[setter]
     pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
-        self._as.multi_policy.as_mut().unwrap().record_queue_size = record_queue_size;
+        self._as.record_queue_size = record_queue_size as usize;
     }
 
-    /// ***************************************************************************
-    /// ReadPolicy Attrs
-    /// ***************************************************************************
-
-    #[getter]
+    // ----- base policy attributes -----
     pub fn get_max_retries(&self) -> u32 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .max_retries
+        self._as.base_policy.max_retries as u32
     }
-
-    #[setter]
     pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.max_retries = max_retries);
+        self._as.base_policy.max_retries = max_retries as usize;
     }
-
-    #[getter]
-    pub fn get_sleep_multiplier(&self) -> f64 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .sleep_multiplier
-    }
-
-    #[setter]
-    pub fn set_sleep_multiplier(&mut self, sleep_multiplier: f64) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.sleep_multiplier = sleep_multiplier);
-    }
-
-    #[getter]
     pub fn get_total_timeout(&self) -> u64 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .total_timeout
+        u64::from(self._as.base_policy.total_timeout)
     }
-
-    #[setter]
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.total_timeout = timeout_millis);
+    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
-
-    #[getter]
     pub fn get_socket_timeout(&self) -> u64 {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .socket_timeout
+        u64::from(self._as.base_policy.socket_timeout)
     }
-
-    #[setter]
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.socket_timeout = timeout_millis);
+    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
     }
-
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.send_key = send_key);
-    }
-
-    #[getter]
-    pub fn get_use_compression(&self) -> bool {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .use_compression
-    }
-
-    #[setter]
-    pub fn set_use_compression(&mut self, use_compression: bool) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.use_compression = use_compression);
-    }
-
-    #[getter]
-    pub fn get_exit_fast_on_exhausted_connection_pool(&self) -> bool {
-        self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
-            .exit_fast_on_exhausted_connection_pool
-    }
-
-    #[setter]
-    pub fn set_exit_fast_on_exhausted_connection_pool(
-        &mut self,
-        exit_fast_on_exhausted_connection_pool: bool,
-    ) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| {
-                p.exit_fast_on_exhausted_connection_pool = exit_fast_on_exhausted_connection_pool
-            });
-    }
-
-    #[getter]
     pub fn get_read_mode_ap(&self) -> ReadModeAP {
         ReadModeAP {
-            _as: match self
-                ._as
-                .multi_policy
-                .as_ref()
-                .unwrap()
-                .read_policy
-                .as_ref()
-                .unwrap()
-                .read_mode_ap
-            {
-                0 => proto::ReadModeAp::One,
-                1 => proto::ReadModeAp::All,
-                _ => unreachable!(),
-            },
+            _as: self._as.base_policy.consistency_level.clone(),
         }
     }
-
-    #[setter]
     pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_ap = read_mode_ap._as.into());
+        self._as.base_policy.consistency_level = read_mode_ap._as;
     }
-
-    #[getter]
-    pub fn get_read_mode_sc(&self) -> ReadModeSC {
-        ReadModeSC {
-            _as: match self
-                ._as
-                .multi_policy
-                .as_ref()
-                .unwrap()
-                .read_policy
-                .as_ref()
-                .unwrap()
-                .read_mode_ap
-            {
-                0 => proto::ReadModeSc::Session,
-                1 => proto::ReadModeSc::Linearize,
-                2 => proto::ReadModeSc::AllowReplica,
-                3 => proto::ReadModeSc::AllowUnavailable,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_sc(&mut self, read_mode_sc: ReadModeSC) {
-        self._as
-            .multi_policy
-            .as_mut()
-            .unwrap()
-            .read_policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_sc = read_mode_sc._as.into());
-    }
-
-    #[getter]
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
-            .multi_policy
-            .as_ref()
-            .unwrap()
-            .read_policy
-            .as_ref()
-            .unwrap()
+            .base_policy
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self
-                ._as
-                .multi_policy
-                .as_mut()
-                .unwrap()
-                .read_policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = Some(fe._as)),
-            None => self
-                ._as
-                .multi_policy
-                .as_mut()
-                .unwrap()
-                .read_policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = None),
-        };
+        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
 impl Default for ScanPolicy {
     fn default() -> Self {
-        ScanPolicy {
-            _as: proto::ScanPolicy {
-                multi_policy: Some(MultiPolicy::default()._as),
-            },
-        }
+        let mut qp = aero::QueryPolicy::default();
+        qp.base_policy.total_timeout = 0; // scans have no total timeout by default
+        ScanPolicy { _as: qp }
     }
 }
 
@@ -3442,39 +2098,40 @@ impl Default for ScanPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// IndexCollectionType is the secondary index collection type.
-#[php_class(name = "Aerospike\\IndexCollectionType")]
+#[php_class]
+#[php(name = "Aerospike\\IndexCollectionType")]
+#[derive(Clone)]
 pub struct IndexCollectionType {
-    _as: proto::IndexCollectionType,
+    _as: aero::CollectionIndexType,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl IndexCollectionType {
     /// ICT_DEFAULT is the Normal scalar index.
     pub fn Default() -> Self {
         IndexCollectionType {
-            _as: proto::IndexCollectionType::Default,
+            _as: aero::CollectionIndexType::Default,
         }
     }
 
     /// ICT_LIST is Index list elements.
     pub fn List() -> Self {
         IndexCollectionType {
-            _as: proto::IndexCollectionType::List,
+            _as: aero::CollectionIndexType::List,
         }
     }
 
     /// ICT_MAPKEYS is Index map keys.
     pub fn MapKeys() -> Self {
         IndexCollectionType {
-            _as: proto::IndexCollectionType::MapKeys,
+            _as: aero::CollectionIndexType::MapKeys,
         }
     }
 
     /// ICT_MAPVALUES is Index map values.
     pub fn MapValues() -> Self {
         IndexCollectionType {
-            _as: proto::IndexCollectionType::MapValues,
+            _as: aero::CollectionIndexType::MapValues,
         }
     }
 }
@@ -3486,77 +2143,78 @@ impl IndexCollectionType {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Server particle types. Unsupported types are commented out.
-#[php_class(name = "Aerospike\\ParticleType")]
+#[php_class]
+#[php(name = "Aerospike\\ParticleType")]
+#[derive(Clone)]
 pub struct ParticleType {
-    _as: proto::ParticleType,
+    _as: aero::ParticleType,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl ParticleType {
     pub fn Null() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Null,
+            _as: aero::ParticleType::NULL,
         }
     }
 
     pub fn Integer() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Integer,
+            _as: aero::ParticleType::INTEGER,
         }
     }
 
     pub fn Float() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Float,
+            _as: aero::ParticleType::FLOAT,
         }
     }
 
     pub fn String() -> Self {
         ParticleType {
-            _as: proto::ParticleType::String,
+            _as: aero::ParticleType::STRING,
         }
     }
 
     pub fn Blob() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Blob,
+            _as: aero::ParticleType::BLOB,
         }
     }
 
     pub fn Digest() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Digest,
+            _as: aero::ParticleType::DIGEST,
         }
     }
 
     pub fn Bool() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Bool,
+            _as: aero::ParticleType::BOOL,
         }
     }
 
     pub fn Hll() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Hll,
+            _as: aero::ParticleType::HLL,
         }
     }
 
     pub fn Map() -> Self {
         ParticleType {
-            _as: proto::ParticleType::Map,
+            _as: aero::ParticleType::MAP,
         }
     }
 
     pub fn List() -> Self {
         ParticleType {
-            _as: proto::ParticleType::List,
+            _as: aero::ParticleType::LIST,
         }
     }
 
     pub fn Geo_Json() -> Self {
         ParticleType {
-            _as: proto::ParticleType::GeoJson,
+            _as: aero::ParticleType::GEOJSON,
         }
     }
 }
@@ -3564,18 +2222,18 @@ impl ParticleType {
 impl From<ParticleType> for i64 {
     fn from(input: ParticleType) -> Self {
         match &input._as {
-            proto::ParticleType::Null => 0,
-            proto::ParticleType::Integer => 1,
-            proto::ParticleType::Float => 2,
-            proto::ParticleType::String => 3,
-            proto::ParticleType::Blob => 4,
-            proto::ParticleType::Digest => 6,
-            proto::ParticleType::Bool => 17,
-            proto::ParticleType::Hll => 18,
-            proto::ParticleType::Map => 19,
-            proto::ParticleType::List => 20,
-            proto::ParticleType::Ldt => 21,
-            proto::ParticleType::GeoJson => 23,
+            aero::ParticleType::NULL => 0,
+            aero::ParticleType::INTEGER => 1,
+            aero::ParticleType::FLOAT => 2,
+            aero::ParticleType::STRING => 3,
+            aero::ParticleType::BLOB => 4,
+            aero::ParticleType::DIGEST => 6,
+            aero::ParticleType::BOOL => 17,
+            aero::ParticleType::HLL => 18,
+            aero::ParticleType::MAP => 19,
+            aero::ParticleType::LIST => 20,
+            aero::ParticleType::LDT => 21,
+            aero::ParticleType::GEOJSON => 23,
         }
     }
 }
@@ -3587,39 +2245,33 @@ impl From<ParticleType> for i64 {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// IndexType the type of the secondary index.
-#[php_class(name = "Aerospike\\IndexType")]
+#[php_class]
+#[php(name = "Aerospike\\IndexType")]
+#[derive(Clone)]
 pub struct IndexType {
-    _as: proto::IndexType,
+    _as: aero::IndexType,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl IndexType {
     /// NUMERIC specifies an index on numeric values.
     pub fn Numeric() -> Self {
         IndexType {
-            _as: proto::IndexType::Numeric,
+            _as: aero::IndexType::Numeric,
         }
     }
 
     /// STRING specifies an index on string values.
     pub fn String() -> Self {
         IndexType {
-            _as: proto::IndexType::String,
-        }
-    }
-
-    /// BLOB specifies a []byte index. Requires server version 7.0+.
-    pub fn Blob() -> Self {
-        IndexType {
-            _as: proto::IndexType::Blob,
+            _as: aero::IndexType::String,
         }
     }
 
     /// GEO2DSPHERE specifies 2-dimensional spherical geospatial index.
     pub fn Geo2DSphere() -> Self {
         IndexType {
-            _as: proto::IndexType::Geo2DSphere,
+            _as: aero::IndexType::Geo2DSphere,
         }
     }
 }
@@ -3632,57 +2284,47 @@ impl IndexType {
 
 /// Query filter definition. Currently, only one filter is allowed in a Statement, and must be on a
 /// bin which has a secondary index defined.
-/// Filter instances should be instantiated using one of the provided macros.
-#[php_class(name = "Aerospike\\Filter")]
+#[php_class]
+#[php(name = "Aerospike\\Filter")]
+#[derive(Clone)]
 pub struct Filter {
-    _as: proto::QueryFilter,
+    _as: aero::query::Filter,
+}
+
+/// Apply an optional PHP CDT context to a freshly-built aero `Filter`.
+fn filter_with_ctx(f: aero::query::Filter, ctx: Option<Vec<&CDTContext>>) -> aero::query::Filter {
+    match ctx {
+        Some(c) if !c.is_empty() => f.context(c.iter().map(|x| x._as.clone()).collect()),
+        _ => f,
+    }
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Filter {
-    /// NewEqualFilter creates a new equality filter instance for query.
-    /// Value can be an integer, string or a blob (byte array). Byte arrays are only supported on server v7+.
+    /// Creates an equality filter for queries. Value can be an integer, string, or blob.
+    /// Byte arrays are only supported on server v7+.
     pub fn equal(bin_name: &str, value: PHPValue, ctx: Option<Vec<&CDTContext>>) -> Self {
+        let v: aero::Value = value.into();
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: proto::IndexCollectionType::Default.into(),
-                value_particle_type: value.particle_type() as u32,
-                begin: Some(value.clone().into()),
-                end: Some(value.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(aero::query::Filter::equal(bin_name, v), ctx),
         }
     }
 
-    /// NewRangeFilter creates a range filter for query.
-    /// Range arguments must be int64 values.
-    /// String ranges are not supported.
+    /// Creates a range filter for queries. Only integer ranges are supported.
     pub fn range(
         bin_name: &str,
         begin: PHPValue,
         end: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Self {
+        let b: aero::Value = begin.into();
+        let e: aero::Value = end.into();
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: proto::IndexCollectionType::Default.into(),
-                value_particle_type: begin.particle_type() as u32,
-                begin: Some(begin.clone().into()),
-                end: Some(end.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(aero::query::Filter::range(bin_name, b, e), ctx),
         }
     }
 
-    /// NewContainsFilter creates a contains filter for query on collection index.
-    /// Value can be an integer, string or a blob (byte array). Byte arrays are only supported on server v7+.
+    /// Creates a contains filter for queries on a collection index.
     pub fn contains(
         bin_name: &str,
         value: PHPValue,
@@ -3691,21 +2333,17 @@ impl Filter {
     ) -> Self {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
+        let v: aero::Value = value.into();
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: cit._as.into(),
-                value_particle_type: value.particle_type() as u32,
-                begin: Some(value.clone().into()),
-                end: Some(value.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(
+                aero::query::Filter::contains(bin_name, v, cit._as.clone()),
+                ctx,
+            ),
         }
     }
 
-    /// NewContainsRangeFilter creates a contains filter for query on ranges of data in a collection index.
+    /// Creates a contains-range filter for queries on a collection index. Only integer values
+    /// are supported.
     pub fn contains_range(
         bin_name: &str,
         begin: PHPValue,
@@ -3715,22 +2353,17 @@ impl Filter {
     ) -> Self {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
+        let b: aero::Value = begin.into();
+        let e: aero::Value = end.into();
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: cit._as.into(),
-                value_particle_type: begin.particle_type() as u32,
-                begin: Some(begin.clone().into()),
-                end: Some(end.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(
+                aero::query::Filter::contains_range(bin_name, b, e, cit._as.clone()),
+                ctx,
+            ),
         }
     }
 
-    /// NewGeoWithinRegionFilter creates a geospatial "within region" filter for query.
-    /// Argument must be a valid GeoJSON region.
+    /// Creates a geospatial "within region" filter for query. Argument must be a valid GeoJSON region.
     pub fn within_region(
         bin_name: &str,
         region: &str,
@@ -3739,23 +2372,15 @@ impl Filter {
     ) -> Self {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        let region = Value::string(region.into());
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: cit._as.into(),
-                value_particle_type: PHPValue::GeoJSON("".into()).particle_type() as u32,
-                begin: Some(region.clone().into()),
-                end: Some(region.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(
+                aero::query::Filter::geo_within_region_cit(bin_name, region, cit._as.clone()),
+                ctx,
+            ),
         }
     }
 
-    /// NewGeoWithinRegionForCollectionFilter creates a geospatial "within region" filter for query on collection index.
-    /// Argument must be a valid GeoJSON region.
+    /// Creates a geospatial "within radius" filter for query.
     pub fn within_radius(
         bin_name: &str,
         lat: f64,
@@ -3766,27 +2391,21 @@ impl Filter {
     ) -> Self {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        let rgnStr = format!(
-            r#"{{ "type": "AeroCircle", "coordinates": [[{:.8}, {:.8}], {}] }}"#,
-            lng, lat, radius
-        );
-        let value = Value::string(rgnStr);
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: cit._as.into(),
-                value_particle_type: PHPValue::GeoJSON("".into()).particle_type() as u32,
-                begin: Some(value.clone().into()),
-                end: Some(value.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(
+                aero::query::Filter::geo_within_radius_cit(
+                    bin_name,
+                    lng,
+                    lat,
+                    radius,
+                    cit._as.clone(),
+                ),
+                ctx,
+            ),
         }
     }
 
-    /// NewGeoRegionsContainingPointFilter creates a geospatial "containing point" filter for query.
-    /// Argument must be a valid GeoJSON point.
+    /// Creates a geospatial "regions containing point" filter for query.
     pub fn regions_containing_point(
         bin_name: &str,
         lat: f64,
@@ -3796,22 +2415,12 @@ impl Filter {
     ) -> Self {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        let point = format!(
-            r#"{{"type":"Point","coordinates":[{:.8},{:.8}]}}"#,
-            lng, lat
-        );
-        let value = Value::string(point);
+        let point = format!(r#"{{"type":"Point","coordinates":[{lng:.8},{lat:.8}]}}"#);
         Filter {
-            _as: proto::QueryFilter {
-                name: bin_name.into(),
-                idx_type: cit._as.into(),
-                value_particle_type: PHPValue::GeoJSON("".into()).particle_type() as u32,
-                begin: Some(value.clone().into()),
-                end: Some(value.clone().into()),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            },
+            _as: filter_with_ctx(
+                aero::query::Filter::geo_contains_cit(bin_name, &point, cit._as.clone()),
+                ctx,
+            ),
         }
     }
 }
@@ -3833,13 +2442,23 @@ impl FromZval<'_> for Filter {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Statement encapsulates query statement parameters.
-#[php_class(name = "Aerospike\\Statement")]
+///
+/// v2 BREAKING:
+/// - `index_name` getter/setter removed. To target a specific secondary index, use the
+///   `Filter::equal_by_index` / `Filter::range_by_index` / `Filter::contains_by_index` helpers
+///   (not yet wrapped in PHP; will be added if needed).
+/// - `return_data` toggle removed. Use `bin_names = Some(vec![])` for header-only reads
+///   (maps to `aero::Bins::None`); `bin_names = None` returns all bins (`aero::Bins::All`);
+///   non-empty `bin_names` returns the specified bins (`aero::Bins::Some(names)`).
+/// - `task_id` removed; the aerospike v2 client manages it internally.
+#[php_class]
+#[php(name = "Aerospike\\Statement")]
+#[derive(Clone)]
 pub struct Statement {
-    _as: proto::Statement,
+    _as: aero::query::Statement,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Statement {
     pub fn __construct(
         namespace: &str,
@@ -3847,76 +2466,58 @@ impl Statement {
         filter: Option<Filter>,
         bin_names: Option<Vec<String>>,
     ) -> Self {
-        let mut rng = rand::thread_rng();
-        let filter_proto = filter.map(|f| f._as.clone());
-        Statement {
-            _as: proto::Statement {
-                namespace: namespace.into(),
-                set_name: set_name.into(),
-                bin_names: bin_names.unwrap_or_default(),
-                return_data: true,
-                task_id: rng.gen(),
-                filter: filter_proto,
-                index_name: None,
-                udf_call: None,
-            },
+        let bins = match bin_names {
+            None => aero::Bins::All,
+            Some(names) if names.is_empty() => aero::Bins::None,
+            Some(names) => aero::Bins::Some(names),
+        };
+        let mut stmt = aero::query::Statement::new(namespace, set_name, bins);
+        if let Some(f) = filter {
+            stmt.add_filter(f._as);
+        }
+        Statement { _as: stmt }
+    }
+
+    /// Query index filter (optional). Applied to the secondary index on query.
+    /// Query index filters must reference a bin which has a secondary index defined.
+    pub fn get_filter(&self) -> Option<Filter> {
+        self._as
+            .filters
+            .as_ref()
+            .and_then(|fs| fs.first().cloned())
+            .map(|f| Filter { _as: f })
+    }
+    pub fn set_filter(&mut self, filter: Option<Filter>) {
+        self._as.filters = filter.map(|f| vec![f._as]);
+    }
+
+    /// Bin names to return (optional). Empty Vec is treated as Bins::None (header-only).
+    pub fn get_bin_names(&self) -> Vec<String> {
+        match &self._as.bins {
+            aero::Bins::Some(names) => names.clone(),
+            _ => vec![],
         }
     }
-
-    /// Filter determines query index filter (Optional).
-    /// This filter is applied to the secondary index on query.
-    /// Query index filters must reference a bin which has a secondary index defined.
-    #[getter]
-    pub fn get_filter(&self) -> Option<Filter> {
-        self._as.filter.as_ref().map(|f| Filter { _as: f.clone() })
-    }
-
-    #[setter]
-    pub fn set_filter(&mut self, filter: Option<Filter>) {
-        self._as.filter = filter.map(|f| f._as.clone());
-    }
-
-    /// IndexName determines query index name (Optional)
-    /// If not set, the server will determine the index from the filter's bin name.
-    #[getter]
-    pub fn get_index_name(&self) -> Option<String> {
-        self._as.index_name.clone()
-    }
-
-    #[setter]
-    pub fn set_index_name(&mut self, index_name: Option<String>) {
-        self._as.index_name = index_name;
-    }
-
-    /// BinNames detemines bin names (optional)
-    #[getter]
-    pub fn get_bin_names(&self) -> Vec<String> {
-        self._as.bin_names.clone()
-    }
-
-    #[setter]
     pub fn set_bin_names(&mut self, bin_names: Vec<String>) {
-        self._as.bin_names = bin_names;
+        self._as.bins = if bin_names.is_empty() {
+            aero::Bins::None
+        } else {
+            aero::Bins::Some(bin_names)
+        };
     }
 
-    /// Namespace determines query Namespace
-    #[getter]
+    /// Query namespace.
     pub fn get_namespace(&self) -> String {
         self._as.namespace.clone()
     }
-
-    #[setter]
     pub fn set_namespace(&mut self, namespace: String) {
         self._as.namespace = namespace;
     }
 
-    /// SetName determines query Set name (Optional)
-    #[getter]
+    /// Query set name (optional).
     pub fn get_setname(&self) -> String {
         self._as.set_name.clone()
     }
-
-    #[setter]
     pub fn set_setname(&mut self, set_name: String) {
         self._as.set_name = set_name;
     }
@@ -3928,58 +2529,50 @@ impl Statement {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Virtual collection of records retrieved through queries and scans. During a query/scan,
-/// multiple threads will retrieve records from the server nodes and put these records on an
-/// internal queue managed by the recordset. The single user thread consumes these records from the
-/// queue.
-#[php_class(name = "Aerospike\\PartitionStatus")]
+/// Status of a single partition during a scan/query. Used as a cursor.
+///
+/// v2 BREAKING: `bval` is now `Option<u64>` on the underlying aero type (was `Option<i64>` in
+/// proto). The PHP getter is widened to `Option<i64>` via lossy cast for backward compat —
+/// callers should expect non-negative values.
+#[php_class]
+#[php(name = "Aerospike\\PartitionStatus")]
 pub struct PartitionStatus {
-    _as: proto::PartitionStatus,
+    _as: aero::query::PartitionStatus,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl PartitionStatus {
     pub fn __construct(id: u32) -> Self {
         PartitionStatus {
-            _as: proto::PartitionStatus {
+            _as: aero::query::PartitionStatus {
                 bval: None,
-                id: id,
-                retry: false,
-                digest: vec![],
+                id: id as u16,
+                retry: true,
+                digest: None,
+                node: None,
+                sequence: None,
             },
         }
     }
 
-    /// get BVal
-    #[getter]
+    /// Record's bval.
     pub fn get_bval(&self) -> Option<i64> {
-        self._as.bval
+        self._as.bval.map(|v| v as i64)
     }
 
-    /// Id shows the partition Id.
-    #[getter]
+    /// Partition id (0..4095).
     pub fn get_partition_id(&self) -> u32 {
-        self._as.id
+        u32::from(self._as.id)
     }
 
-    /// Digest records the digest of the last key digest received from the server
-    /// for this partition.
-    #[getter]
+    /// Digest of the last key seen on the server for this partition (empty if none).
     pub fn get_digest(&self) -> Vec<u8> {
-        self._as.digest.clone()
+        self._as.digest.map(|d| d.to_vec()).unwrap_or_default()
     }
 
-    /// Retry signifies if the partition requires a retry.
-    #[getter]
+    /// Whether the partition requires a retry.
     pub fn get_retry(&self) -> bool {
         self._as.retry
-    }
-}
-
-impl From<&proto::PartitionStatus> for PartitionStatus {
-    fn from(input: &proto::PartitionStatus) -> Self {
-        PartitionStatus { _as: input.clone() }
     }
 }
 
@@ -3989,7 +2582,16 @@ impl FromZval<'_> for PartitionStatus {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &PartitionStatus = zval.extract()?;
 
-        Some(PartitionStatus { _as: f._as.clone() })
+        Some(PartitionStatus {
+            _as: aero::query::PartitionStatus {
+                bval: f._as.bval,
+                id: f._as.id,
+                retry: f._as.retry,
+                digest: f._as.digest,
+                node: f._as.node.clone(),
+                sequence: f._as.sequence,
+            },
+        })
     }
 }
 
@@ -3999,83 +2601,47 @@ impl FromZval<'_> for PartitionStatus {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Virtual collection of records retrieved through queries and scans. During a query/scan,
-/// multiple threads will retrieve records from the server nodes and put these records on an
-/// internal queue managed by the recordset. The single user thread consumes these records from the
-/// queue.
-#[php_class(name = "Aerospike\\PartitionFilter")]
+/// Partition cursor for scan/query operations. Used to resume reads across calls.
+///
+/// v2 BREAKING:
+/// - `get_partition_status()` and `init_partition_status()` removed. The aerospike v2 client
+///   manages `partitions` internally during `client.query(...)`. To resume a query, reuse the
+///   same `PartitionFilter` instance; the cursor state is preserved by the underlying
+///   `aero::PartitionFilter` (via `AtomicBool` flags and internally-owned partition vec).
+#[php_class]
+#[php(name = "Aerospike\\PartitionFilter")]
 pub struct PartitionFilter {
-    _as: Arc<Mutex<proto::PartitionFilter>>,
+    _as: Arc<Mutex<aero::PartitionFilter>>,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl PartitionFilter {
     pub fn __construct() -> Self {
         Self::all()
     }
 
-    #[getter]
-    pub fn get_partition_status(&self) -> Vec<PartitionStatus> {
-        let p = self._as.lock().unwrap();
-        p.partitions.iter().map(|ps| ps.into()).collect()
-    }
-
-    /// NewPartitionFilterAll creates a partition filter that
-    /// reads all the partitions.
+    /// Creates a partition filter that reads all the partitions.
     pub fn all() -> Self {
         PartitionFilter {
-            _as: Arc::new(Mutex::new(proto::PartitionFilter {
-                begin: 0,
-                count: PARTITIONS as u32,
-                digest: vec![],
-                partitions: vec![],
-                done: false,
-                retry: false,
-            })),
+            _as: Arc::new(Mutex::new(aero::PartitionFilter::all())),
         }
     }
 
-    /// NewPartitionFilterById creates a partition filter by partition id.
-    /// Partition id is between 0 - 4095
+    /// Creates a partition filter by a single partition id (0..4095).
     pub fn partition(id: u32) -> Self {
         PartitionFilter {
-            _as: Arc::new(Mutex::new(proto::PartitionFilter {
-                begin: id,
-                count: 1,
-                digest: vec![],
-                partitions: vec![],
-                done: false,
-                retry: false,
-            })),
+            _as: Arc::new(Mutex::new(aero::PartitionFilter::by_id(id as usize))),
         }
     }
 
-    /// NewPartitionFilterByRange creates a partition filter by partition range.
-    /// begin partition id is between 0 - 4095
-    /// count is the number of partitions, in the range of 1 - 4096 inclusive.
+    /// Creates a partition filter by a partition range. `begin` is in 0..4095; `count` is in 1..=4096.
     pub fn range(begin: u32, count: u32) -> Self {
         PartitionFilter {
-            _as: Arc::new(Mutex::new(proto::PartitionFilter {
-                begin: begin,
-                count: count,
-                digest: vec![],
-                partitions: vec![],
-                done: false,
-                retry: false,
-            })),
+            _as: Arc::new(Mutex::new(aero::PartitionFilter::by_range(
+                begin as usize,
+                count as usize,
+            ))),
         }
-    }
-
-    fn init_partition_status(&mut self) {
-        let mut p = self._as.lock().unwrap();
-        if p.partitions.len() > 0 {
-            return;
-        }
-
-        p.partitions = (0..PARTITIONS)
-            .map(|id| PartitionStatus::__construct(id as u32)._as)
-            .collect();
     }
 }
 
@@ -4095,91 +2661,97 @@ impl FromZval<'_> for PartitionFilter {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Virtual collection of records retrieved through queries and scans. During a query/scan,
-/// multiple threads will retrieve records from the server nodes and put these records on an
-/// internal queue managed by the recordset. The single user thread consumes these records from the
-/// queue.
-#[php_class(name = "Aerospike\\Recordset")]
+/// Virtual collection of records retrieved through queries and scans.
+///
+/// Wraps `aero::Recordset`, which manages a bounded queue between the client's background
+/// node-reader tasks and the user thread. `next()` blocks until the next record is available
+/// or the recordset is closed by the client (via `close()` or completion).
+///
+/// If the recordset was produced from a `PartitionFilter` (via `Client::scan`/`Client::query`),
+/// the post-scan cursor is automatically written back into the original PHP `PartitionFilter`
+/// when the stream is exhausted — so the next `scan`/`query` call with the same
+/// `PartitionFilter` resumes where this one left off. This is how pagination works on v2.
+#[php_class]
+#[php(name = "Aerospike\\Recordset")]
+#[derive(Default)]
 pub struct Recordset {
-    _as: Option<tonic::Streaming<proto::AerospikeStreamResponse>>,
-    client: Arc<Mutex<grpc::BlockingClient>>,
-    partition_filter: PartitionFilter,
+    /// `None` only when this Recordset is a sentinel default returned together with a
+    /// pending `AerospikeException` from `scan()`/`query()`. PHP never observes such a
+    /// sentinel because the pending exception takes precedence.
+    _as: Option<Arc<aero::Recordset>>,
+    /// Original PHP `PartitionFilter` Arc. When the stream is exhausted, we extract the
+    /// updated cursor from `aero::Recordset` and write it back here so the user's PHP
+    /// `$pf` reflects progress and subsequent scans can resume.
+    partition_filter: Option<Arc<Mutex<aero::PartitionFilter>>>,
+    /// Whether we've already attempted to sync the partition filter back. The aero recordset
+    /// only yields its filter once (it extracts from an internal tracker), so subsequent
+    /// `next()` calls returning `None` would otherwise overwrite the filter with `None`.
+    pf_synced: bool,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Recordset {
-    /// Drop the stream, which will signal the server and close the recordset
+    /// Close the recordset. Background tasks finish at their next safe point.
     pub fn close(&mut self) {
-        self._as = None;
+        if let Some(rs) = self._as.as_ref() {
+            rs.close();
+        }
     }
 
-    /// IsActive returns true if the operation hasn't been finished or cancelled.
-    #[getter]
+    /// Returns true if the operation hasn't been finished or cancelled.
     pub fn get_active(&self) -> bool {
-        self._as.is_some()
+        self._as.as_ref().map(|rs| rs.is_active()).unwrap_or(false)
     }
 
-    /// Records is a channel on which the resulting records will be sent back.
-    pub fn next(&mut self) -> Option<Result<Record>> {
-        let mut pid: Option<usize> = None;
-        let mut digest: Option<Vec<u8>> = None;
-        let mut bval: Option<i64> = None;
-        let mut close: Option<bool> = None;
-
-        let rec = self._as.as_mut().map(|mut stream| {
-            let mut client = self.client.lock().unwrap();
-            let res = client.next_record(&mut stream);
-            match res {
-                None => {
-                    close = Some(true);
-                    None
-                }
-                Some(Err(pe)) => {
-                    let e = format!("{pe}");
-                    let error = AerospikeException::new(&e);
-                    let _ = throw_object(error.into_zval(true).unwrap());
-                    None
-                }
-                Some(Ok(proto::AerospikeStreamResponse {
-                    record: Some(ref rec),
-                    bval: bv,
-                    ..
-                })) => {
-                    pid = rec
-                        .key
-                        .as_ref()
-                        .map(|k| Key { _as: k.clone() }.partition_id())?;
-                    digest = rec.key.as_ref().map(|k| k.digest.clone())?;
-                    bval = bv;
-
-                    Some(Ok(rec.into()))
-                }
-                Some(Ok(proto::AerospikeStreamResponse {
-                    error: Some(ref pe),
-                    ..
-                })) => {
-                    let error: AerospikeException = pe.into();
-                    let _ = throw_object(error.into_zval(true).unwrap());
-                    None
-                }
-                _ => None,
+    /// Returns the next record from the queue, blocking until a record arrives or the
+    /// recordset closes. Returns `None` when the stream is exhausted; throws an
+    /// `AerospikeException` on read failure.
+    ///
+    /// Uses the canonical `Iterator for &aero::Recordset` implementation which yields the
+    /// tokio scheduler between checks via `futures::executor::block_on(yield_now())` —
+    /// no 1ms `thread::sleep` busy-wait. On end-of-stream the cursor inside the originating
+    /// `PartitionFilter` is updated so paginated scans resume from the last digest.
+    pub fn next(&mut self) -> PhpResult<Option<Record>> {
+        let Some(rs) = self._as.clone() else {
+            return Ok(None);
+        };
+        let _guard = TOKIO_RT.enter();
+        // `Iterator for &Recordset` requires a mutable reference to the `&Recordset` itself.
+        let recordset: &aero::Recordset = &rs;
+        let mut iter: &aero::Recordset = recordset;
+        match Iterator::next(&mut iter) {
+            Some(Ok(r)) => Ok(Some(Record { _as: r })),
+            Some(Err(e)) => throw_aero_error(&e, None),
+            None => {
+                self.sync_partition_filter_back();
+                Ok(None)
             }
-        })?;
+        }
+    }
+}
 
-        // update partition_filter
-        pid.map(|pid| {
-            let mut p = self.partition_filter._as.lock().unwrap();
-            let begin = p.begin as usize;
-            let ps = &mut p.partitions[pid - begin];
-            ps.bval = bval;
-            digest.map(|digest| ps.digest = digest);
-        });
-
-        // close the recordset
-        close.map(|_| self.close());
-
-        rec
+impl Recordset {
+    /// Copy the post-scan partition cursor from the underlying `aero::Recordset` into the
+    /// originating PHP `PartitionFilter` wrapper. Called exactly once on first end-of-stream.
+    fn sync_partition_filter_back(&mut self) {
+        if self.pf_synced {
+            return;
+        }
+        self.pf_synced = true;
+        let Some(pf_arc) = self.partition_filter.as_ref() else {
+            return;
+        };
+        let Some(rs) = self._as.as_ref() else {
+            return;
+        };
+        // `aero::Recordset::partition_filter` is async; we're already inside `TOKIO_RT.enter()`
+        // when called from `next()`, but `block_on` requires an explicit handle.
+        let updated = TOKIO_RT.block_on(rs.partition_filter());
+        if let Some(new_pf) = updated {
+            if let Ok(mut guard) = pf_arc.lock() {
+                *guard = new_pf;
+            }
+        }
     }
 }
 
@@ -4190,89 +2762,143 @@ impl Recordset {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Container object for a record bin, comprising a name and a value.
-#[php_class(name = "Aerospike\\Bin")]
+#[php_class]
+#[php(name = "Aerospike\\Bin")]
 #[derive(Debug)]
 pub struct Bin {
-    _as: proto::Bin,
+    _as: aero::Bin,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Bin {
     pub fn __construct(name: &str, value: &Zval) -> PhpResult<Self> {
         let v_op: Option<PHPValue> = from_zval(value);
         match v_op {
-            Some(v) => {
-                let _as = proto::Bin {
-                    name: name.into(),
-                    value: Some(v.into()),
-                };
-                Ok(Bin { _as: _as })
-            }
-            _ => Err(format!("Invalid input for argument `value`").into()),
+            Some(v) => Ok(Bin {
+                _as: aero::Bin::new(name.to_string(), v.into()),
+            }),
+            _ => Err("Invalid input for argument `value`".to_string().into()),
         }
+    }
+
+    /// Bin name.
+    pub fn get_name(&self) -> String {
+        self._as.name.clone()
+    }
+
+    /// Bin value.
+    pub fn get_value(&self) -> PHPValue {
+        self._as.value.clone().into()
+    }
+
+    /// v1 compatibility shim: forwards `$bin->name`, `->value` to the getters.
+    pub fn __get(&self, name: &str) -> PhpResult<Zval> {
+        let mut zv = Zval::new();
+        match name {
+            "name" => zv.set_string(&self.get_name(), false)?,
+            "value" => self.get_value().set_zval(&mut zv, false)?,
+            _ => zv.set_null(),
+        }
+        Ok(zv)
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
-///
-///  Record
-///
+//
+//  Record
+//
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Container object for a database record.
-#[php_class(name = "Aerospike\\Record")]
+#[php_class]
+#[php(name = "Aerospike\\Record")]
 pub struct Record {
-    _as: proto::Record,
+    _as: aero::Record,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Record {
-    /// Bins is the map of requested name/value bins.
-    pub fn bin(&self, name: &str) -> Option<PHPValue> {
-        let b = self._as.bins.get(name);
-        b.map(|v| (*v).clone().into())
+    /// v1 compatibility shim: forwards `$record->bins`, `->generation`, `->ttl`,
+    /// `->expiration`, `->key` to the corresponding getters. New code should call the
+    /// explicit `getX()` methods.
+    pub fn __get(&self, name: &str) -> PhpResult<Zval> {
+        let mut zv = Zval::new();
+        match name {
+            "bins" => {
+                if let Some(b) = self.get_bins() {
+                    b.set_zval(&mut zv, false)?;
+                } else {
+                    zv.set_null();
+                }
+            }
+            "generation" => match self.get_generation() {
+                Some(g) => zv.set_long(g as i64),
+                None => zv.set_null(),
+            },
+            "ttl" => match self.get_ttl() {
+                Some(t) => zv.set_long(t as i64),
+                None => zv.set_null(),
+            },
+            "key" => match self.get_key() {
+                Some(k) => {
+                    let zo: ZBox<ZendObject> = k.into_zend_object()?;
+                    zo.set_zval(&mut zv, false)?;
+                }
+                None => zv.set_null(),
+            },
+            _ => zv.set_null(),
+        }
+        Ok(zv)
     }
 
     /// Bins is the map of requested name/value bins.
-    #[getter]
+    pub fn bin(&self, name: &str) -> Option<PHPValue> {
+        self._as.bins.get(name).map(|v| v.clone().into())
+    }
+
+    /// Bins is the map of requested name/value bins.
     pub fn get_bins(&self) -> Option<PHPValue> {
         Some(self._as.bins.clone().into())
     }
 
     /// Generation shows record modification count.
-    #[getter]
     pub fn get_generation(&self) -> Option<u32> {
         Some(self._as.generation)
     }
 
     /// Expiration indicates when a record will expire (Time-To-Live).
-    /// To determine a record's time to live, use the `getTtl()` method on the
-    /// Expiration or, equivalently, on the record.
-    #[getter]
+    /// Returns the remaining TTL in seconds, or `Never` if the record never expires.
     pub fn get_expiration(&self) -> Expiration {
-        match self._as.expiration {
-            0 => NEVER_EXPIRE.into(),
-            secs => secs.into(),
+        match self._as.time_to_live() {
+            None => Expiration::Never(),
+            Some(d) => Expiration::Seconds(d.as_secs() as u32),
         }
     }
 
-    /// Answer with the record's TTL (Time-To-Live), or null if not
-    /// possible.  Expressed in number of seconds until record expires.
-    /// Equivalent to `$this->getExpiration()->getTtl()`.
-    #[getter]
+    /// Absolute Unix timestamp (in seconds since epoch) when this record will expire.
+    /// Returns `null` if the record never expires. v1-compatible.
+    ///
+    /// For the remaining TTL in seconds, use `getRemainingTtl()`.
     pub fn get_ttl(&self) -> Option<u32> {
+        self._as.time_to_live().map(|d| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|n| n.as_secs() as u32)
+                .unwrap_or(0);
+            now.saturating_add(d.as_secs() as u32)
+        })
+    }
+
+    /// Remaining TTL in seconds (positive integer), or `null` if the record never expires.
+    /// Equivalent to `$this->getExpiration()->getTtl()`.
+    pub fn get_remaining_ttl(&self) -> Option<u32> {
         self.get_expiration().get_ttl()
     }
 
     /// Key is the record's key.
     /// Might be empty, or may only consist of digest value.
-    #[getter]
     pub fn get_key(&self) -> Option<Key> {
-        Some(Key {
-            _as: self._as.key.clone()?,
-        })
+        self._as.key.clone().map(|k| Key { _as: k })
     }
 }
 
@@ -4292,254 +2918,134 @@ impl FromZval<'_> for Record {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// BatchPolicy encapsulates parameters for policy attributes used in write operations.
-/// This object is passed into methods where database writes can occur.
-#[php_class(name = "Aerospike\\BatchPolicy")]
+/// BatchPolicy encapsulates parameters for batch operations.
+///
+/// v2 BREAKING: legacy fields `sleep_multiplier`, `send_key`, `use_compression`,
+/// `exit_fast_on_exhausted_connection_pool`, `read_mode_sc` have been removed.
+/// `concurrent_nodes` was renamed to `concurrency` (enum Sequential/Parallel).
+/// `allow_partial_results` has been removed (controlled via `respond_all_keys`).
+#[php_class]
+#[php(name = "Aerospike\\BatchPolicy")]
 #[derive(Debug)]
 pub struct BatchPolicy {
-    _as: proto::BatchPolicy,
+    _as: aero::BatchPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchPolicy {
     pub fn __construct() -> Self {
         BatchPolicy::default()
     }
 
-    // ***************************************************************************
-    // ReadPolicy Attrs
-    // ***************************************************************************
-
-    #[getter]
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.policy.as_ref().unwrap().max_retries
-    }
-
-    #[setter]
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.max_retries = max_retries);
-    }
-
-    #[getter]
-    pub fn get_sleep_multiplier(&self) -> f64 {
-        self._as.policy.as_ref().unwrap().sleep_multiplier
-    }
-
-    #[setter]
-    pub fn set_sleep_multiplier(&mut self, sleep_multiplier: f64) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.sleep_multiplier = sleep_multiplier);
-    }
-
-    #[getter]
-    pub fn get_total_timeout(&self) -> u64 {
-        self._as.policy.as_ref().unwrap().total_timeout
-    }
-
-    #[setter]
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.total_timeout = timeout_millis);
-    }
-
-    #[getter]
-    pub fn get_socket_timeout(&self) -> u64 {
-        self._as.policy.as_ref().unwrap().socket_timeout
-    }
-
-    #[setter]
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.socket_timeout = timeout_millis);
-    }
-
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as.policy.as_ref().unwrap().send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.send_key = send_key);
-    }
-
-    #[getter]
-    pub fn get_use_compression(&self) -> bool {
-        self._as.policy.as_ref().unwrap().use_compression
-    }
-
-    #[setter]
-    pub fn set_use_compression(&mut self, use_compression: bool) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.use_compression = use_compression);
-    }
-
-    #[getter]
-    pub fn get_exit_fast_on_exhausted_connection_pool(&self) -> bool {
-        self._as
-            .policy
-            .as_ref()
-            .unwrap()
-            .exit_fast_on_exhausted_connection_pool
-    }
-
-    #[setter]
-    pub fn set_exit_fast_on_exhausted_connection_pool(
-        &mut self,
-        exit_fast_on_exhausted_connection_pool: bool,
-    ) {
-        self._as.policy.as_mut().map(|ref mut p| {
-            p.exit_fast_on_exhausted_connection_pool = exit_fast_on_exhausted_connection_pool
-        });
-    }
-
-    #[getter]
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: match self._as.policy.as_ref().unwrap().read_mode_ap {
-                0 => proto::ReadModeAp::One,
-                1 => proto::ReadModeAp::All,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_ap = read_mode_ap._as.into());
-    }
-
-    #[getter]
-    pub fn get_read_mode_sc(&self) -> ReadModeSC {
-        ReadModeSC {
-            _as: match self._as.policy.as_ref().unwrap().read_mode_sc {
-                0 => proto::ReadModeSc::Session,
-                1 => proto::ReadModeSc::Linearize,
-                2 => proto::ReadModeSc::AllowReplica,
-                3 => proto::ReadModeSc::AllowUnavailable,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_sc(&mut self, read_mode_sc: ReadModeSC) {
-        self._as
-            .policy
-            .as_mut()
-            .map(|ref mut p| p.read_mode_sc = read_mode_sc._as.into());
-    }
-
-    #[getter]
-    pub fn get_filter_expression(&self) -> Option<Expression> {
-        self._as
-            .policy
-            .as_ref()
-            .unwrap()
-            .filter_expression
-            .clone()
-            .map(|fe| Expression { _as: fe })
-    }
-
-    #[setter]
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self
-                ._as
-                .policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = Some(fe._as)),
-            None => self
-                ._as
-                .policy
-                .as_mut()
-                .map(|ref mut p| p.filter_expression = None),
-        };
-    }
-
-    #[getter]
-    pub fn get_concurrent_nodes(&self) -> i32 {
-        if let Some(nodes) = self._as.concurrent_nodes {
-            nodes
-        } else {
-            1
-        }
-    }
-
-    #[setter]
-    pub fn set_concurrent_nodes(&mut self, concurrent_nodes: i32) {
-        self._as.concurrent_nodes = Some(concurrent_nodes);
-    }
-
-    #[getter]
+    /// Allow batch to be processed immediately in the server's receiving thread.
     pub fn get_allow_inline(&self) -> bool {
         self._as.allow_inline
     }
-
-    #[setter]
     pub fn set_allow_inline(&mut self, allow_inline: bool) {
         self._as.allow_inline = allow_inline;
     }
 
-    #[getter]
+    /// Allow batch to be processed immediately in the server's receiving thread for SSD namespaces.
     pub fn get_allow_inline_ssd(&self) -> bool {
         self._as.allow_inline_ssd
     }
-
-    #[setter]
     pub fn set_allow_inline_ssd(&mut self, allow_inline_ssd: bool) {
         self._as.allow_inline_ssd = allow_inline_ssd;
     }
 
-    #[getter]
+    /// Should all batch keys be attempted regardless of errors.
     pub fn get_respond_all_keys(&self) -> bool {
         self._as.respond_all_keys
     }
-
-    #[setter]
     pub fn set_respond_all_keys(&mut self, respond_all_keys: bool) {
-        self._as.respond_all_keys = respond_all_keys
+        self._as.respond_all_keys = respond_all_keys;
     }
 
-    #[getter]
-    pub fn get_allow_partial_results(&self) -> bool {
-        self._as.allow_partial_results
+    /// v1 compatibility: set concurrency by node count. aerospike-rust 2.x dropped the
+    /// per-thread limit, so values map to `Sequential` (n ≤ 1) or `Parallel` (n > 1).
+    /// For explicit control over the typed enum, use `setConcurrency()`.
+    pub fn set_concurrent_nodes(&mut self, n: u32) {
+        self._as.concurrency = if n <= 1 {
+            aero::Concurrency::Sequential
+        } else {
+            aero::Concurrency::Parallel
+        };
+    }
+    /// v1 compatibility: returns 1 for `Sequential`, 0 for `Parallel` (matching the
+    /// historical semantics of `concurrent_nodes`: 1 = serial, 0 = unbounded).
+    pub fn get_concurrent_nodes(&self) -> u32 {
+        match self._as.concurrency {
+            aero::Concurrency::Sequential => 1,
+            aero::Concurrency::Parallel => 0,
+        }
     }
 
-    #[setter]
-    pub fn set_allow_partial_results(&mut self, allow_partial_results: bool) {
-        self._as.respond_all_keys = allow_partial_results
+    /// Set concurrency strategy via the typed `Concurrency` wrapper. Prefer this over
+    /// `setConcurrentNodes()` in new code.
+    pub fn set_concurrency(&mut self, c: &Concurrency) {
+        self._as.concurrency = match c.v {
+            _Concurrency::Sequential => aero::Concurrency::Sequential,
+            _Concurrency::Parallel | _Concurrency::MaxThreads(_) => aero::Concurrency::Parallel,
+        };
+    }
+    pub fn get_concurrency(&self) -> Concurrency {
+        match self._as.concurrency {
+            aero::Concurrency::Sequential => Concurrency::Sequential(),
+            aero::Concurrency::Parallel => Concurrency::Parallel(),
+        }
+    }
+
+    // ----- base policy attributes -----
+    pub fn get_max_retries(&self) -> u32 {
+        self._as.base_policy.max_retries as u32
+    }
+    pub fn set_max_retries(&mut self, max_retries: u32) {
+        self._as.base_policy.max_retries = max_retries as usize;
+    }
+    pub fn get_total_timeout(&self) -> u64 {
+        u64::from(self._as.base_policy.total_timeout)
+    }
+    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
+    }
+    pub fn get_socket_timeout(&self) -> u64 {
+        u64::from(self._as.base_policy.socket_timeout)
+    }
+    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+        Ok(())
+    }
+    pub fn get_read_mode_ap(&self) -> ReadModeAP {
+        ReadModeAP {
+            _as: self._as.base_policy.consistency_level.clone(),
+        }
+    }
+    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
+        self._as.base_policy.consistency_level = read_mode_ap._as;
+    }
+    pub fn get_filter_expression(&self) -> Option<Expression> {
+        self._as
+            .filter_expression
+            .clone()
+            .map(|fe| Expression { _as: fe })
+    }
+    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+        self._as.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
 impl Default for BatchPolicy {
     fn default() -> Self {
         BatchPolicy {
-            _as: proto::BatchPolicy {
-                policy: Some(ReadPolicy::default()._as),
-                concurrent_nodes: Some(1), // Default concurrent nodes value
-                allow_inline: true,        // Default allow inline value
-                allow_inline_ssd: false,   // Default allow inline SSD value
-                respond_all_keys: true,    // Default respond all keys value
-                allow_partial_results: false, // Default allow partial results value
+            _as: aero::BatchPolicy {
+                base_policy: aero::policy::BasePolicy::default(),
+                concurrency: aero::Concurrency::Sequential,
+                allow_inline: true,
+                allow_inline_ssd: false,
+                respond_all_keys: true,
+                filter_expression: None,
+                replica: Default::default(),
             },
         }
     }
@@ -4552,110 +3058,43 @@ impl Default for BatchPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BatchReadPolicy attributes used in batch read commands.
-#[php_class(name = "Aerospike\\BatchReadPolicy")]
+#[php_class]
+#[php(name = "Aerospike\\BatchReadPolicy")]
+#[derive(Default)]
 pub struct BatchReadPolicy {
-    _as: proto::BatchReadPolicy,
+    _as: aero::BatchReadPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchReadPolicy {
     pub fn __construct() -> Self {
         BatchReadPolicy::default()
     }
 
-    /// FilterExpression is the optional expression filter. If FilterExpression exists and evaluates to false, the specific batch key
-    /// request is not performed and BatchRecord.ResultCode is set to types.FILTERED_OUT.
-    ///
-    /// Default: null
-    #[getter]
+    /// Read-touch-TTL percent (0=server default, -1=don't reset, 1-100=percentage).
+    pub fn get_read_touch_ttl_percent(&self) -> i32 {
+        match self._as.read_touch_ttl {
+            aero::policy::ReadTouchTTL::Percent(p) => i32::from(p),
+            aero::policy::ReadTouchTTL::ServerDefault => 0,
+            aero::policy::ReadTouchTTL::DontReset => -1,
+        }
+    }
+    pub fn set_read_touch_ttl_percent(&mut self, percent: i32) {
+        self._as.read_touch_ttl = match percent {
+            0 => aero::policy::ReadTouchTTL::ServerDefault,
+            -1 => aero::policy::ReadTouchTTL::DontReset,
+            p if (1..=100).contains(&p) => aero::policy::ReadTouchTTL::Percent(p as u8),
+            _ => aero::policy::ReadTouchTTL::ServerDefault,
+        };
+    }
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self._as.filter_expression = Some(fe._as),
-            None => self._as.filter_expression = None,
-        }
-    }
-
-    /// ReadModeAP indicates read policy for AP (availability) namespaces.
-    #[getter]
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: match self._as.read_mode_ap {
-                0 => proto::ReadModeAp::One,
-                1 => proto::ReadModeAp::All,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.read_mode_ap = read_mode_ap._as.into();
-    }
-
-    /// ReadModeSC indicates read policy for SC (strong consistency) namespaces.
-    #[getter]
-    pub fn get_read_mode_sc(&self) -> ReadModeSC {
-        ReadModeSC {
-            _as: match self._as.read_mode_ap {
-                0 => proto::ReadModeSc::Session,
-                1 => proto::ReadModeSc::Linearize,
-                2 => proto::ReadModeSc::AllowReplica,
-                3 => proto::ReadModeSc::AllowUnavailable,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_read_mode_sc(&mut self, read_mode_sc: ReadModeSC) {
-        self._as.read_mode_sc = read_mode_sc._as.into();
-    }
-
-    /// ReadTouchTTLPercent determines how record TTL (time to live) is affected on reads. When enabled, the server can
-    /// efficiently operate as a read-based LRU cache where the least recently used records are expired.
-    /// The value is expressed as a percentage of the TTL sent on the most recent write such that a read
-    /// within this interval of the record’s end of life will generate a touch.
-    ///
-    /// For example, if the most recent write had a TTL of 10 hours and read_touch_ttl_percent is set to
-    /// 80, the next read within 8 hours of the record's end of life (equivalent to 2 hours after the most
-    /// recent write) will result in a touch, resetting the TTL to another 10 hours.
-    ///
-    /// Values:
-    ///
-    /// 0 : Use server config default-read-touch-ttl-pct for the record's namespace/set.
-    /// -1 : Do not reset record TTL on reads.
-    /// 1 - 100 : Reset record TTL on reads when within this percentage of the most recent write TTL.
-    /// Default: 0
-    #[getter]
-    pub fn get_read_touch_ttl_percent(&self) -> i32 {
-        self._as.read_touch_ttl_percent
-    }
-
-    #[setter]
-    pub fn set_read_touch_ttl_percent(&mut self, percent: i32) {
-        self._as.read_touch_ttl_percent = percent;
-    }
-}
-
-impl Default for BatchReadPolicy {
-    fn default() -> Self {
-        BatchReadPolicy {
-            _as: proto::BatchReadPolicy {
-                filter_expression: None,
-                read_mode_ap: proto::ReadModeAp::One.into(),
-                read_mode_sc: proto::ReadModeSc::Session.into(),
-                read_touch_ttl_percent: 0,
-            },
-        }
+        self._as.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -4666,183 +3105,76 @@ impl Default for BatchReadPolicy {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BatchWritePolicy attributes used in batch write commands.
-#[php_class(name = "Aerospike\\BatchWritePolicy")]
+#[php_class]
+#[php(name = "Aerospike\\BatchWritePolicy")]
+#[derive(Default)]
 pub struct BatchWritePolicy {
-    _as: proto::BatchWritePolicy,
+    _as: aero::BatchWritePolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchWritePolicy {
     pub fn __construct() -> Self {
         BatchWritePolicy::default()
     }
-
-    /// FilterExpression is optional expression filter. If FilterExpression exists and evaluates to false, the specific batch key
-    /// request is not performed and BatchRecord#resultCode is set to types.FILTERED_OUT.
-    ///
-    /// Default: nil
-    #[getter]
+    pub fn get_record_exists_action(&self) -> RecordExistsAction {
+        RecordExistsAction {
+            _as: self._as.record_exists_action.clone(),
+        }
+    }
+    pub fn set_record_exists_action(&mut self, record_exists_action: RecordExistsAction) {
+        self._as.record_exists_action = record_exists_action._as;
+    }
+    pub fn get_generation_policy(&self) -> GenerationPolicy {
+        GenerationPolicy {
+            _as: self._as.generation_policy.clone(),
+        }
+    }
+    pub fn set_generation_policy(&mut self, generation_policy: GenerationPolicy) {
+        self._as.generation_policy = generation_policy._as;
+    }
+    pub fn get_commit_level(&self) -> CommitLevel {
+        CommitLevel {
+            _as: self._as.commit_level.clone(),
+        }
+    }
+    pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
+        self._as.commit_level = commit_level._as;
+    }
+    pub fn get_generation(&self) -> u32 {
+        self._as.generation
+    }
+    pub fn set_generation(&mut self, generation: u32) {
+        self._as.generation = generation;
+    }
+    pub fn get_expiration(&self) -> Expiration {
+        Expiration {
+            _as: self._as.expiration,
+        }
+    }
+    pub fn set_expiration(&mut self, expiration: Expiration) {
+        self._as.expiration = expiration._as;
+    }
+    pub fn get_send_key(&self) -> bool {
+        self._as.send_key
+    }
+    pub fn set_send_key(&mut self, send_key: bool) {
+        self._as.send_key = send_key;
+    }
+    pub fn get_durable_delete(&self) -> bool {
+        self._as.durable_delete
+    }
+    pub fn set_durable_delete(&mut self, durable_delete: bool) {
+        self._as.durable_delete = durable_delete;
+    }
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self._as.filter_expression = Some(fe._as),
-            None => self._as.filter_expression = None,
-        }
-    }
-
-    /// RecordExistsAction qualifies how to handle writes where the record already exists.
-    #[getter]
-    pub fn get_record_exists_action(&self) -> RecordExistsAction {
-        RecordExistsAction {
-            _as: match &self._as.record_exists_action {
-                0 => proto::RecordExistsAction::Update,
-                1 => proto::RecordExistsAction::UpdateOnly,
-                2 => proto::RecordExistsAction::Replace,
-                3 => proto::RecordExistsAction::ReplaceOnly,
-                4 => proto::RecordExistsAction::CreateOnly,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_record_exists_action(&mut self, record_exists_action: RecordExistsAction) {
-        self._as.record_exists_action = record_exists_action._as.into();
-    }
-
-    /// Desired consistency guarantee when committing a transaction on the server. The default
-    /// (COMMIT_ALL) indicates that the server should wait for master and all replica commits to
-    /// be successful before returning success to the client.
-    ///
-    /// Default: CommitLevel.COMMIT_ALL
-    #[getter]
-    pub fn get_generation_policy(&self) -> GenerationPolicy {
-        GenerationPolicy {
-            _as: match &self._as.generation_policy {
-                0 => proto::GenerationPolicy::None,
-                1 => proto::GenerationPolicy::ExpectGenEqual,
-                2 => proto::GenerationPolicy::ExpectGenGt,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_generation_policy(&mut self, generation_policy: GenerationPolicy) {
-        self._as.generation_policy = generation_policy._as.into();
-    }
-
-    /// GenerationPolicy qualifies how to handle record writes based on record generation. The default (NONE)
-    /// indicates that the generation is not used to restrict writes.
-    ///
-    /// The server does not support this field for UDF execute() calls. The read-modify-write
-    /// usage model can still be enforced inside the UDF code itself.
-    ///
-    /// Default: GenerationPolicy.NONE
-    /// indicates that the generation is not used to restrict writes.
-    #[getter]
-    pub fn get_commit_level(&self) -> CommitLevel {
-        CommitLevel {
-            _as: match &self._as.commit_level {
-                0 => proto::CommitLevel::CommitAll,
-                1 => proto::CommitLevel::CommitMaster,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
-        self._as.commit_level = commit_level._as.into();
-    }
-
-    /// Expected generation. Generation is the number of times a record has been modified
-    /// (including creation) on the server. If a write operation is creating a record,
-    /// the expected generation would be 0. This field is only relevant when
-    /// generationPolicy is not NONE.
-    ///
-    /// The server does not support this field for UDF execute() calls. The read-modify-write
-    /// usage model can still be enforced inside the UDF code itself.
-    ///
-    /// Default: 0
-    #[getter]
-    pub fn get_generation(&self) -> u32 {
-        self._as.generation
-    }
-
-    #[setter]
-    pub fn set_generation(&mut self, generation: u32) {
-        self._as.generation = generation;
-    }
-
-    /// Expiration determines record expiration in seconds. Also known as TTL (Time-To-Live).
-    /// Seconds record will live before being removed by the server.
-    /// Expiration values:
-    /// TTLServerDefault (0): Default to namespace configuration variable "default-ttl" on the server.
-    /// TTLDontExpire (MaxUint32): Never expire for Aerospike 2 server versions >= 2.7.2 and Aerospike 3+ server
-    /// TTLDontUpdate (MaxUint32 - 1): Do not change ttl when record is written. Supported by Aerospike server versions >= 3.10.1
-    /// > 0: Actual expiration in seconds.
-    #[getter]
-    pub fn get_expiration(&self) -> Expiration {
-        match self._as.expiration {
-            NAMESPACE_DEFAULT => Expiration::Namespace_Default(),
-            NEVER_EXPIRE => Expiration::Never(),
-            DONT_UPDATE => Expiration::Dont_Update(),
-            secs => Expiration::Seconds(secs),
-        }
-    }
-
-    #[setter]
-    pub fn set_expiration(&mut self, expiration: Expiration) {
-        self._as.expiration = (&expiration).into();
-    }
-
-    /// DurableDelete leaves a tombstone for the record if the transaction results in a record deletion.
-    /// This prevents deleted records from reappearing after node failures.
-    /// Valid for Aerospike Server Enterprise Edition 3.10+ only.
-    #[getter]
-    pub fn get_durable_delete(&self) -> bool {
-        self._as.durable_delete
-    }
-
-    #[setter]
-    pub fn set_durable_delete(&mut self, durable_delete: bool) {
-        self._as.durable_delete = durable_delete;
-    }
-
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as.send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as.send_key = send_key;
-    }
-}
-
-impl Default for BatchWritePolicy {
-    fn default() -> Self {
-        BatchWritePolicy {
-            _as: proto::BatchWritePolicy {
-                filter_expression: None,
-                record_exists_action: proto::RecordExistsAction::Update.into(),
-                generation_policy: proto::GenerationPolicy::None.into(),
-                commit_level: proto::CommitLevel::CommitAll.into(),
-                generation: 0,
-                expiration: 0,
-                durable_delete: false,
-                send_key: false,
-            },
-        }
+        self._as.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -4852,112 +3184,61 @@ impl Default for BatchWritePolicy {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// BatchDeletePolicy is used in batch delete commands.
-#[php_class(name = "Aerospike\\BatchDeletePolicy")]
+/// BatchDeletePolicy attributes used in batch delete commands.
+#[php_class]
+#[php(name = "Aerospike\\BatchDeletePolicy")]
+#[derive(Default)]
 pub struct BatchDeletePolicy {
-    _as: proto::BatchDeletePolicy,
+    _as: aero::BatchDeletePolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchDeletePolicy {
     pub fn __construct() -> Self {
         BatchDeletePolicy::default()
     }
-
-    /// FilterExpression is optional expression filter. If FilterExpression exists and evaluates to false, the specific batch key
-    /// request is not performed and BatchRecord.ResultCode is set to type.FILTERED_OUT.
-    /// Default: nil
-    #[getter]
+    pub fn get_generation_policy(&self) -> GenerationPolicy {
+        GenerationPolicy {
+            _as: self._as.generation_policy.clone(),
+        }
+    }
+    pub fn set_generation_policy(&mut self, generation_policy: GenerationPolicy) {
+        self._as.generation_policy = generation_policy._as;
+    }
+    pub fn get_commit_level(&self) -> CommitLevel {
+        CommitLevel {
+            _as: self._as.commit_level.clone(),
+        }
+    }
+    pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
+        self._as.commit_level = commit_level._as;
+    }
+    pub fn get_generation(&self) -> u32 {
+        self._as.generation
+    }
+    pub fn set_generation(&mut self, generation: u32) {
+        self._as.generation = generation;
+    }
+    pub fn get_send_key(&self) -> bool {
+        self._as.send_key
+    }
+    pub fn set_send_key(&mut self, send_key: bool) {
+        self._as.send_key = send_key;
+    }
+    pub fn get_durable_delete(&self) -> bool {
+        self._as.durable_delete
+    }
+    pub fn set_durable_delete(&mut self, durable_delete: bool) {
+        self._as.durable_delete = durable_delete;
+    }
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self._as.filter_expression = Some(fe._as),
-            None => self._as.filter_expression = None,
-        }
-    }
-
-    /// Desired consistency guarantee when committing a transaction on the server. The default
-    /// (COMMIT_ALL) indicates that the server should wait for master and all replica commits to
-    /// be successful before returning success to the client.
-    /// Default: CommitLevel.COMMIT_ALL
-    #[getter]
-    pub fn get_commit_level(&self) -> CommitLevel {
-        CommitLevel {
-            _as: match &self._as.commit_level {
-                0 => proto::CommitLevel::CommitAll,
-                1 => proto::CommitLevel::CommitMaster,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
-        self._as.commit_level = commit_level._as.into();
-    }
-
-    /// Expected generation. Generation is the number of times a record has been modified
-    /// (including creation) on the server. This field is only relevant when generationPolicy
-    /// is not NONE.
-    /// Default: 0
-    #[getter]
-    pub fn get_generation(&self) -> u32 {
-        self._as.generation
-    }
-
-    #[setter]
-    pub fn set_generation(&mut self, generation: u32) {
-        self._as.generation = generation;
-    }
-
-    /// If the transaction results in a record deletion, leave a tombstone for the record.
-    /// This prevents deleted records from reappearing after node failures.
-    /// Valid for Aerospike Server Enterprise Edition only.
-    /// Default: false (do not tombstone deleted records).
-    #[getter]
-    pub fn get_durable_delete(&self) -> bool {
-        self._as.durable_delete
-    }
-
-    #[setter]
-    pub fn set_durable_delete(&mut self, durable_delete: bool) {
-        self._as.durable_delete = durable_delete;
-    }
-
-    /// Send user defined key in addition to hash digest.
-    /// If true, the key will be stored with the tombstone record on the server.
-    /// Default: false (do not send the user defined key)
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as.send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as.send_key = send_key;
-    }
-}
-
-impl Default for BatchDeletePolicy {
-    fn default() -> Self {
-        BatchDeletePolicy {
-            _as: proto::BatchDeletePolicy {
-                filter_expression: None,
-                generation_policy: proto::GenerationPolicy::None.into(),
-                commit_level: proto::CommitLevel::CommitAll.into(),
-                generation: 0,
-                durable_delete: false,
-                send_key: false,
-            },
-        }
+        self._as.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -4967,120 +3248,55 @@ impl Default for BatchDeletePolicy {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// BatchUDFPolicy attributes used in batch UDF execute commands.
-#[php_class(name = "Aerospike\\BatchUdfPolicy")]
+/// BatchUdfPolicy attributes used in batch UDF commands.
+#[php_class]
+#[php(name = "Aerospike\\BatchUdfPolicy")]
+#[derive(Default)]
 pub struct BatchUdfPolicy {
-    _as: proto::BatchUdfPolicy,
+    _as: aero::BatchUDFPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchUdfPolicy {
     pub fn __construct() -> Self {
         BatchUdfPolicy::default()
     }
-
-    /// Optional expression filter. If FilterExpression exists and evaluates to false, the specific batch key
-    /// request is not performed and BatchRecord.ResultCode is set to types.FILTERED_OUT.
-    ///
-    /// Default: nil
-    #[getter]
+    pub fn get_commit_level(&self) -> CommitLevel {
+        CommitLevel {
+            _as: self._as.commit_level.clone(),
+        }
+    }
+    pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
+        self._as.commit_level = commit_level._as;
+    }
+    pub fn get_expiration(&self) -> Expiration {
+        Expiration {
+            _as: self._as.expiration,
+        }
+    }
+    pub fn set_expiration(&mut self, expiration: Expiration) {
+        self._as.expiration = expiration._as;
+    }
+    pub fn get_send_key(&self) -> bool {
+        self._as.send_key
+    }
+    pub fn set_send_key(&mut self, send_key: bool) {
+        self._as.send_key = send_key;
+    }
+    pub fn get_durable_delete(&self) -> bool {
+        self._as.durable_delete
+    }
+    pub fn set_durable_delete(&mut self, durable_delete: bool) {
+        self._as.durable_delete = durable_delete;
+    }
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
             .filter_expression
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-
-    #[setter]
     pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        match filter_expression {
-            Some(fe) => self._as.filter_expression = Some(fe._as),
-            None => self._as.filter_expression = None,
-        }
-    }
-    /// Desired consistency guarantee when committing a transaction on the server. The default
-    /// (COMMIT_ALL) indicates that the server should wait for master and all replica commits to
-    /// be successful before returning success to the client.
-    ///
-    /// Default: CommitLevel.COMMIT_ALL
-    #[getter]
-    pub fn get_commit_level(&self) -> CommitLevel {
-        CommitLevel {
-            _as: match &self._as.commit_level {
-                0 => proto::CommitLevel::CommitAll,
-                1 => proto::CommitLevel::CommitMaster,
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[setter]
-    pub fn set_commit_level(&mut self, commit_level: CommitLevel) {
-        self._as.commit_level = commit_level._as.into();
-    }
-
-    /// Expiration determines record expiration in seconds. Also known as TTL (Time-To-Live).
-    /// Seconds record will live before being removed by the server.
-    /// Expiration values:
-    /// TTLServerDefault (0): Default to namespace configuration variable "default-ttl" on the server.
-    /// TTLDontExpire (MaxUint32): Never expire for Aerospike 2 server versions >= 2.7.2 and Aerospike 3+ server
-    /// TTLDontUpdate (MaxUint32 - 1): Do not change ttl when record is written. Supported by Aerospike server versions >= 3.10.1
-    /// > 0: Actual expiration in seconds.
-    #[getter]
-    pub fn get_expiration(&self) -> Expiration {
-        match self._as.expiration {
-            NAMESPACE_DEFAULT => Expiration::Namespace_Default(),
-            NEVER_EXPIRE => Expiration::Never(),
-            DONT_UPDATE => Expiration::Dont_Update(),
-            secs => Expiration::Seconds(secs),
-        }
-    }
-
-    #[setter]
-    pub fn set_expiration(&mut self, expiration: Expiration) {
-        self._as.expiration = (&expiration).into();
-    }
-
-    /// DurableDelete leaves a tombstone for the record if the transaction results in a record deletion.
-    /// This prevents deleted records from reappearing after node failures.
-    /// Valid for Aerospike Server Enterprise Edition 3.10+ only.
-    #[getter]
-    pub fn get_durable_delete(&self) -> bool {
-        self._as.durable_delete
-    }
-
-    #[setter]
-    pub fn set_durable_delete(&mut self, durable_delete: bool) {
-        self._as.durable_delete = durable_delete;
-    }
-
-    /// SendKey determines to whether send user defined key in addition to hash digest on both reads and writes.
-    /// If the key is sent on a write, the key will be stored with the record on
-    /// the server.
-    /// The default is to not send the user defined key.
-    #[getter]
-    pub fn get_send_key(&self) -> bool {
-        self._as.send_key
-    }
-
-    #[setter]
-    pub fn set_send_key(&mut self, send_key: bool) {
-        self._as.send_key = send_key;
-    }
-}
-
-impl Default for BatchUdfPolicy {
-    fn default() -> Self {
-        BatchUdfPolicy {
-            _as: proto::BatchUdfPolicy {
-                filter_expression: None,
-                commit_level: proto::CommitLevel::CommitAll.into(),
-                expiration: 0,
-                durable_delete: false,
-                send_key: false,
-            },
-        }
+        self._as.filter_expression = filter_expression.map(|fe| fe._as);
     }
 }
 
@@ -5091,134 +3307,103 @@ impl Default for BatchUdfPolicy {
 //////////////////////////////////////////////////////////////////////////////////////////
 
 /// OperationType determines operation type
-#[php_class(name = "Aerospike\\Operation")]
+#[php_class]
+#[php(name = "Aerospike\\Operation")]
+#[derive(Clone)]
 pub struct Operation {
-    _as: proto::operation::Op,
+    _as: aero::operations::Operation,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Operation {
-    /// read bin database operation.
+    /// read bin database operation. When `bin_name` is `None`, reads all bins.
     pub fn get(bin_name: Option<String>) -> Self {
-        Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Get.into(),
-                bin_name: bin_name,
-                ..proto::StdOperation::default()
-            }),
-        }
+        let op = match bin_name {
+            Some(name) => aero::operations::get_bin(&name),
+            None => aero::operations::get(),
+        };
+        Operation { _as: op }
     }
 
     /// read record header database operation.
     pub fn get_header() -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::GetHeader.into(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::get_header(),
         }
     }
 
     /// set database operation.
     pub fn put(bin: &Bin) -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Put.into(),
-                bin_name: Some(bin._as.name.clone()),
-                bin_value: bin._as.value.clone(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::put(&bin._as),
         }
     }
 
     /// string append database operation.
     pub fn append(bin: &Bin) -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Append.into(),
-                bin_name: Some(bin._as.name.clone()),
-                bin_value: bin._as.value.clone(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::append(&bin._as),
         }
     }
 
     /// string prepend database operation.
     pub fn prepend(bin: &Bin) -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Prepend.into(),
-                bin_name: Some(bin._as.name.clone()),
-                bin_value: bin._as.value.clone(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::prepend(&bin._as),
         }
     }
 
     /// integer add database operation.
     pub fn add(bin: &Bin) -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Add.into(),
-                bin_name: Some(bin._as.name.clone()),
-                bin_value: bin._as.value.clone(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::add(&bin._as),
         }
     }
 
     /// touch record database operation.
     pub fn touch() -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Touch.into(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::touch(),
         }
     }
 
     /// delete record database operation.
     pub fn delete() -> Self {
         Operation {
-            _as: proto::operation::Op::Std(proto::StdOperation {
-                op_type: proto::OperationType::Delete.into(),
-                ..proto::StdOperation::default()
-            }),
+            _as: aero::operations::delete(),
         }
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
-///
-///  BatchRecord
-///
+//
+//  BatchRecord
+//
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// BatchRecord encasulates the Batch key and record result.
-#[php_class(name = "Aerospike\\BatchRecord")]
-#[derive(Debug, PartialEq, Clone)]
+/// Encapsulates a Batch key and the record result populated after a batch command completes.
+///
+/// Constructed only by the client when reading batch results back from the server. Field
+/// shape mirrors `aero::BatchRecord`.
+#[php_class]
+#[php(name = "Aerospike\\BatchRecord")]
+#[derive(Debug, Clone)]
 pub struct BatchRecord {
-    _as: proto::BatchRecord,
+    _as: aero::BatchRecord,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchRecord {
-    /// Key.
-    #[getter]
+    /// Record's key.
     pub fn get_key(&self) -> Option<Key> {
         Some(Key {
-            _as: self._as.key.clone()?,
+            _as: self._as.key.clone(),
         })
     }
 
-    /// Record result after batch command has completed.  Will be nil if record was not found
-    /// or an error occurred. See ResultCode.
-    #[getter]
+    /// Record result. `None` when the record was not found or an error occurred. See ResultCode.
     pub fn get_record(&self) -> Option<Record> {
-        let r: proto::Record = self._as.record.clone()?;
-        Some(Record { _as: r })
+        self._as.record.clone().map(|r| Record { _as: r })
     }
 }
 
@@ -5230,75 +3415,45 @@ impl BatchRecord {
 
 /// BatchRead specifies the Key and bin names used in batch read commands
 /// where variable bins are needed for each key.
-#[php_class(name = "Aerospike\\BatchRead")]
-#[derive(Debug, PartialEq, Clone)]
+///
+/// Maps to `aero::BatchOperation::Read`. `bins` semantics:
+/// - `None` → header only (`Bins::None`)
+/// - `Some([])` → read all bins (`Bins::All`)
+/// - `Some(names)` → read specified bins (`Bins::Some(names)`)
+#[php_class]
+#[php(name = "Aerospike\\BatchRead")]
+#[derive(Debug, Clone)]
 pub struct BatchRead {
-    _as: proto::BatchRead,
+    _as: aero::BatchOperation,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchRead {
     pub fn __construct(policy: &BatchReadPolicy, key: &Key, bins: Option<Vec<String>>) -> Self {
-        let read_all_bins = match bins {
-            None => false,
-            Some(ref l) => l.len() == 0,
+        let bins = match bins {
+            None => aero::Bins::None,
+            Some(names) if names.is_empty() => aero::Bins::All,
+            Some(names) => aero::Bins::Some(names),
         };
-
         BatchRead {
-            _as: proto::BatchRead {
-                batch_record: Some(proto::BatchRecord {
-                    key: Some(key._as.clone()),
-                    record: None,
-                    error: None,
-                }),
-                policy: Some(policy._as.clone()),
-                bin_names: bins.clone().unwrap_or(vec![]),
-                read_all_bins: read_all_bins,
-                ops: vec![],
-            },
+            _as: aero::BatchOperation::read(&policy._as, key._as.clone(), bins),
         }
     }
 
-    /// Optional read policy.
+    /// Specifies the read-only operations to perform for the key. Mutually exclusive with `bins`.
+    /// A bin name can be emulated with `Operation::get(Some("bin"))`. Supported by server v5.6.0+.
     pub fn ops(policy: &BatchReadPolicy, key: &Key, ops: Vec<&Operation>) -> Self {
+        let aero_ops: Vec<aero::operations::Operation> =
+            ops.iter().map(|o| o._as.clone()).collect();
         BatchRead {
-            _as: proto::BatchRead {
-                batch_record: Some(proto::BatchRecord {
-                    key: Some(key._as.clone()),
-                    record: None,
-                    error: None,
-                }),
-                policy: Some(policy._as.clone()),
-                bin_names: vec![],
-                read_all_bins: false,
-                ops: ops
-                    .into_iter()
-                    .map(|v| proto::Operation {
-                        op: Some(v._as.clone()),
-                    })
-                    .collect(),
-            },
+            _as: aero::BatchOperation::read_ops(&policy._as, key._as.clone(), aero_ops),
         }
     }
 
-    /// Ops specifies the operations to perform for every key.
-    /// Ops are mutually exclusive with BinNames.
-    /// A binName can be emulated with `GetOp(binName)`
-    /// Supported by server v5.6.0+.
+    /// Read record header only (no bins).
     pub fn header(policy: &BatchReadPolicy, key: &Key) -> Self {
         BatchRead {
-            _as: proto::BatchRead {
-                batch_record: Some(proto::BatchRecord {
-                    key: Some(key._as.clone()),
-                    record: None,
-                    error: None,
-                }),
-                policy: Some(policy._as.clone()),
-                bin_names: vec![],
-                read_all_bins: false,
-                ops: vec![],
-            },
+            _as: aero::BatchOperation::read(&policy._as, key._as.clone(), aero::Bins::None),
         }
     }
 }
@@ -5310,31 +3465,21 @@ impl BatchRead {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BatchWrite encapsulates a batch key and read/write operations with write policy.
-#[php_class(name = "Aerospike\\BatchWrite")]
-#[derive(Debug, PartialEq, Clone)]
+/// Maps to `aero::BatchOperation::Write`.
+#[php_class]
+#[php(name = "Aerospike\\BatchWrite")]
+#[derive(Debug, Clone)]
 pub struct BatchWrite {
-    _as: proto::BatchWrite,
+    _as: aero::BatchOperation,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchWrite {
     pub fn __construct(policy: &BatchWritePolicy, key: &Key, ops: Vec<&Operation>) -> Self {
+        let aero_ops: Vec<aero::operations::Operation> =
+            ops.iter().map(|o| o._as.clone()).collect();
         BatchWrite {
-            _as: proto::BatchWrite {
-                batch_record: Some(proto::BatchRecord {
-                    key: Some(key._as.clone()),
-                    record: None,
-                    error: None,
-                }),
-                policy: Some(policy._as.clone()),
-                ops: ops
-                    .into_iter()
-                    .map(|v| proto::Operation {
-                        op: Some(v._as.clone()),
-                    })
-                    .collect(),
-            },
+            _as: aero::BatchOperation::write(&policy._as, key._as.clone(), aero_ops),
         }
     }
 }
@@ -5345,26 +3490,19 @@ impl BatchWrite {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// BatchDelete encapsulates a batch delete operation.
-#[php_class(name = "Aerospike\\BatchDelete")]
-#[derive(Debug, PartialEq, Clone)]
+/// BatchDelete encapsulates a batch delete operation. Maps to `aero::BatchOperation::Delete`.
+#[php_class]
+#[php(name = "Aerospike\\BatchDelete")]
+#[derive(Debug, Clone)]
 pub struct BatchDelete {
-    _as: proto::BatchDelete,
+    _as: aero::BatchOperation,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchDelete {
     pub fn __construct(policy: &BatchDeletePolicy, key: &Key) -> Self {
         BatchDelete {
-            _as: proto::BatchDelete {
-                batch_record: Some(proto::BatchRecord {
-                    key: Some(key._as.clone()),
-                    record: None,
-                    error: None,
-                }),
-                policy: Some(policy._as.clone()),
-            },
+            _as: aero::BatchOperation::delete(&policy._as, key._as.clone()),
         }
     }
 }
@@ -5375,15 +3513,16 @@ impl BatchDelete {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// BatchUDF encapsulates a batch user defined function operation.
-#[php_class(name = "Aerospike\\BatchUdf")]
-#[derive(Debug, PartialEq, Clone)]
+/// BatchUDF encapsulates a batch user-defined-function operation.
+/// Maps to `aero::BatchOperation::UDF`.
+#[php_class]
+#[php(name = "Aerospike\\BatchUdf")]
+#[derive(Debug, Clone)]
 pub struct BatchUdf {
-    _as: proto::BatchUdf,
+    _as: aero::BatchOperation,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BatchUdf {
     pub fn __construct(
         policy: &BatchUdfPolicy,
@@ -5392,18 +3531,19 @@ impl BatchUdf {
         function_name: String,
         function_args: Vec<PHPValue>,
     ) -> Self {
+        let args: Option<Vec<aero::Value>> = if function_args.is_empty() {
+            None
+        } else {
+            Some(function_args.into_iter().map(Into::into).collect())
+        };
         BatchUdf {
-            _as: proto::BatchUdf {
-                batch_record: Some(proto::BatchRecord {
-                    key: Some(key._as.clone()),
-                    record: None,
-                    error: None,
-                }),
-                policy: Some(policy._as.clone()),
-                package_name: package_name,
-                function_name: function_name,
-                function_args: function_args.into_iter().map(|v| v.into()).collect(),
-            },
+            _as: aero::BatchOperation::udf(
+                &policy._as,
+                key._as.clone(),
+                &package_name,
+                &function_name,
+                args,
+            ),
         }
     }
 }
@@ -5415,35 +3555,31 @@ impl BatchUdf {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// `UdfLanguage` determines how to handle record writes based on record generation.
-#[php_class(name = "Aerospike\\UdfLanguage")]
+#[php_class]
+#[php(name = "Aerospike\\UdfLanguage")]
 pub struct UdfLanguage {
-    _as: proto::UdfLanguage,
+    _as: aero::UDFLang,
 }
 
 impl FromZval<'_> for UdfLanguage {
     const TYPE: DataType = DataType::Mixed;
 
     fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &UdfLanguage = zval.extract()?;
-
-        Some(UdfLanguage { _as: f._as.clone() })
+        // UDFLang has only Lua and is not Clone; we just verify the zval is a UdfLanguage.
+        let _ = zval.extract::<&UdfLanguage>()?;
+        Some(UdfLanguage {
+            _as: aero::UDFLang::Lua,
+        })
     }
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl UdfLanguage {
     /// lua language.
     pub fn Lua() -> Self {
         UdfLanguage {
-            _as: proto::UdfLanguage::Lua,
+            _as: aero::UDFLang::Lua,
         }
-    }
-}
-
-impl From<proto::UdfLanguage> for UdfLanguage {
-    fn from(input: proto::UdfLanguage) -> Self {
-        UdfLanguage { _as: input.clone() }
     }
 }
 
@@ -5459,7 +3595,7 @@ impl From<i32> for UdfLanguage {
 impl From<UdfLanguage> for i32 {
     fn from(input: UdfLanguage) -> Self {
         match input._as {
-            proto::UdfLanguage::Lua => 0,
+            aero::UDFLang::Lua => 0,
         }
     }
 }
@@ -5471,37 +3607,62 @@ impl From<UdfLanguage> for i32 {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Represents UDF (User-Defined Function) metadata for Aerospike.
-#[php_class(name = "Aerospike\\UdfMeta")]
+/// Standalone struct — aerospike-core v2 does not expose a UdfMeta type directly.
+/// UDF listing will be implemented later via the Info command.
+#[php_class]
+#[php(name = "Aerospike\\UdfMeta")]
 #[derive(Debug, PartialEq, Clone)]
 pub struct UdfMeta {
-    _as: proto::UdfMeta,
+    pub package_name: String,
+    pub hash: String,
+    /// Language string, e.g. "lua".
+    pub language: String,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl UdfMeta {
+    /// v1 compatibility shim: forwards `$udf->packageName`, `->hash`, `->language` to
+    /// the corresponding getters.
+    pub fn __get(&self, name: &str) -> PhpResult<Zval> {
+        let mut zv = Zval::new();
+        match name {
+            "packageName" | "package_name" => zv.set_string(&self.get_package_name(), false)?,
+            "hash" => zv.set_string(&self.get_hash(), false)?,
+            "language" => {
+                let lang = self.get_language();
+                let zo: ZBox<ZendObject> = lang.into_zend_object()?;
+                zo.set_zval(&mut zv, false)?;
+            }
+            _ => zv.set_null(),
+        }
+        Ok(zv)
+    }
+
     /// Getter method to retrieve the package name of the UDF.
-    #[getter]
     pub fn get_package_name(&self) -> String {
-        self._as.package_name.clone()
+        self.package_name.clone()
     }
 
     /// Getter method to retrieve the hash of the UDF.
-    #[getter]
     pub fn get_hash(&self) -> String {
-        self._as.hash.clone()
+        self.hash.clone()
     }
 
     /// Getter method to retrieve the language of the UDF.
-    #[getter]
+    /// v1-compatible: returns a `UdfLanguage` enum. Today aero::UDFLang has only `Lua`,
+    /// so the parsed language string is always mapped to `UdfLanguage::Lua()`.
     pub fn get_language(&self) -> UdfLanguage {
-        self._as.language.into()
+        UdfLanguage::Lua()
     }
 }
 
-impl From<&proto::UserRole> for UserRole {
-    fn from(input: &proto::UserRole) -> Self {
-        UserRole { _as: input.clone() }
+impl FromZval<'_> for UdfMeta {
+    const TYPE: DataType = DataType::Mixed;
+
+    fn from_zval(zval: &Zval) -> Option<Self> {
+        let f: &UdfMeta = zval.extract()?;
+
+        Some(f.clone())
     }
 }
 
@@ -5511,24 +3672,29 @@ impl From<&proto::UserRole> for UserRole {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// UserRoles contains information about a user.
-#[php_class(name = "Aerospike\\UserRole")]
+/// UserRole contains information about a user and their assigned roles.
+/// Wraps `aerospike::User` (aerospike-core v2).
+///
+/// v2 NOTE: `read_info` and `write_info` are `Vec<u32>` in aerospike-core (not u64).
+/// The PHP getters return `Vec<u64>` for backward compatibility (widening cast).
+/// `conns_in_use` is `u32` in aerospike-core; the PHP getter returns `u64` for
+/// backward compatibility.
+#[php_class]
+#[php(name = "Aerospike\\UserRole")]
 #[derive(Debug, PartialEq, Clone)]
 pub struct UserRole {
-    _as: proto::UserRole,
+    _as: aero::User,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl UserRole {
     /// User name.
-    #[getter]
+    /// NOTE: aerospike-core v2 stores the user name in the `user` field (not `name`).
     pub fn get_user(&self) -> String {
         self._as.user.clone()
     }
 
     /// Roles is a list of assigned roles.
-    #[getter]
     pub fn get_roles(&self) -> Vec<String> {
         self._as.roles.clone()
     }
@@ -5542,9 +3708,8 @@ impl UserRole {
     /// 3: number of limitless read scans/queries
     ///
     /// Future server releases may add additional statistics.
-    #[getter]
     pub fn get_read_info(&self) -> Vec<u64> {
-        self._as.read_info.clone().into()
+        self._as.read_info.iter().map(|&v| v as u64).collect()
     }
 
     /// WriteInfo is the list of write statistics. List may be nil.
@@ -5556,15 +3721,29 @@ impl UserRole {
     /// 3: number of limitless write scans/queries
     ///
     /// Future server releases may add additional statistics.
-    #[getter]
     pub fn get_write_info(&self) -> Vec<u64> {
-        self._as.write_info.clone().into()
+        self._as.write_info.iter().map(|&v| v as u64).collect()
     }
 
-    /// ConnsInUse is the number of currently open connections for the user
-    #[getter]
+    /// ConnsInUse is the number of currently open connections for the user.
     pub fn get_conns_in_use(&self) -> u64 {
-        self._as.conns_in_use.into()
+        self._as.conns_in_use as u64
+    }
+}
+
+impl From<aero::User> for UserRole {
+    fn from(input: aero::User) -> Self {
+        UserRole { _as: input }
+    }
+}
+
+impl FromZval<'_> for UserRole {
+    const TYPE: DataType = DataType::Mixed;
+
+    fn from_zval(zval: &Zval) -> Option<Self> {
+        let f: &UserRole = zval.extract()?;
+
+        Some(f.clone())
     }
 }
 
@@ -5575,49 +3754,55 @@ impl UserRole {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Role allows granular access to database entities for users.
-#[php_class(name = "Aerospike\\Role")]
+/// Wraps `aerospike::Role` (aerospike-core v2).
+///
+/// v2 NOTE: `read_quota` and `write_quota` are `u32` in aerospike-core.
+/// The PHP getters return `u64` for backward compatibility (widening cast).
+/// v2 BREAKING: the old `write_quota()` getter (missing `get_` prefix) is renamed to
+/// `get_write_quota()` for consistency with all other getters.
+#[php_class]
+#[php(name = "Aerospike\\Role")]
 #[derive(Debug, PartialEq, Clone)]
 pub struct Role {
-    _as: proto::Role,
+    _as: aero::Role,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Role {
-    /// Name is role name
-    #[getter]
+    /// Name is role name.
     pub fn get_name(&self) -> String {
         self._as.name.clone()
     }
 
-    /// Privilege is the list of assigned privileges
-    #[getter]
+    /// Privileges is the list of assigned privileges.
     pub fn get_privileges(&self) -> Vec<Privilege> {
-        self._as.privileges.iter().map(|v| v.into()).collect()
+        self._as
+            .privileges
+            .iter()
+            .map(|v| Privilege { _as: v.clone() })
+            .collect()
     }
 
-    /// While is the list of allowable IP addresses
-    #[getter]
+    /// Allowlist is the list of allowable IP addresses.
     pub fn get_allowlist(&self) -> Vec<String> {
-        self._as.allowlist.clone().into()
+        self._as.allowlist.clone()
     }
 
-    /// ReadQuota is the maximum reads per second limit for the role
-    #[getter]
+    /// ReadQuota is the maximum reads per second limit for the role.
     pub fn get_read_quota(&self) -> u64 {
-        self._as.read_quota.into()
+        self._as.read_quota as u64
     }
 
-    /// WriteQuota is the maximum writes per second limit for the role
-    #[getter]
-    pub fn write_quota(&self) -> u64 {
-        self._as.write_quota.into()
+    /// WriteQuota is the maximum writes per second limit for the role.
+    /// v2 BREAKING: renamed from `write_quota()` (no `get_` prefix) to `get_write_quota()`.
+    pub fn get_write_quota(&self) -> u64 {
+        self._as.write_quota as u64
     }
 }
 
-impl From<&proto::Role> for Role {
-    fn from(input: &proto::Role) -> Self {
-        Role { _as: input.clone() }
+impl From<aero::Role> for Role {
+    fn from(input: aero::Role) -> Self {
+        Role { _as: input }
     }
 }
 
@@ -5627,7 +3812,7 @@ impl FromZval<'_> for Role {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &Role = zval.extract()?;
 
-        Some(Role { _as: f._as.clone() })
+        Some(f.clone())
     }
 }
 
@@ -5638,28 +3823,38 @@ impl FromZval<'_> for Role {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Privilege determines user access granularity.
-#[php_class(name = "Aerospike\\Privilege")]
+/// Wraps `aerospike::Privilege` (aerospike-core v2).
+///
+/// v2 BREAKING: proto had a string `name` field for the privilege code; aerospike-core
+/// uses a typed `PrivilegeCode` enum in the `code` field.  The `get_name()` getter now
+/// derives the string representation from `PrivilegeCode` via `String::from(&code)` so
+/// the PHP API surface is preserved.
+///
+/// `namespace` and `set_name` are `Option<String>` in aerospike-core.  The getters
+/// return an empty string when `None` for backward compatibility.
+#[php_class]
+#[php(name = "Aerospike\\Privilege")]
 #[derive(Debug, PartialEq, Clone)]
 pub struct Privilege {
-    _as: proto::Privilege,
+    _as: aero::Privilege,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Privilege {
-    #[getter]
+    /// Returns the string name of the privilege code (e.g. "read", "read-write").
+    /// Derived from `PrivilegeCode` — replaces proto's string `name` field.
     pub fn get_name(&self) -> String {
-        self._as.name.clone()
+        String::from(&self._as.code)
     }
 
-    #[getter]
+    /// Returns the namespace scope, or empty string if unscoped.
     pub fn get_namespace(&self) -> String {
-        self._as.namespace.clone()
+        self._as.namespace.clone().unwrap_or_default()
     }
 
-    #[getter]
+    /// Returns the set name scope, or empty string if unscoped.
     pub fn get_setname(&self) -> String {
-        self._as.set_name.clone()
+        self._as.set_name.clone().unwrap_or_default()
     }
 
     /// UserAdmin allows to manages users and their roles.
@@ -5713,19 +3908,13 @@ impl Privilege {
     }
 }
 
-impl From<&proto::Privilege> for Privilege {
-    fn from(input: &proto::Privilege) -> Self {
-        Privilege { _as: input.clone() }
-    }
-}
-
 impl FromZval<'_> for Privilege {
     const TYPE: DataType = DataType::Mixed;
 
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &Privilege = zval.extract()?;
 
-        Some(Privilege { _as: f._as.clone() })
+        Some(f.clone())
     }
 }
 
@@ -5736,20 +3925,21 @@ impl FromZval<'_> for Privilege {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// ListReturnType determines the returned values in CDT List operations.
-#[php_class(name = "Aerospike\\ListReturnType")]
+#[php_class]
+#[php(name = "Aerospike\\ListReturnType")]
 #[derive(Debug, PartialEq, Clone)]
 pub struct CdtListReturnType {
-    /// _as: proto::CdtListReturnType,
+    // Stored as i32 bitmask to support the Inverted() combinator (bitwise OR with 0x10000).
+    // Values are taken from aero::ListReturnType discriminants.
     _as: i32,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtListReturnType {
     /// ListReturnTypeNone will not return a result.
     pub fn None() -> Self {
         Self {
-            _as: proto::CdtListReturnType::None.into(),
+            _as: aero::ListReturnType::None as i32,
         }
     }
 
@@ -5759,7 +3949,7 @@ impl CdtListReturnType {
     /// -1 = last key
     pub fn Index() -> Self {
         Self {
-            _as: proto::CdtListReturnType::Index.into(),
+            _as: aero::ListReturnType::Index as i32,
         }
     }
 
@@ -5768,7 +3958,7 @@ impl CdtListReturnType {
     /// -1 = first key
     pub fn Reverse_index() -> Self {
         Self {
-            _as: proto::CdtListReturnType::ReverseIndex.into(),
+            _as: aero::ListReturnType::ReverseIndex as i32,
         }
     }
 
@@ -5778,7 +3968,7 @@ impl CdtListReturnType {
     /// -1 = largest value
     pub fn Rank() -> Self {
         Self {
-            _as: proto::CdtListReturnType::Rank.into(),
+            _as: aero::ListReturnType::Rank as i32,
         }
     }
 
@@ -5788,28 +3978,29 @@ impl CdtListReturnType {
     /// -1 = smallest value
     pub fn Reverse_rank() -> Self {
         Self {
-            _as: proto::CdtListReturnType::ReverseRank.into(),
+            _as: aero::ListReturnType::ReverseRank as i32,
         }
     }
 
     /// ListReturnTypeCount will return count of items selected.
     pub fn Count() -> Self {
         Self {
-            _as: proto::CdtListReturnType::Count.into(),
+            _as: aero::ListReturnType::Count as i32,
         }
     }
 
-    /// ListReturnTypeValue will return value for single key read and value list for range read.
+    /// ListReturnTypeValues will return value for single key read and value list for range read.
+    /// Note: proto named this variant `Value`; aero equivalent is `Values` (discriminant 7).
     pub fn Value() -> Self {
         Self {
-            _as: proto::CdtListReturnType::Value.into(),
+            _as: aero::ListReturnType::Values as i32,
         }
     }
 
     /// ListReturnTypeExists returns true if count > 0.
     pub fn Exists() -> Self {
         Self {
-            _as: proto::CdtListReturnType::Exists.into(),
+            _as: aero::ListReturnType::Exists as i32,
         }
     }
 
@@ -5821,15 +4012,7 @@ impl CdtListReturnType {
     /// With the INVERTED flag enabled, the items outside of the specified index range will be removed and returned.
     pub fn Inverted(&self) -> Self {
         Self {
-            _as: self._as | 0x10000,
-        }
-    }
-}
-
-impl From<&proto::CdtListReturnType> for CdtListReturnType {
-    fn from(input: &proto::CdtListReturnType) -> Self {
-        CdtListReturnType {
-            _as: (*input).into(),
+            _as: self._as | aero::ListReturnType::Inverted as i32,
         }
     }
 }
@@ -5840,7 +4023,7 @@ impl FromZval<'_> for CdtListReturnType {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtListReturnType = zval.extract()?;
 
-        Some(CdtListReturnType { _as: f._as.clone() })
+        Some(CdtListReturnType { _as: f._as })
     }
 }
 
@@ -5850,43 +4033,42 @@ impl FromZval<'_> for CdtListReturnType {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// ListWriteFlags detemines write flags for CDT lists
-/// type ListWriteFlags int
-#[php_class(name = "Aerospike\\ListWriteFlags")]
-#[derive(Debug, PartialEq, Clone)]
+/// ListWriteFlags determines write flags for CDT lists.
+#[php_class]
+#[php(name = "Aerospike\\ListWriteFlags")]
+#[derive(Debug, Clone, Copy)]
 pub struct CdtListWriteFlags {
-    _as: proto::CdtListWriteFlags,
+    _as: aero::ListWriteFlags,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtListWriteFlags {
-    /// ListWriteFlagsDefault is the default behavior. It means:  Allow duplicate values and insertions at any index.
+    /// ListWriteFlagsDefault is the default behavior: allow duplicate values and insertions at any index.
     pub fn Default() -> Self {
         Self {
-            _as: proto::CdtListWriteFlags::Default,
+            _as: aero::ListWriteFlags::Default,
         }
     }
 
-    /// ListWriteFlagsAddUnique means: Only add unique values.
+    /// ListWriteFlagsAddUnique means: only add unique values.
     pub fn Add_Unique() -> Self {
         Self {
-            _as: proto::CdtListWriteFlags::AddUnique,
+            _as: aero::ListWriteFlags::AddUnique,
         }
     }
 
-    /// ListWriteFlagsInsertBounded means: Enforce list boundaries when inserting.  Do not allow values to be inserted
-    /// at index outside current list boundaries.
+    /// ListWriteFlagsInsertBounded means: enforce list boundaries when inserting. Do not allow values
+    /// to be inserted at an index outside the current list boundaries.
     pub fn Insert_Bounded() -> Self {
         Self {
-            _as: proto::CdtListWriteFlags::InsertBounded,
+            _as: aero::ListWriteFlags::InsertBounded,
         }
     }
 
     /// ListWriteFlagsNoFail means: do not raise error if a list item fails due to write flag constraints.
     pub fn No_Fail() -> Self {
         Self {
-            _as: proto::CdtListWriteFlags::NoFail,
+            _as: aero::ListWriteFlags::NoFail,
         }
     }
 
@@ -5894,14 +4076,8 @@ impl CdtListWriteFlags {
     /// write flag constraints.
     pub fn Partial() -> Self {
         Self {
-            _as: proto::CdtListWriteFlags::Partial,
+            _as: aero::ListWriteFlags::Partial,
         }
-    }
-}
-
-impl From<&proto::CdtListWriteFlags> for CdtListWriteFlags {
-    fn from(input: &proto::CdtListWriteFlags) -> Self {
-        CdtListWriteFlags { _as: input.clone() }
     }
 }
 
@@ -5911,7 +4087,7 @@ impl FromZval<'_> for CdtListWriteFlags {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtListWriteFlags = zval.extract()?;
 
-        Some(CdtListWriteFlags { _as: f._as.clone() })
+        Some(CdtListWriteFlags { _as: f._as })
     }
 }
 
@@ -5921,45 +4097,35 @@ impl FromZval<'_> for CdtListWriteFlags {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-// TODO: Check the PHP enum system and see if the current system work for us
-// TODO: Add the additional expressions (HLL, BIT, etc.)
-// TODO: Add method comments
-
-/// ListOrderType determines the order of returned values in CDT list operations.
-#[php_class(name = "Aerospike\\ListSortFlags")]
-#[derive(Debug, PartialEq, Clone)]
+/// ListSortFlags determines sort flags for CDT list operations.
+#[php_class]
+#[php(name = "Aerospike\\ListSortFlags")]
+#[derive(Debug, Clone, Copy)]
 pub struct CdtListSortFlags {
-    _as: proto::CdtListSortFlags,
+    _as: aero::ListSortFlags,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtListSortFlags {
-    /// ListSortFlagsDefault is the default sort flag for CDT lists, and sort in Ascending order.
+    /// ListSortFlagsDefault is the default sort flag for CDT lists, and sorts in ascending order.
     pub fn Default() -> Self {
         Self {
-            _as: proto::CdtListSortFlags::Default,
+            _as: aero::ListSortFlags::Default,
         }
     }
 
     /// ListSortFlagsDescending will sort the contents of the list in descending order.
     pub fn Descending() -> Self {
         Self {
-            _as: proto::CdtListSortFlags::Descending,
+            _as: aero::ListSortFlags::Descending,
         }
     }
 
     /// ListSortFlagsDropDuplicates will drop duplicate values in the results of the CDT list operation.
     pub fn Drop_Duplicates() -> Self {
         Self {
-            _as: proto::CdtListSortFlags::DropDuplicates,
+            _as: aero::ListSortFlags::DropDuplicates,
         }
-    }
-}
-
-impl From<&proto::CdtListSortFlags> for CdtListSortFlags {
-    fn from(input: &proto::CdtListSortFlags) -> Self {
-        CdtListSortFlags { _as: input.clone() }
     }
 }
 
@@ -5969,7 +4135,7 @@ impl FromZval<'_> for CdtListSortFlags {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtListSortFlags = zval.extract()?;
 
-        Some(CdtListSortFlags { _as: f._as.clone() })
+        Some(CdtListSortFlags { _as: f._as })
     }
 }
 
@@ -5980,39 +4146,29 @@ impl FromZval<'_> for CdtListSortFlags {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// ListPolicy directives when creating a list and writing list items.
-#[php_class(name = "Aerospike\\ListPolicy")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\ListPolicy")]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CdtListPolicy {
-    _as: proto::CdtListPolicy,
+    _as: aero::ListPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtListPolicy {
     /// NewListPolicy creates a policy with directives when creating a list and writing list items.
-    /// Flags are ListWriteFlags. You can specify multiple by `or`ing them together.
+    /// Flags are ListWriteFlags. You can specify multiple by passing multiple values in the array;
+    /// they are combined with a bitwise OR.
     pub fn __construct(order: ListOrderType, flags: Option<Vec<CdtListWriteFlags>>) -> Self {
-        let flags: i32 = flags
-            .map(|flags| {
-                flags.iter().fold(0 as i32, |acc, f| {
-                    let f: i32 = f._as.into();
-                    acc | f
-                })
-            })
+        let flags_bitmask: u8 = flags
+            .map(|flags| flags.iter().fold(0u8, |acc, f| acc | f._as as u8))
             .unwrap_or(0);
 
         CdtListPolicy {
-            _as: proto::CdtListPolicy {
-                order: order._as.into(),
-                flags: flags,
+            _as: aero::ListPolicy {
+                attributes: order._as,
+                flags: flags_bitmask,
             },
         }
-    }
-}
-
-impl From<&proto::CdtListPolicy> for CdtListPolicy {
-    fn from(input: &proto::CdtListPolicy) -> Self {
-        CdtListPolicy { _as: input.clone() }
     }
 }
 
@@ -6022,7 +4178,7 @@ impl FromZval<'_> for CdtListPolicy {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtListPolicy = zval.extract()?;
 
-        Some(CdtListPolicy { _as: f._as.clone() })
+        Some(CdtListPolicy { _as: f._as })
     }
 }
 
@@ -6031,6 +4187,43 @@ impl FromZval<'_> for CdtListPolicy {
 //  CdtListOperation
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Local newtype wrapping a raw `i32` return-type bitmask so it can be passed to
+/// `aero::operations::lists::*` builders which require `ToListReturnTypeBitmask`.
+/// PHP `ListReturnType` stores an `i32` because it supports the `Inverted()` flag
+/// (bitwise OR with `0x10000`).
+struct ListReturn(i32);
+
+impl aero::operations::lists::ToListReturnTypeBitmask for ListReturn {
+    fn to_bitmask(self) -> i64 {
+        i64::from(self.0)
+    }
+}
+
+fn list_return(return_type: Option<CdtListReturnType>) -> ListReturn {
+    ListReturn(
+        return_type
+            .map(|rt| rt._as)
+            .unwrap_or(aero::ListReturnType::Values as i32),
+    )
+}
+
+/// Apply a CDT context (from PHP) to an already-built aero `Operation` via the
+/// builder method `.context(Vec<CdtContext>)`.
+fn with_ctx(
+    op: aero::operations::Operation,
+    ctx: Option<Vec<&CDTContext>>,
+) -> aero::operations::Operation {
+    match ctx {
+        Some(c) if !c.is_empty() => op.context(c.iter().map(|x| x._as.clone()).collect()),
+        _ => op,
+    }
+}
+
+/// Coerce a `Vec<PHPValue>` to `Vec<aero::Value>` (cheap; consumes the input).
+fn php_values_to_aero(values: Vec<PHPValue>) -> Vec<aero::Value> {
+    values.into_iter().map(Into::into).collect()
+}
 
 /// List operations support negative indexing.  If the index is negative, the
 /// resolved index starts backwards from end of list. If an index is out of bounds,
@@ -6047,9 +4240,11 @@ impl FromZval<'_> for CdtListPolicy {
 ///    Index -3 Count 3: Last three items in list.
 ///    Index -5 Count 4: Range between fifth to last item to second to last item inclusive.
 ///
-#[php_class(name = "Aerospike\\ListOp")]
+#[php_class]
+#[php(name = "Aerospike\\ListOp")]
+#[derive(Clone)]
 pub struct CdtListOperation {
-    _as: proto::CdtListOperation,
+    _as: aero::operations::Operation,
 }
 
 impl FromZval<'_> for CdtListOperation {
@@ -6063,12 +4258,12 @@ impl FromZval<'_> for CdtListOperation {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtListOperation {
     /// ListCreateOp creates list create operation.
     /// Server creates list at given context level. The context is allowed to be beyond list
-    /// boundaries only if pad is set to true.  In that case, nil list entries will be inserted to
-    /// satisfy the context position.
+    /// boundaries only if pad is set to true. When `index` is true, the list is created with a
+    /// persisted index (and the `pad` argument is ignored — aero's `create_with_index` does not
+    /// support padding).
     pub fn create(
         bin_name: String,
         order: ListOrderType,
@@ -6076,77 +4271,55 @@ impl CdtListOperation {
         index: Option<bool>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let order: i32 = order._as.into();
+        let op = if index.unwrap_or(false) {
+            aero::operations::lists::create_with_index(&bin_name, order._as)
+        } else {
+            aero::operations::lists::create(&bin_name, order._as, pad)
+        };
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Create.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(order as i64).into(),
-                    PHPValue::Bool(pad).into(),
-                    PHPValue::Bool(index.unwrap_or(false)).into(),
-                ],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// ListSetOrderOp creates a set list order operation.
-    /// Server sets list order.  Server returns nil.
+    /// Server sets list order. Server returns nil.
     pub fn set_order(
         bin_name: String,
         order: ListOrderType,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let order: i32 = order._as.into();
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::SetOrder.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(order as i64).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::set_order(&bin_name, order._as),
+                ctx,
+            ),
         }
     }
 
     /// ListAppendOp creates a list append operation.
     /// Server appends values to end of list bin.
     /// Server returns list size on bin name.
-    /// It will panic is no values have been passed.
+    /// Panics if `values` is empty.
     pub fn append(
         policy: &CdtListPolicy,
         bin_name: String,
         values: Vec<PHPValue>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::append_items(
+            &policy._as,
+            &bin_name,
+            php_values_to_aero(values),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Append.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(values.iter().map(|v| (*v).clone().into()).collect()).into(),
-                ],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// ListInsertOp creates a list insert operation.
-    /// Server inserts value to specified index of list bin.
+    /// Server inserts values starting at specified index of list bin.
     /// Server returns list size on bin name.
-    /// It will panic is no values have been passed.
+    /// Panics if `values` is empty.
     pub fn insert(
         policy: &CdtListPolicy,
         bin_name: String,
@@ -6154,20 +4327,14 @@ impl CdtListOperation {
         values: Vec<PHPValue>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::insert_items(
+            &policy._as,
+            &bin_name,
+            index,
+            php_values_to_aero(values),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Insert.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(index).into(),
-                    PHPValue::List(values.iter().map(|v| (*v).clone().into()).collect()).into(),
-                ],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6175,16 +4342,7 @@ impl CdtListOperation {
     /// Server returns item at specified index and removes item from list bin.
     pub fn pop(bin_name: String, index: i64, ctx: Option<Vec<&CDTContext>>) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Pop.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(aero::operations::lists::pop(&bin_name, index), ctx),
         }
     }
 
@@ -6197,16 +4355,10 @@ impl CdtListOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::PopRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), PHPValue::Int(count).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::pop_range(&bin_name, index, count),
+                ctx,
+            ),
         }
     }
 
@@ -6218,42 +4370,28 @@ impl CdtListOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::PopRangeFrom.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::pop_range_from(&bin_name, index),
+                ctx,
+            ),
         }
     }
 
-    /// ListRemoveByValueOp creates list remove by value operation.
-    /// Server removes the item identified by value and returns removed data specified by returnType.
+    /// ListRemoveByValueListOp creates list remove by value operation.
+    /// Server removes items identified by values and returns removed data specified by returnType.
     pub fn remove_values(
         bin_name: String,
         values: Vec<PHPValue>,
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_value_list(
+            &bin_name,
+            php_values_to_aero(values),
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByValueList.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(values.iter().map(|v| (*v).clone().into()).collect()).into(),
-                ],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6261,7 +4399,7 @@ impl CdtListOperation {
     /// Server removes list items identified by value range (valueBegin inclusive, valueEnd exclusive).
     /// If valueBegin is nil, the range is less than valueEnd.
     /// If valueEnd is nil, the range is greater than equal to valueBegin.
-    /// Server returns removed data specified by returnType
+    /// Server returns removed data specified by returnType.
     pub fn remove_by_value_range(
         bin_name: String,
         begin: PHPValue,
@@ -6269,25 +4407,14 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let args = if end.is_some() {
-            vec![begin.into(), end.unwrap().into()]
-        } else {
-            vec![begin.into()]
-        };
-
+        let op = aero::operations::lists::remove_by_value_range(
+            &bin_name,
+            list_return(return_type),
+            begin.into(),
+            end.map(Into::into).unwrap_or(aero::Value::Nil),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByValueList.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: args,
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6311,19 +4438,14 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_value_relative_rank_range(
+            &bin_name,
+            list_return(return_type),
+            value.into(),
+            rank,
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByValueRelativeRankRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![value.into(), PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6347,23 +4469,15 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_value_relative_rank_range_count(
+            &bin_name,
+            list_return(return_type),
+            value.into(),
+            rank,
+            count,
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByValueRelativeRankRangeCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    value.into(),
-                    PHPValue::Int(rank).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6377,16 +4491,10 @@ impl CdtListOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), PHPValue::Int(count).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::remove_range(&bin_name, index, count),
+                ctx,
+            ),
         }
     }
 
@@ -6398,18 +4506,11 @@ impl CdtListOperation {
         index: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        // TODO: compare return_type signatures with the java client
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveRangeFrom.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::remove_range_from(&bin_name, index),
+                ctx,
+            ),
         }
     }
 
@@ -6423,16 +4524,10 @@ impl CdtListOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Set.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), value.into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::set(&bin_name, index, value.into()),
+                ctx,
+            ),
         }
     }
 
@@ -6447,16 +4542,7 @@ impl CdtListOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Trim.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), PHPValue::Int(count).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(aero::operations::lists::trim(&bin_name, index, count), ctx),
         }
     }
 
@@ -6465,40 +4551,28 @@ impl CdtListOperation {
     /// Server does not return a result by default.
     pub fn clear(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Clear.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(aero::operations::lists::clear(&bin_name), ctx),
         }
     }
 
     /// ListIncrementOp creates a list increment operation.
     /// Server increments list[index] by value.
-    /// Value should be integer(IntegerValue, LongValue) or float(FloatValue).
     /// Server returns list[index] after incrementing.
+    ///
+    /// v2 BREAKING: aerospike-client-rust v2 only supports integer increments. Float
+    /// increments accepted by the proto version are no longer supported.
     pub fn increment(
         bin_name: String,
         index: i64,
-        value: PHPValue,
+        value: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let policy = aero::ListPolicy::default();
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Increment.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), value.into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::increment(&policy, &bin_name, index, value),
+                ctx,
+            ),
         }
     }
 
@@ -6506,16 +4580,7 @@ impl CdtListOperation {
     /// Server returns size of list on bin name.
     pub fn size(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Size.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(aero::operations::lists::size(&bin_name), ctx),
         }
     }
 
@@ -6527,18 +4592,11 @@ impl CdtListOperation {
         sort_flags: &CdtListSortFlags,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let sort_flags: i32 = sort_flags._as.into();
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::Sort.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(sort_flags as i64).into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::lists::sort(&bin_name, sort_flags._as),
+                ctx,
+            ),
         }
     }
 
@@ -6550,19 +4608,10 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op =
+            aero::operations::lists::remove_by_index(&bin_name, index, list_return(return_type));
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByIndex.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6575,19 +4624,13 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_index_range(
+            &bin_name,
+            index,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByIndexRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6600,19 +4643,14 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_index_range_count(
+            &bin_name,
+            index,
+            count,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByIndexRangeCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), PHPValue::Int(count).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6624,19 +4662,9 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_rank(&bin_name, rank, list_return(return_type));
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByRank.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6649,19 +4677,13 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_rank_range(
+            &bin_name,
+            rank,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByRankRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6674,45 +4696,32 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::remove_by_rank_range_count(
+            &bin_name,
+            rank,
+            count,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::RemoveByRankRangeCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into(), PHPValue::Int(count).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// ListGetByValueOp creates a list get by value operation.
-    /// Server selects list items identified by value and returns selected data specified by returnType.
+    /// ListGetByValueListOp creates a list get by value operation.
+    /// Server selects list items identified by values and returns selected data specified by returnType.
     pub fn get_by_values(
         bin_name: String,
         values: Vec<PHPValue>,
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_value_list(
+            &bin_name,
+            php_values_to_aero(values),
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByValueList.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(values.iter().map(|v| (*v).clone().into()).collect()).into(),
-                ],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6728,49 +4737,28 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let args = if end.is_some() {
-            vec![begin.into(), end.unwrap().into()]
-        } else {
-            vec![begin.into()]
-        };
-
+        let op = aero::operations::lists::get_by_value_range(
+            &bin_name,
+            begin.into(),
+            end.map(Into::into).unwrap_or(aero::Value::Nil),
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByValueRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: args,
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// ListGetByIndexOp creates list get by index operation.
-    /// Server selects list item identified by index and returns selected data specified by returnType
+    /// Server selects list item identified by index and returns selected data specified by returnType.
     pub fn get_by_index(
         bin_name: String,
         index: i64,
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_index(&bin_name, index, list_return(return_type));
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByIndex.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6783,19 +4771,10 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op =
+            aero::operations::lists::get_by_index_range(&bin_name, index, list_return(return_type));
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByIndexRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6809,19 +4788,14 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_index_range_count(
+            &bin_name,
+            index,
+            count,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByIndexRangeCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), PHPValue::Int(count).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6833,44 +4807,25 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_rank(&bin_name, rank, list_return(return_type));
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByRank.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// ListGetByRankRangeOp creates a list get by rank range operation.
     /// Server selects list items starting at specified rank to the last ranked item and returns selected
-    /// data specified by returnType
+    /// data specified by returnType.
     pub fn get_by_rank_range(
         bin_name: String,
         rank: i64,
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op =
+            aero::operations::lists::get_by_rank_range(&bin_name, rank, list_return(return_type));
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByRankRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6883,19 +4838,14 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_rank_range_count(
+            &bin_name,
+            rank,
+            count,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByRankRangeCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into(), PHPValue::Int(count).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6919,19 +4869,14 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_value_relative_rank_range(
+            &bin_name,
+            value.into(),
+            rank,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByValueRelativeRankRange.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![value.into(), PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -6956,23 +4901,15 @@ impl CdtListOperation {
         return_type: Option<CdtListReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::lists::get_by_value_relative_rank_range_count(
+            &bin_name,
+            value.into(),
+            rank,
+            count,
+            list_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::List(proto::CdtListOperation {
-                op: proto::CdtListCommandOp::GetByValueRelativeRankRangeCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    value.into(),
-                    PHPValue::Int(rank).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|rt| rt._as.into())
-                    .unwrap_or(Some(proto::CdtListReturnType::Value.into())),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 }
@@ -6985,20 +4922,19 @@ impl CdtListOperation {
 
 /// MapReturnType defines the map return type.
 /// Type of data to return when selecting or removing items from the map.
-#[php_class(name = "Aerospike\\MapReturnType")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\MapReturnType")]
+#[derive(Clone, Copy)]
 pub struct CdtMapReturnType {
-    /// _as: proto::CdtMapReturnType,
-    _as: i32,
+    _as: aero::MapReturnType,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtMapReturnType {
-    /// NONE will will not return a result.
+    /// NONE will not return a result.
     pub fn None() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::None.into(),
+            _as: aero::MapReturnType::None,
         }
     }
 
@@ -7009,7 +4945,7 @@ impl CdtMapReturnType {
     /// -1 = last key
     pub fn Index() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::Index.into(),
+            _as: aero::MapReturnType::Index,
         }
     }
 
@@ -7019,7 +4955,7 @@ impl CdtMapReturnType {
     /// -1 = first key
     pub fn Reverse_Index() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::ReverseIndex.into(),
+            _as: aero::MapReturnType::ReverseIndex,
         }
     }
 
@@ -7030,7 +4966,7 @@ impl CdtMapReturnType {
     /// -1 = largest value
     pub fn Rank() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::Rank.into(),
+            _as: aero::MapReturnType::Rank,
         }
     }
 
@@ -7041,76 +4977,68 @@ impl CdtMapReturnType {
     /// -1 = smallest value
     pub fn Reverse_Rank() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::ReverseRank.into(),
+            _as: aero::MapReturnType::ReverseRank,
         }
     }
 
     /// COUNT will return count of items selected.
     pub fn Count() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::Count.into(),
+            _as: aero::MapReturnType::Count,
         }
     }
 
     /// KEY will return key for single key read and key list for range read.
     pub fn Key() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::Key.into(),
+            _as: aero::MapReturnType::Key,
         }
     }
 
     /// VALUE will return value for single key read and value list for range read.
     pub fn Value() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::Value.into(),
+            _as: aero::MapReturnType::Value,
         }
     }
 
     /// KEY_VALUE will return key/value items. The possible return types are:
     ///
-    /// map[interface{}]interface{} : Returned for unordered maps
-    /// []MapPair : Returned for range results where range order needs to be preserved.
+    /// Value::HashMap : Returned for unordered maps
+    /// Value::KeyValueList : Returned for range results where range order needs to be preserved.
     pub fn Key_Value() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::KeyValue.into(),
+            _as: aero::MapReturnType::KeyValue,
         }
     }
 
     /// EXISTS returns true if count > 0.
     pub fn Exists() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::Exists.into(),
+            _as: aero::MapReturnType::Exists,
         }
     }
 
     /// UNORDERED_MAP returns an unordered map.
     pub fn Unordered_Map() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::UnorderedMap.into(),
+            _as: aero::MapReturnType::UnorderedMap,
         }
     }
 
     /// ORDERED_MAP returns an ordered map.
     pub fn Ordered_Map() -> Self {
         Self {
-            _as: proto::CdtMapReturnType::OrderedMap.into(),
+            _as: aero::MapReturnType::OrderedMap,
         }
     }
 
-    /// INVERTED will invert meaning of map command and return values.  For example:
+    /// INVERTED will invert meaning of map command and return values. For example:
     /// MapRemoveByKeyRange(binName, keyBegin, keyEnd, MapReturnType.KEY | MapReturnType.INVERTED)
     /// With the INVERTED flag enabled, the keys outside of the specified key range will be removed and returned.
-    pub fn Inverted(&self) -> Self {
+    pub fn Inverted() -> Self {
         Self {
-            _as: self._as | 0x10000,
-        }
-    }
-}
-
-impl From<&proto::CdtMapReturnType> for CdtMapReturnType {
-    fn from(input: &proto::CdtMapReturnType) -> Self {
-        CdtMapReturnType {
-            _as: (*input).into(),
+            _as: aero::MapReturnType::Inverted,
         }
     }
 }
@@ -7121,7 +5049,7 @@ impl FromZval<'_> for CdtMapReturnType {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtMapReturnType = zval.extract()?;
 
-        Some(CdtMapReturnType { _as: f._as.clone() })
+        Some(CdtMapReturnType { _as: f._as })
     }
 }
 
@@ -7133,20 +5061,20 @@ impl FromZval<'_> for CdtMapReturnType {
 
 /// MapWriteMode should only be used for server versions < 4.3.
 /// MapWriteFlags are recommended for server versions >= 4.3.
-#[php_class(name = "Aerospike\\MapWriteMode")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\MapWriteMode")]
+#[derive(Clone, Copy)]
 pub struct CdtMapWriteMode {
-    _as: proto::CdtMapWriteMode,
+    _as: aero::MapWriteMode,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtMapWriteMode {
     /// If the key already exists, the item will be overwritten.
     /// If the key does not exist, a new item will be created.
     pub fn Update() -> Self {
         Self {
-            _as: proto::CdtMapWriteMode::Update,
+            _as: aero::MapWriteMode::Update,
         }
     }
 
@@ -7154,7 +5082,7 @@ impl CdtMapWriteMode {
     /// If the key does not exist, the write will fail.
     pub fn Update_Only() -> Self {
         Self {
-            _as: proto::CdtMapWriteMode::UpdateOnly,
+            _as: aero::MapWriteMode::UpdateOnly,
         }
     }
 
@@ -7162,14 +5090,8 @@ impl CdtMapWriteMode {
     /// If the key does not exist, a new item will be created.
     pub fn Create_Only() -> Self {
         Self {
-            _as: proto::CdtMapWriteMode::CreateOnly,
+            _as: aero::MapWriteMode::CreateOnly,
         }
-    }
-}
-
-impl From<&proto::CdtMapWriteMode> for CdtMapWriteMode {
-    fn from(input: &proto::CdtMapWriteMode) -> Self {
-        CdtMapWriteMode { _as: input.clone() }
     }
 }
 
@@ -7179,7 +5101,7 @@ impl FromZval<'_> for CdtMapWriteMode {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtMapWriteMode = zval.extract()?;
 
-        Some(CdtMapWriteMode { _as: f._as.clone() })
+        Some(CdtMapWriteMode { _as: f._as })
     }
 }
 
@@ -7191,57 +5113,54 @@ impl FromZval<'_> for CdtMapWriteMode {
 
 /// Map write bit flags.
 /// Requires server versions >= 4.3.
-#[php_class(name = "Aerospike\\MapWriteFlags")]
-#[derive(Debug, PartialEq, Clone)]
+///
+/// NOTE: aero::MapWriteFlags is a module of u8 constants, not an enum.
+/// This wrapper holds the raw u8 flag value so callers can OR flags together.
+#[php_class]
+#[php(name = "Aerospike\\MapWriteFlags")]
+#[derive(Clone, Copy)]
 pub struct CdtMapWriteFlags {
-    _as: proto::CdtMapWriteFlags,
+    _as: u8,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtMapWriteFlags {
-    /// MapWriteFlagsDefault is the Default. Allow create or update.
+    /// Default. Allow create or update.
     pub fn Default() -> Self {
         Self {
-            _as: proto::CdtMapWriteFlags::Default,
+            _as: aero::MapWriteFlags::DEFAULT,
         }
     }
 
-    /// MapWriteFlagsCreateOnly means: If the key already exists, the item will be denied.
+    /// If the key already exists, the item will be denied.
     /// If the key does not exist, a new item will be created.
     pub fn Create_Only() -> Self {
         Self {
-            _as: proto::CdtMapWriteFlags::CreateOnly,
+            _as: aero::MapWriteFlags::CREATE_ONLY,
         }
     }
 
-    /// MapWriteFlagsUpdateOnly means: If the key already exists, the item will be overwritten.
+    /// If the key already exists, the item will be overwritten.
     /// If the key does not exist, the item will be denied.
     pub fn Update_Only() -> Self {
         Self {
-            _as: proto::CdtMapWriteFlags::UpdateOnly,
+            _as: aero::MapWriteFlags::UPDATE_ONLY,
         }
     }
 
-    /// MapWriteFlagsNoFail means: Do not raise error if a map item is denied due to write flag constraints.
+    /// Do not raise error if a map item is denied due to write flag constraints.
     pub fn No_Fail() -> Self {
         Self {
-            _as: proto::CdtMapWriteFlags::NoFail,
+            _as: aero::MapWriteFlags::NO_FAIL,
         }
     }
 
-    /// MapWriteFlagsNoFail means: Allow other valid map items to be committed if a map item is denied due to
+    /// Allow other valid map items to be committed if a map item is denied due to
     /// write flag constraints.
     pub fn Partial() -> Self {
         Self {
-            _as: proto::CdtMapWriteFlags::Partial,
+            _as: aero::MapWriteFlags::PARTIAL,
         }
-    }
-}
-
-impl From<&proto::CdtMapWriteFlags> for CdtMapWriteFlags {
-    fn from(input: &proto::CdtMapWriteFlags) -> Self {
-        CdtMapWriteFlags { _as: input.clone() }
     }
 }
 
@@ -7251,7 +5170,7 @@ impl FromZval<'_> for CdtMapWriteFlags {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtMapWriteFlags = zval.extract()?;
 
-        Some(CdtMapWriteFlags { _as: f._as.clone() })
+        Some(CdtMapWriteFlags { _as: f._as })
     }
 }
 
@@ -7262,42 +5181,35 @@ impl FromZval<'_> for CdtMapWriteFlags {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// MapPolicy directives when creating a map and writing map items.
-#[php_class(name = "Aerospike\\MapPolicy")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\MapPolicy")]
+#[derive(Clone, Copy)]
 pub struct CdtMapPolicy {
-    _as: proto::CdtMapPolicy,
+    _as: aero::MapPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtMapPolicy {
-    /// NewMapPolicy creates a MapPolicy with WriteMode. Use with servers before v4.3.
+    /// Creates a MapPolicy with optional write flags (server >= 4.3) or defaults to
+    /// `MapWriteMode::Update` when no flags are supplied (servers < 4.3).
     pub fn __construct(
         order: &MapOrderType,
         flags: Option<Vec<&CdtMapWriteFlags>>,
-        persisted_index: Option<bool>,
+        persist_index: Option<bool>,
     ) -> Self {
-        let flags: i32 = flags
-            .unwrap_or(vec![])
+        let combined_flags: u8 = flags
+            .unwrap_or_default()
             .into_iter()
-            .fold(0 as i32, |acc, f| {
-                let f: i32 = f._as.into();
-                acc | f
-            });
+            .fold(aero::MapWriteFlags::DEFAULT, |acc, f| acc | f._as);
 
-        Self {
-            _as: proto::CdtMapPolicy {
-                map_order: order._as.into(),
-                flags: flags,
-                persisted_index: persisted_index.unwrap_or(false),
-            },
-        }
-    }
-}
+        let mut policy = if combined_flags == aero::MapWriteFlags::DEFAULT {
+            aero::MapPolicy::new(order._as, aero::MapWriteMode::Update)
+        } else {
+            aero::MapPolicy::new_with_flags(order._as, combined_flags)
+        };
+        policy.persist_index = persist_index.unwrap_or(false);
 
-impl From<&proto::CdtMapPolicy> for CdtMapPolicy {
-    fn from(input: &proto::CdtMapPolicy) -> Self {
-        CdtMapPolicy { _as: input.clone() }
+        Self { _as: policy }
     }
 }
 
@@ -7307,18 +5219,17 @@ impl FromZval<'_> for CdtMapPolicy {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtMapPolicy = zval.extract()?;
 
-        Some(CdtMapPolicy { _as: f._as.clone() })
+        Some(CdtMapPolicy { _as: f._as })
     }
 }
 
 impl Default for CdtMapPolicy {
     fn default() -> Self {
         CdtMapPolicy {
-            _as: proto::CdtMapPolicy {
-                map_order: proto::MapOrderType::Unordered.into(),
-                flags: proto::CdtMapWriteFlags::Default.into(),
-                persisted_index: false,
-            },
+            _as: aero::MapPolicy::new(
+                aero::operations::maps::MapOrder::Unordered,
+                aero::MapWriteMode::Update,
+            ),
         }
     }
 }
@@ -7369,9 +5280,11 @@ impl Default for CdtMapPolicy {
 ///  MapPutOp(DefaultMapPolicy(), "bin", StringValue("key121"), IntegerValue(11), CtxMapKey(StringValue("key1")), CtxMapRank(-1))
 ///  bin result = {key1:{key11:{key111:1},key12:{key121:11}}, key2:{key21:{"key211":7}}}
 
-#[php_class(name = "Aerospike\\MapOp")]
+#[php_class]
+#[php(name = "Aerospike\\MapOp")]
+#[derive(Clone)]
 pub struct CdtMapOperation {
-    _as: proto::CdtMapOperation,
+    _as: aero::operations::Operation,
 }
 
 impl FromZval<'_> for CdtMapOperation {
@@ -7384,33 +5297,45 @@ impl FromZval<'_> for CdtMapOperation {
     }
 }
 
+/// Default map return type used when the PHP caller passes `null`.
+fn map_return(return_type: Option<CdtMapReturnType>) -> aero::MapReturnType {
+    return_type
+        .map(|rt| rt._as)
+        .unwrap_or(aero::MapReturnType::KeyValue)
+}
+
+/// Convert a `Vec<&CDTContext>` to the owned `Vec<aero::CdtContext>` form
+/// expected by aero builders that accept ctx as a function argument.
+fn ctx_to_aero(ctx: Option<Vec<&CDTContext>>) -> Vec<aero::operations::cdt_context::CdtContext> {
+    ctx.map(|c| c.iter().map(|x| x._as.clone()).collect())
+        .unwrap_or_default()
+}
+
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtMapOperation {
     /// MapCreateOp creates a map create operation.
     /// Server creates map at given context level.
+    ///
+    /// v2 BREAKING: When `with_index` is `true`, the operation falls back to
+    /// `aero::operations::maps::create_with_index` which does NOT accept a CDT context.
+    /// Callers that used `with_index=true` together with `ctx` should drop `ctx` or split
+    /// the call into a separate `set_policy` operation.
     pub fn create(
         bin_name: String,
         order: &MapOrderType,
         with_index: Option<bool>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::Create.into(),
-                policy: Some(CdtMapPolicy::__construct(order, None, with_index)._as),
-                bin_name: bin_name,
-                args: vec![],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
-        }
+        let op = if with_index.unwrap_or(false) {
+            aero::operations::maps::create_with_index(&bin_name, order._as)
+        } else {
+            aero::operations::maps::create(&bin_name, order._as, ctx_to_aero(ctx))
+        };
+        Operation { _as: op }
     }
 
     /// MapSetPolicyOp creates set map policy operation.
-    /// Server sets map policy attributes.  Server returns nil.
+    /// Server sets map policy attributes. Server returns nil.
     ///
     /// The required map policy attributes can be changed after the map is created.
     pub fn set_policy(
@@ -7419,16 +5344,7 @@ impl CdtMapOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::SetPolicy.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: aero::operations::maps::set_policy(&policy._as, &bin_name, ctx_to_aero(ctx)),
         }
     }
 
@@ -7436,54 +5352,36 @@ impl CdtMapOperation {
     /// Server returns size of map.
     pub fn size(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::SetPolicy.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(aero::operations::maps::size(&bin_name), ctx),
         }
     }
 
-    /// MapPutOp creates map put operation.
-    /// Server writes key/value item to map bin and returns map size.
-    ///
-    /// The required map policy dictates the type of map to create when it does not exist.
-    /// The map policy also specifies the mode used when writing items to the map.
+    /// MapPutOp creates map put-items operation.
+    /// Server writes each key/value item to the map bin and returns the map size.
+    /// Returns `None` if `map` is not a PHP associative array (HashMap).
     pub fn put(
         policy: &CdtMapPolicy,
         bin_name: String,
         map: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Option<Operation> {
-        if !assert_map(&map) {
-            return None;
-        }
-
+        let aero_map: HashMap<aero::Value, aero::Value> = match map {
+            PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            PHPValue::Json(h) => h
+                .into_iter()
+                .map(|(k, v)| (aero::Value::String(k), v.into()))
+                .collect(),
+            _ => return None,
+        };
+        let op = aero::operations::maps::put_items(&policy._as, &bin_name, aero_map);
         Some(Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::PutItems.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![map.into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         })
     }
 
     /// MapIncrementOp creates map increment operation.
-    /// Server increments values by incr for all items identified by key and returns final result.
-    /// Valid only for numbers.
-    ///
-    /// The required map policy dictates the type of map to create when it does not exist.
-    /// The map policy also specifies the mode used when writing items to the map.
+    /// Server increments values by `incr` for the item identified by `key` and returns final
+    /// result. Valid only for numbers.
     pub fn increment(
         policy: &CdtMapPolicy,
         bin_name: String,
@@ -7491,26 +5389,20 @@ impl CdtMapOperation {
         incr: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::increment_value(
+            &policy._as,
+            &bin_name,
+            key.into(),
+            incr.into(),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::Increment.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![key.into(), incr.into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapDecrementOp creates map decrement operation.
-    /// Server decrements values by decr for all items identified by key and returns final result.
-    /// Valid only for numbers.
-    ///
-    /// The required map policy dictates the type of map to create when it does not exist.
-    /// The map policy also specifies the mode used when writing items to the map.
+    /// Server decrements values by `decr` for the item identified by `key` and returns final
+    /// result. Valid only for numbers.
     pub fn decrement(
         policy: &CdtMapPolicy,
         bin_name: String,
@@ -7518,58 +5410,40 @@ impl CdtMapOperation {
         decr: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::decrement_value(
+            &policy._as,
+            &bin_name,
+            key.into(),
+            decr.into(),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::Decrement.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![key.into(), decr.into()],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapClearOp creates map clear operation.
-    /// Server removes all items in map.  Server returns nil.
+    /// Server removes all items in map. Server returns nil.
     pub fn clear(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::Clear.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-                return_type: None,
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(aero::operations::maps::clear(&bin_name), ctx),
         }
     }
 
-    /// MapRemoveByKeyOp creates map remove operation.
-    /// Server removes map item identified by key and returns removed data specified by returnType.
+    /// MapRemoveByKeyListOp creates map remove operation.
+    /// Server removes map items identified by keys and returns removed data specified by returnType.
     pub fn remove_by_keys(
         bin_name: String,
         keys: Vec<PHPValue>,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_key_list(
+            &bin_name,
+            php_values_to_aero(keys),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByKeyList.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::List(keys.iter().map(|k| k.clone().into()).collect()).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
@@ -7578,128 +5452,91 @@ impl CdtMapOperation {
     /// If keyBegin is nil, the range is less than keyEnd.
     /// If keyEnd is nil, the range is greater than equal to keyBegin.
     ///
-    /// Server returns removed data specified by returnType.
+    /// `policy` is accepted for PHP API stability and currently has no effect.
     pub fn remove_by_key_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_key_range(
+            &bin_name,
+            begin.into(),
+            end.into(),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByKeyRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![begin.into(), end.into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
-        }
-    }
-
-    /// MapRemoveByValueOp creates map remove operation.
-    /// Server removes map items identified by value and returns removed data specified by returnType.
-    pub fn remove_by_values(
-        policy: &CdtMapPolicy,
-        bin_name: String,
-        values: Vec<PHPValue>,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByValueList.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(values.iter().map(|v| (*v).clone().into()).collect()).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByValueListOp creates map remove operation.
     /// Server removes map items identified by values and returns removed data specified by returnType.
+    pub fn remove_by_values(
+        _policy: &CdtMapPolicy,
+        bin_name: String,
+        values: Vec<PHPValue>,
+        return_type: Option<CdtMapReturnType>,
+        ctx: Option<Vec<&CDTContext>>,
+    ) -> Operation {
+        let op = aero::operations::maps::remove_by_value_list(
+            &bin_name,
+            php_values_to_aero(values),
+            map_return(return_type),
+        );
+        Operation {
+            _as: with_ctx(op, ctx),
+        }
+    }
+
+    /// MapRemoveByValueRangeOp creates map remove operation.
+    /// Server removes map items identified by value range (valueBegin inclusive, valueEnd exclusive).
     pub fn remove_by_value_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_value_range(
+            &bin_name,
+            begin.into(),
+            end.into(),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByValueRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![begin.into(), end.into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByValueRelativeRankRangeOp creates a map remove by value relative to rank range operation.
     /// Server removes map items nearest to value and greater by relative rank.
-    /// Server returns removed data specified by returnType.
-    ///
-    /// Examples for map [{4=2},{9=10},{5=15},{0=17}]:
-    ///
-    ///	(value,rank) = [removed items]
-    ///	(11,1) = [{0=17}]
-    ///	(11,-1) = [{9=10},{5=15},{0=17}]
     pub fn remove_by_value_relative_rank_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         value: PHPValue,
         rank: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_value_relative_rank_range(
+            &bin_name,
+            value.into(),
+            rank,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByValueRelativeRankRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![value.into(), PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByValueRelativeRankRangeCountOp creates a map remove by value relative to rank range operation.
     /// Server removes map items nearest to value and greater by relative rank with a count limit.
-    /// Server returns removed data specified by returnType (See MapReturnType).
-    ///
-    /// Examples for map [{4=2},{9=10},{5=15},{0=17}]:
-    ///
-    ///	(value,rank,count) = [removed items]
-    ///	(11,1,1) = [{0=17}]
-    ///	(11,-1,1) = [{9=10}]
     pub fn remove_by_value_relative_rank_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         value: PHPValue,
         rank: i64,
@@ -7707,230 +5544,151 @@ impl CdtMapOperation {
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_value_relative_rank_range_count(
+            &bin_name,
+            value.into(),
+            rank,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByValueRelativeRankRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    value.into(),
-                    PHPValue::Int(rank).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByIndexOp creates map remove operation.
     /// Server removes map item identified by index and returns removed data specified by returnType.
     pub fn remove_by_index(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_index(&bin_name, index, map_return(return_type));
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByIndex.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByIndexRangeOp creates map remove operation.
-    /// Server removes map items starting at specified index to the end of map and returns removed
-    /// data specified by returnTyp
+    /// Server removes map items starting at specified index to the end of map.
     pub fn remove_by_index_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_index_range_from(
+            &bin_name,
+            index,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByIndexRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByIndexRangeCountOp creates map remove operation.
-    /// Server removes "count" map items starting at specified index and returns removed data specified by returnType.
+    /// Server removes "count" map items starting at specified index.
     pub fn remove_by_index_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
         count: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_index_range(
+            &bin_name,
+            index,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByIndexRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into(), PHPValue::Int(count).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByRankOp creates map remove operation.
     /// Server removes map item identified by rank and returns removed data specified by returnType.
     pub fn remove_by_rank(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_rank(&bin_name, rank, map_return(return_type));
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByRank.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByRankRangeOp creates map remove operation.
-    /// Server removes map items starting at specified rank to the last ranked item and returns removed
-    /// data specified by returnType.
+    /// Server removes map items starting at specified rank to the last ranked item.
     pub fn remove_by_rank_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_rank_range_from(
+            &bin_name,
+            rank,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByRankRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByRankRangeCountOp creates map remove operation.
-    /// Server removes "count" map items starting at specified rank and returns removed data specified by returnType.
+    /// Server removes "count" map items starting at specified rank.
     pub fn remove_by_rank_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
         count: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_rank_range(
+            &bin_name,
+            rank,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByRankRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into(), PHPValue::Int(count).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByKeyRelativeIndexRangeOp creates a map remove by key relative to index range operation.
-    /// Server removes map items nearest to key and greater by index.
-    /// Server returns removed data specified by returnType.
-    ///
-    /// Examples for map [{0=17},{4=2},{5=15},{9=10}]:
-    ///
-    ///	(value,index) = [removed items]
-    ///	(5,0) = [{5=15},{9=10}]
-    ///	(5,1) = [{9=10}]
-    ///	(5,-1) = [{4=2},{5=15},{9=10}]
-    ///	(3,2) = [{9=10}]
-    ///	(3,-2) = [{0=17},{4=2},{5=15},{9=10}]
     pub fn remove_by_key_relative_index_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         key: PHPValue,
         index: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_key_relative_index_range(
+            &bin_name,
+            key.into(),
+            index,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByKeyRelativeIndexRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![key.into(), PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapRemoveByKeyRelativeIndexRangeCountOp creates map remove by key relative to index range operation.
-    /// Server removes map items nearest to key and greater by index with a count limit.
-    /// Server returns removed data specified by returnType.
-    ///
-    /// Examples for map [{0=17},{4=2},{5=15},{9=10}]:
-    ///
-    ///	(value,index,count) = [removed items]
-    ///	(5,0,1) = [{5=15}]
-    ///	(5,1,2) = [{9=10}]
-    ///	(5,-1,1) = [{4=2}]
-    ///	(3,2,1) = [{9=10}]
-    ///	(3,-2,2) = [{0=17}]
     pub fn remove_by_key_relative_index_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         key: PHPValue,
         index: i64,
@@ -7938,137 +5696,80 @@ impl CdtMapOperation {
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::remove_by_key_relative_index_range_count(
+            &bin_name,
+            key.into(),
+            index,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::RemoveByKeyRelativeIndexRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    key.into(),
-                    PHPValue::Int(index).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// MapGetByKeyOp creates map get by key operation.
-    /// Server selects map item identified by key and returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    /// MapGetByKeyListOp creates a map get by key list operation. Should be used with BatchRead.
     pub fn get_by_keys(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         keys: Vec<PHPValue>,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_key_list(
+            &bin_name,
+            php_values_to_aero(keys),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByKeyList.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(keys.iter().map(|key| key.clone().into()).collect()).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByKeyRangeOp creates map get by key range operation.
-    /// Server selects map items identified by key range (keyBegin inclusive, keyEnd exclusive).
-    /// If keyBegin is nil, the range is less than keyEnd.
-    /// If keyEnd is nil, the range is greater than equal to keyBegin.
-    ///
-    /// Server returns selected data specified by returnType.
     /// Should be used with BatchRead.
     pub fn get_by_key_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_key_range(
+            &bin_name,
+            begin.into(),
+            end.into(),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByKeyRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![begin.into(), end.into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByKeyRelativeIndexRangeOp creates a map get by key relative to index range operation.
-    /// Server selects map items nearest to key and greater by index.
-    /// Server returns selected data specified by returnType.
-    ///
-    /// Examples for ordered map [{0=17},{4=2},{5=15},{9=10}]:
-    ///
-    ///	(value,index) = [selected items]
-    ///	(5,0) = [{5=15},{9=10}]
-    ///	(5,1) = [{9=10}]
-    ///	(5,-1) = [{4=2},{5=15},{9=10}]
-    ///	(3,2) = [{9=10}]
-    ///	(3,-2) = [{0=17},{4=2},{5=15},{9=10}]
-    /// Should be used with BatchRead.
     pub fn get_by_key_relative_index_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         key: PHPValue,
         index: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_key_relative_index_range(
+            &bin_name,
+            key.into(),
+            index,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByKeyRelativeIndexRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![key.into(), PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByKeyRelativeIndexRangeCountOp creates a map get by key relative to index range operation.
-    /// Server selects map items nearest to key and greater by index with a count limit.
-    /// Server returns selected data specified by returnType (See MapReturnType).
-    ///
-    /// Examples for ordered map [{0=17},{4=2},{5=15},{9=10}]:
-    ///
-    ///	(value,index,count) = [selected items]
-    ///	(5,0,1) = [{5=15}]
-    ///	(5,1,2) = [{9=10}]
-    ///	(5,-1,1) = [{4=2}]
-    ///	(3,2,1) = [{9=10}]
-    ///	(3,-2,2) = [{0=17}]
-    /// Should be used with BatchRead.
     pub fn get_by_key_relative_index_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         key: PHPValue,
         index: i64,
@@ -8076,131 +5777,79 @@ impl CdtMapOperation {
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_key_relative_index_range_count(
+            &bin_name,
+            key.into(),
+            index,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByKeyRelativeIndexRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    key.into(),
-                    PHPValue::Int(index).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// MapGetByKeyListOp creates a map get by key list operation.
-    /// Server selects map items identified by keys and returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    /// MapGetByValueListOp creates a map get by value list operation. Should be used with BatchRead.
     pub fn get_by_values(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         values: Vec<PHPValue>,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_value_list(
+            &bin_name,
+            php_values_to_aero(values),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByValueList.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(values.iter().map(|v| (*v).clone().into()).collect()).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// MapGetByValueRangeOp creates map get by value range operation.
-    /// Server selects map items identified by value range (valueBegin inclusive, valueEnd exclusive)
-    /// If valueBegin is nil, the range is less than valueEnd.
-    /// If valueEnd is nil, the range is greater than equal to valueBegin.
-    ///
-    /// Server returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    /// MapGetByValueRangeOp creates map get by value range operation. Should be used with BatchRead.
     pub fn get_by_value_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_value_range(
+            &bin_name,
+            begin.into(),
+            end.into(),
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByValueRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![begin.into(), end.into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByValueRelativeRankRangeOp creates a map get by value relative to rank range operation.
-    /// Server selects map items nearest to value and greater by relative rank.
-    /// Server returns selected data specified by returnType.
-    ///
-    /// Examples for map [{4=2},{9=10},{5=15},{0=17}]:
-    ///
-    ///	(value,rank) = [selected items]
-    ///	(11,1) = [{0=17}]
-    ///	(11,-1) = [{9=10},{5=15},{0=17}]
-    /// Should be used with BatchRead.
     pub fn get_by_value_relative_rank_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         value: PHPValue,
         rank: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_value_relative_rank_range(
+            &bin_name,
+            value.into(),
+            rank,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByValueRelativeRankRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![value.into(), PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByValueRelativeRankRangeCountOp creates a map get by value relative to rank range operation.
-    /// Server selects map items nearest to value and greater by relative rank with a count limit.
-    /// Server returns selected data specified by returnType.
-    ///
-    /// Examples for map [{4=2},{9=10},{5=15},{0=17}]:
-    ///
-    ///	(value,rank,count) = [selected items]
-    ///	(11,1,1) = [{0=17}]
-    ///	(11,-1,1) = [{9=10}]
-    /// Should be used with BatchRead.
     pub fn get_by_value_relative_rank_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         value: PHPValue,
         rank: i64,
@@ -8208,195 +5857,133 @@ impl CdtMapOperation {
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_value_relative_rank_range_count(
+            &bin_name,
+            value.into(),
+            rank,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByValueRelativeRankRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    value.into(),
-                    PHPValue::Int(rank).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// MapGetByIndexOp creates map get by index operation.
-    /// Server selects map item identified by index and returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    /// MapGetByIndexOp creates map get by index operation. Should be used with BatchRead.
     pub fn get_by_index(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_index(&bin_name, index, map_return(return_type));
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByIndex.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByIndexRangeOp creates map get by index range operation.
-    /// Server selects map items starting at specified index to the end of map and returns selected
-    /// data specified by returnType.
-    /// Should be used with BatchRead.
+    ///
+    /// v2 BREAKING: aerospike-client-rust v2 expects an `i64` index, not a `PHPValue` begin/end
+    /// pair. The previous proto-based signature was incompatible with the wire protocol and is
+    /// replaced by `(index: i64)`. Server selects map items starting at the specified index to
+    /// the end of the map. Should be used with BatchRead.
     pub fn get_by_index_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
-        begin: PHPValue,
-        end: PHPValue,
+        index: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_index_range_from(
+            &bin_name,
+            index,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByIndexRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![begin.into(), end.into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByIndexRangeCountOp creates map get by index range operation.
-    /// Server selects "count" map items starting at specified index and returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    ///
+    /// v2 BREAKING: the previous `rank` parameter (a copy-paste artifact from
+    /// `get_by_rank_range_count`) is removed. New signature is `(index, count)`.
     pub fn get_by_index_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
-        rank: i64,
         count: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_index_range(
+            &bin_name,
+            index,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByIndexRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(index).into(),
-                    PHPValue::Int(rank).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// MapGetByRankOp creates map get by rank operation.
-    /// Server selects map item identified by rank and returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    /// MapGetByRankOp creates map get by rank operation. Should be used with BatchRead.
     pub fn get_by_rank(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_rank(&bin_name, rank, map_return(return_type));
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByRank.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(rank).into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByRankRangeOp creates map get by rank range operation.
-    /// Server selects map items starting at specified rank to the last ranked item and returns selected
-    /// data specified by returnType.
-    /// Should be used with BatchRead.
+    ///
+    /// v2 BREAKING: signature changed from `(begin, end: PHPValue)` to `(rank: i64)`.
+    /// Server selects map items starting at the specified rank to the last ranked item.
     pub fn get_by_rank_range(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
-        begin: PHPValue,
-        end: PHPValue,
+        rank: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_rank_range_from(
+            &bin_name,
+            rank,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByRankRange.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![begin.into(), end.into()],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// MapGetByRankRangeCountOp creates map get by rank range operation.
-    /// Server selects "count" map items starting at specified rank and returns selected data specified by returnType.
-    /// Should be used with BatchRead.
+    ///
+    /// v2 BREAKING: the previous `range` parameter (copy-paste artifact) is removed.
+    /// New signature is `(rank, count)`.
     pub fn get_by_rank_range_count(
-        policy: &CdtMapPolicy,
+        _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
-        range: i64,
         count: i64,
         return_type: Option<CdtMapReturnType>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::maps::get_by_rank_range(
+            &bin_name,
+            rank,
+            count,
+            map_return(return_type),
+        );
         Operation {
-            _as: proto::operation::Op::Map(proto::CdtMapOperation {
-                op: proto::CdtMapCommandOp::GetByRankRangeCount.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(rank).into(),
-                    PHPValue::Int(range).into(),
-                    PHPValue::Int(count).into(),
-                ],
-                return_type: return_type
-                    .map(|v| v._as)
-                    .or(Some(CdtMapReturnType::Key_Value()._as)),
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 }
@@ -8408,19 +5995,19 @@ impl CdtMapOperation {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// HLLWriteFlags specifies the HLL write operation flags.
-#[php_class(name = "Aerospike\\HllWriteFlags")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\HllWriteFlags")]
+#[derive(Debug, Clone)]
 pub struct CdtHllWriteFlags {
-    _as: proto::CdtHllWriteFlags,
+    _as: aero::operations::hll::HLLWriteFlags,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtHllWriteFlags {
     /// HLLWriteFlagsDefault is Default. Allow create or update.
     pub fn Default() -> Self {
         Self {
-            _as: proto::CdtHllWriteFlags::Default,
+            _as: aero::operations::hll::HLLWriteFlags::Default,
         }
     }
 
@@ -8429,7 +6016,7 @@ impl CdtHllWriteFlags {
     /// If the bin does not exist, a new bin will be created.
     pub fn Create_Only() -> Self {
         Self {
-            _as: proto::CdtHllWriteFlags::CreateOnly,
+            _as: aero::operations::hll::HLLWriteFlags::CreateOnly,
         }
     }
 
@@ -8438,14 +6025,14 @@ impl CdtHllWriteFlags {
     /// If the bin does not exist, the operation will be denied.
     pub fn Update_Only() -> Self {
         Self {
-            _as: proto::CdtHllWriteFlags::UpdateOnly,
+            _as: aero::operations::hll::HLLWriteFlags::UpdateOnly,
         }
     }
 
     /// HLLWriteFlagsNoFail does not raise error if operation is denied.
     pub fn No_Fail() -> Self {
         Self {
-            _as: proto::CdtHllWriteFlags::NoFail,
+            _as: aero::operations::hll::HLLWriteFlags::NoFail,
         }
     }
 
@@ -8454,14 +6041,8 @@ impl CdtHllWriteFlags {
     /// of all participating sets do not match.
     pub fn Allow_Fold() -> Self {
         Self {
-            _as: proto::CdtHllWriteFlags::AllowFold,
+            _as: aero::operations::hll::HLLWriteFlags::AllowFold,
         }
-    }
-}
-
-impl From<&proto::CdtHllWriteFlags> for CdtHllWriteFlags {
-    fn from(input: &proto::CdtHllWriteFlags) -> Self {
-        CdtHllWriteFlags { _as: input.clone() }
     }
 }
 
@@ -8471,7 +6052,7 @@ impl FromZval<'_> for CdtHllWriteFlags {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtHllWriteFlags = zval.extract()?;
 
-        Some(CdtHllWriteFlags { _as: f._as.clone() })
+        Some(CdtHllWriteFlags { _as: f._as })
     }
 }
 
@@ -8482,29 +6063,25 @@ impl FromZval<'_> for CdtHllWriteFlags {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// HLLPolicy determines the HyperLogLog operation policy.
-#[php_class(name = "Aerospike\\HllPolicy")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\HllPolicy")]
+#[derive(Debug, Clone, Default)]
 pub struct CdtHllPolicy {
-    _as: proto::CdtHllPolicy,
+    _as: aero::operations::hll::HLLPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtHllPolicy {
     /// new HLLPolicy uses specified optional HLLWriteFlags when performing HLL operations.
-    pub fn __construct(flags: Option<CdtListWriteFlags>) -> Self {
-        let flags: i32 = flags.map(|f| f._as.into()).unwrap_or(0);
+    pub fn __construct(flags: Option<CdtHllWriteFlags>) -> Self {
+        let write_flags = flags
+            .map(|f| f._as)
+            .unwrap_or(aero::operations::hll::HLLWriteFlags::Default);
 
         // DefaultHLLPolicy uses the default policy when performing HLL operations.
         CdtHllPolicy {
-            _as: proto::CdtHllPolicy { flags: flags },
+            _as: aero::operations::hll::HLLPolicy::new(write_flags),
         }
-    }
-}
-
-impl From<&proto::CdtHllPolicy> for CdtHllPolicy {
-    fn from(input: &proto::CdtHllPolicy) -> Self {
-        CdtHllPolicy { _as: input.clone() }
     }
 }
 
@@ -8514,7 +6091,7 @@ impl FromZval<'_> for CdtHllPolicy {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtHllPolicy = zval.extract()?;
 
-        Some(CdtHllPolicy { _as: f._as.clone() })
+        Some(CdtHllPolicy { _as: f._as })
     }
 }
 
@@ -8529,9 +6106,11 @@ impl FromZval<'_> for CdtHllPolicy {
 ///
 /// HyperLogLog operations on HLL items nested in lists/maps are not currently
 /// supported by the server.
-#[php_class(name = "Aerospike\\HllOp")]
+#[php_class]
+#[php(name = "Aerospike\\HllOp")]
+#[derive(Clone)]
 pub struct CdtHllOperation {
-    _as: proto::CdtHllOperation,
+    _as: aero::operations::Operation,
 }
 
 impl FromZval<'_> for CdtHllOperation {
@@ -8545,16 +6124,15 @@ impl FromZval<'_> for CdtHllOperation {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtHllOperation {
     /// HLLInitOp creates HLL init operation with minhash bits.
     /// Server creates a new HLL or resets an existing HLL.
     /// Server does not return a value.
     ///
-    /// policy			write policy, use DefaultHLLPolicy for default
-    /// binName			name of bin
-    /// indexBitCount	number of index bits. Must be between 4 and 16 inclusive. Pass -1 for default.
-    /// minHashBitCount  number of min hash bits. Must be between 4 and 58 inclusive. Pass -1 for default.
+    /// policy            write policy, use DefaultHLLPolicy for default
+    /// binName           name of bin
+    /// indexBitCount     number of index bits. Must be between 4 and 16 inclusive. Pass -1 for default.
+    /// minHashBitCount   number of min hash bits. Must be between 4 and 58 inclusive. Pass -1 for default.
     /// indexBitCount + minHashBitCount must be <= 64.
     pub fn init(
         policy: &CdtHllPolicy,
@@ -8563,28 +6141,18 @@ impl CdtHllOperation {
         min_hash_bit_count: i64,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::Init.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(index_bit_count).into(),
-                    PHPValue::Int(min_hash_bit_count).into(),
-                ],
-            }),
+            _as: aero::operations::hll::init_with_min_hash(
+                &policy._as,
+                &bin_name,
+                index_bit_count,
+                min_hash_bit_count,
+            ),
         }
     }
 
     /// HLLAddOp creates HLL add operation with minhash bits.
     /// Server adds values to HLL set. If HLL bin does not exist, use indexBitCount and minHashBitCount
     /// to create HLL bin. Server returns number of entries that caused HLL to update a register.
-    ///
-    /// policy			write policy, use DefaultHLLPolicy for default
-    /// binName			name of bin
-    /// list				list of values to be added
-    /// indexBitCount	number of index bits. Must be between 4 and 16 inclusive. Pass -1 for default.
-    /// minHashBitCount  number of min hash bits. Must be between 4 and 58 inclusive. Pass -1 for default.
-    /// indexBitCount + minHashBitCount must be <= 64.
     pub fn add(
         policy: &CdtHllPolicy,
         bin_name: String,
@@ -8593,26 +6161,19 @@ impl CdtHllOperation {
         min_hash_bit_count: i64,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::Add.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::List(list).into(),
-                    PHPValue::Int(index_bit_count).into(),
-                    PHPValue::Int(min_hash_bit_count).into(),
-                ],
-            }),
+            _as: aero::operations::hll::add_with_index_and_min_hash(
+                &policy._as,
+                &bin_name,
+                php_values_to_aero(list),
+                index_bit_count,
+                min_hash_bit_count,
+            ),
         }
     }
 
     /// HLLSetUnionOp creates HLL set union operation.
     /// Server sets union of specified HLL objects with HLL bin.
-    /// Server does not return a value.
-    ///
-    /// policy			write policy, use DefaultHLLPolicy for default
-    /// binName			name of bin
-    /// list				list of HLL objects
+    /// Returns `None` if any element of `list` is not an HLL value.
     pub fn set_union(
         policy: &CdtHllPolicy,
         bin_name: String,
@@ -8620,162 +6181,89 @@ impl CdtHllOperation {
     ) -> Option<Operation> {
         if !assert_hll_list(&list) {
             return None;
-        };
-
+        }
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::SetUnion.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![PHPValue::List(list).into()],
-            }),
+            _as: aero::operations::hll::set_union(&policy._as, &bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLRefreshCountOp creates HLL refresh operation.
     /// Server updates the cached count (if stale) and returns the count.
-    ///
-    /// binName			name of bin
     pub fn refresh_count(bin_name: String) -> Option<Operation> {
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::RefreshCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-            }),
+            _as: aero::operations::hll::refresh_count(&bin_name),
         })
     }
 
-    /// HLLFoldOp creates HLL fold operation.
-    /// Servers folds indexBitCount to the specified value.
+    /// HLLFoldOp creates HLL fold operation. Server folds indexBitCount to the specified value.
     /// This can only be applied when minHashBitCount on the HLL bin is 0.
-    /// Server does not return a value.
-    ///
-    /// binName			name of bin
-    /// indexBitCount		number of index bits. Must be between 4 and 16 inclusive.
     pub fn fold(bin_name: String, index_bit_count: i64) -> Option<Operation> {
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::Fold.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::Int(index_bit_count).into()],
-            }),
+            _as: aero::operations::hll::fold(&bin_name, index_bit_count),
         })
     }
 
     /// HLLGetCountOp creates HLL getCount operation.
     /// Server returns estimated number of elements in the HLL bin.
-    ///
-    /// binName			name of bin
     pub fn get_count(bin_name: String) -> Option<Operation> {
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::GetCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-            }),
+            _as: aero::operations::hll::get_count(&bin_name),
         })
     }
 
     /// HLLGetUnionOp creates HLL getUnion operation.
     /// Server returns an HLL object that is the union of all specified HLL objects in the list
-    /// with the HLL bin.
-    ///
-    /// binName			name of bin
-    /// list				list of HLL objects
+    /// with the HLL bin. Returns `None` if any element of `list` is not an HLL value.
     pub fn get_union(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
         if !assert_hll_list(&list) {
             return None;
-        };
-
+        }
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::GetUnion.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::List(list).into()],
-            }),
+            _as: aero::operations::hll::get_union(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLGetUnionCountOp creates HLL getUnionCount operation.
     /// Server returns estimated number of elements that would be contained by the union of these
     /// HLL objects.
-    ///
-    /// binName			name of bin
-    /// list				list of HLL objects
     pub fn get_union_count(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
         if !assert_hll_list(&list) {
             return None;
-        };
-
+        }
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::GetUnionCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::List(list).into()],
-            }),
+            _as: aero::operations::hll::get_union_count(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLGetIntersectCountOp creates HLL getIntersectCount operation.
     /// Server returns estimated number of elements that would be contained by the intersection of
     /// these HLL objects.
-    ///
-    /// binName			name of bin
-    /// list				list of HLL objects
     pub fn get_intersect_count(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
         if !assert_hll_list(&list) {
             return None;
-        };
-
+        }
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::GetIntersectCount.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::List(list).into()],
-            }),
+            _as: aero::operations::hll::get_intersect_count(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLGetSimilarityOp creates HLL getSimilarity operation.
     /// Server returns estimated similarity of these HLL objects. Return type is a double.
-    ///
-    /// binName			name of bin
-    /// list				list of HLL objects
     pub fn get_similarity(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
         if !assert_hll_list(&list) {
             return None;
-        };
-
+        }
         Some(Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::GetSimilarity.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![PHPValue::List(list).into()],
-            }),
+            _as: aero::operations::hll::get_similarity(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLDescribeOp creates HLL describe operation.
     /// Server returns indexBitCount and minHashBitCount used to create HLL bin in a list of longs.
     /// The list size is 2.
-    ///
-    /// binName			name of bin
     pub fn describe(bin_name: String) -> Operation {
         Operation {
-            _as: proto::operation::Op::Hll(proto::CdtHllOperation {
-                op: proto::CdtHllCommandOp::Describe.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![],
-            }),
+            _as: aero::operations::hll::describe(&bin_name),
         }
     }
 }
@@ -8787,19 +6275,19 @@ impl CdtHllOperation {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BitWriteFlags specify bitwise operation policy write flags.
-#[php_class(name = "Aerospike\\BitwiseWriteFlags")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\BitwiseWriteFlags")]
+#[derive(Debug, Clone)]
 pub struct CdtBitwiseWriteFlags {
-    _as: proto::CdtBitwiseWriteFlags,
+    _as: aero::operations::bitwise::BitwiseWriteFlags,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtBitwiseWriteFlags {
     /// BitWriteFlagsDefault allows create or update.
     pub fn Default() -> Self {
         Self {
-            _as: proto::CdtBitwiseWriteFlags::Default,
+            _as: aero::operations::bitwise::BitwiseWriteFlags::Default,
         }
     }
 
@@ -8808,7 +6296,7 @@ impl CdtBitwiseWriteFlags {
     /// If the bin does not exist, a new bin will be created.
     pub fn Create_Only() -> Self {
         Self {
-            _as: proto::CdtBitwiseWriteFlags::CreateOnly,
+            _as: aero::operations::bitwise::BitwiseWriteFlags::CreateOnly,
         }
     }
 
@@ -8817,14 +6305,14 @@ impl CdtBitwiseWriteFlags {
     /// If the bin does not exist, the operation will be denied.
     pub fn Update_Only() -> Self {
         Self {
-            _as: proto::CdtBitwiseWriteFlags::UpdateOnly,
+            _as: aero::operations::bitwise::BitwiseWriteFlags::UpdateOnly,
         }
     }
 
     /// BitWriteFlagsNoFail specifies not to raise error if operation is denied.
     pub fn No_Fail() -> Self {
         Self {
-            _as: proto::CdtBitwiseWriteFlags::NoFail,
+            _as: aero::operations::bitwise::BitwiseWriteFlags::NoFail,
         }
     }
 
@@ -8832,14 +6320,8 @@ impl CdtBitwiseWriteFlags {
     /// denied due to flag constraints.
     pub fn Partial() -> Self {
         Self {
-            _as: proto::CdtBitwiseWriteFlags::Partial,
+            _as: aero::operations::bitwise::BitwiseWriteFlags::Partial,
         }
-    }
-}
-
-impl From<&proto::CdtBitwiseWriteFlags> for CdtBitwiseWriteFlags {
-    fn from(input: &proto::CdtBitwiseWriteFlags) -> Self {
-        CdtBitwiseWriteFlags { _as: input.clone() }
     }
 }
 
@@ -8860,47 +6342,41 @@ impl FromZval<'_> for CdtBitwiseWriteFlags {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BitResizeFlags specifies the bitwise operation flags for resize.
-#[php_class(name = "Aerospike\\BitwiseResizeFlags")]
-#[derive(Debug, PartialEq, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\BitwiseResizeFlags")]
+#[derive(Debug, Clone)]
 pub struct CdtBitwiseResizeFlags {
-    _as: proto::CdtBitwiseResizeFlags,
+    _as: aero::operations::bitwise::BitwiseResizeFlags,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtBitwiseResizeFlags {
-    /// BitResizeFlagsDefault specifies the defalt flag.
+    /// BitResizeFlagsDefault specifies the default flag.
     pub fn Default() -> Self {
         Self {
-            _as: proto::CdtBitwiseResizeFlags::Default,
+            _as: aero::operations::bitwise::BitwiseResizeFlags::Default,
         }
     }
 
     /// BitResizeFlagsFromFront Adds/removes bytes from the beginning instead of the end.
     pub fn From_Front() -> Self {
         Self {
-            _as: proto::CdtBitwiseResizeFlags::FromFront,
+            _as: aero::operations::bitwise::BitwiseResizeFlags::FromFront,
         }
     }
 
     /// BitResizeFlagsGrowOnly will only allow the []byte size to increase.
     pub fn Grow_Only() -> Self {
         Self {
-            _as: proto::CdtBitwiseResizeFlags::GrowOnly,
+            _as: aero::operations::bitwise::BitwiseResizeFlags::GrowOnly,
         }
     }
 
     /// BitResizeFlagsShrinkOnly will only allow the []byte size to decrease.
     pub fn Shrink_Only() -> Self {
         Self {
-            _as: proto::CdtBitwiseResizeFlags::ShrinkOnly,
+            _as: aero::operations::bitwise::BitwiseResizeFlags::ShrinkOnly,
         }
-    }
-}
-
-impl From<&proto::CdtBitwiseResizeFlags> for CdtBitwiseResizeFlags {
-    fn from(input: &proto::CdtBitwiseResizeFlags) -> Self {
-        CdtBitwiseResizeFlags { _as: input.clone() }
     }
 }
 
@@ -8921,19 +6397,20 @@ impl FromZval<'_> for CdtBitwiseResizeFlags {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BitOverflowAction specifies the action to take when bitwise add/subtract results in overflow/underflow.
-#[php_class(name = "Aerospike\\BitwiseOverflowAction")]
-#[derive(Debug, PartialEq, Clone)]
+/// Note: the backing aero type is `BitwiseOverflowActions` (plural).
+#[php_class]
+#[php(name = "Aerospike\\BitwiseOverflowAction")]
+#[derive(Debug, Clone)]
 pub struct CdtBitwiseOverflowAction {
-    _as: proto::CdtBitwiseOverflowAction,
+    _as: aero::operations::bitwise::BitwiseOverflowActions,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtBitwiseOverflowAction {
     /// BitOverflowActionFail specifies to fail operation with error.
     pub fn Fail() -> Self {
         Self {
-            _as: proto::CdtBitwiseOverflowAction::Fail,
+            _as: aero::operations::bitwise::BitwiseOverflowActions::Fail,
         }
     }
 
@@ -8941,7 +6418,7 @@ impl CdtBitwiseOverflowAction {
     /// Example: MAXINT + 1 = MAXINT
     pub fn Saturate() -> Self {
         Self {
-            _as: proto::CdtBitwiseOverflowAction::Saturate,
+            _as: aero::operations::bitwise::BitwiseOverflowActions::Saturate,
         }
     }
 
@@ -8949,14 +6426,8 @@ impl CdtBitwiseOverflowAction {
     /// Example: MAXINT + 1 = -1
     pub fn Wrap() -> Self {
         Self {
-            _as: proto::CdtBitwiseOverflowAction::Wrap,
+            _as: aero::operations::bitwise::BitwiseOverflowActions::Wrap,
         }
-    }
-}
-
-impl From<&proto::CdtBitwiseOverflowAction> for CdtBitwiseOverflowAction {
-    fn from(input: &proto::CdtBitwiseOverflowAction) -> Self {
-        CdtBitwiseOverflowAction { _as: input.clone() }
     }
 }
 
@@ -8977,28 +6448,25 @@ impl FromZval<'_> for CdtBitwiseOverflowAction {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// BitPolicy determines the Bit operation policy.
-#[php_class(name = "Aerospike\\BitwisePolicy")]
-#[derive(Debug, PartialEq, Clone)]
+/// Note: the backing aero type is `BitPolicy` (not BitwisePolicy).
+#[php_class]
+#[php(name = "Aerospike\\BitwisePolicy")]
+#[derive(Debug, Clone, Default)]
 pub struct CdtBitwisePolicy {
-    _as: proto::CdtBitwisePolicy,
+    _as: aero::operations::bitwise::BitPolicy,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtBitwisePolicy {
-    /// new BitwisePolicy(int) will return a BitPolicy will provided flags.
+    /// new BitwisePolicy(flags) will return a BitPolicy with provided write flags.
     pub fn __construct(flags: Option<CdtBitwiseWriteFlags>) -> Self {
-        let flags: i32 = flags.map(|f| f._as.into()).unwrap_or(0);
+        let flag_byte = flags
+            .map(|f| f._as as u8)
+            .unwrap_or(aero::operations::bitwise::BitwiseWriteFlags::Default as u8);
 
         CdtBitwisePolicy {
-            _as: proto::CdtBitwisePolicy { flags: flags },
+            _as: aero::operations::bitwise::BitPolicy::new(flag_byte),
         }
-    }
-}
-
-impl From<&proto::CdtBitwisePolicy> for CdtBitwisePolicy {
-    fn from(input: &proto::CdtBitwisePolicy) -> Self {
-        CdtBitwisePolicy { _as: input.clone() }
     }
 }
 
@@ -9008,7 +6476,7 @@ impl FromZval<'_> for CdtBitwisePolicy {
     fn from_zval(zval: &Zval) -> Option<Self> {
         let f: &CdtBitwisePolicy = zval.extract()?;
 
-        Some(CdtBitwisePolicy { _as: f._as.clone() })
+        Some(CdtBitwisePolicy { _as: f._as })
     }
 }
 
@@ -9028,9 +6496,11 @@ impl FromZval<'_> for CdtBitwisePolicy {
 ///	Resize first bitmap (in a list of bitmaps) to 3 bytes.
 ///	BitOperation.resize("bin", 3, BitResizeFlags.DEFAULT, CTX.listIndex(0))
 ///	bin result = [[0b00000001, 0b01000010, 0b00000000],[0b01011010]]
-#[php_class(name = "Aerospike\\BitwiseOp")]
+#[php_class]
+#[php(name = "Aerospike\\BitwiseOp")]
+#[derive(Clone)]
 pub struct CdtBitwiseOperation {
-    _as: proto::CdtBitwiseOperation,
+    _as: aero::operations::Operation,
 }
 
 impl FromZval<'_> for CdtBitwiseOperation {
@@ -9044,17 +6514,9 @@ impl FromZval<'_> for CdtBitwiseOperation {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl CdtBitwiseOperation {
-    /// BitResizeOp creates byte "resize" operation.
-    /// Server resizes []byte to byteSize according to resizeFlags (See BitResizeFlags).
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	$bin = [0b00000001, 0b01000010]
-    ///	$byteSize = 4
-    ///	$resizeFlags = 0
-    ///	$bin result = [0b00000001, 0b01000010, 0b00000000, 0b00000000]
+    /// BitResizeOp creates byte "resize" operation. Server resizes []byte to byteSize
+    /// according to resizeFlags. Server does not return a value.
     pub fn resize(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9062,32 +6524,19 @@ impl CdtBitwiseOperation {
         resize_flags: Option<CdtBitwiseResizeFlags>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let resize_flags: i32 = resize_flags.map(|rf| rf._as.into()).unwrap_or(0);
+        let op = aero::operations::bitwise::resize(
+            &bin_name,
+            byte_size,
+            resize_flags.map(|rf| rf._as),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Resize.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(byte_size).into(),
-                    PHPValue::Int(resize_flags as i64).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitInsertOp creates byte "insert" operation.
-    /// Server inserts value bytes into []byte bin at byteOffset.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	$bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	$byteOffset = 1
-    ///	$value = [0b11111111, 0b11000111]
-    ///	$bin result = [0b00000001, 0b11111111, 0b11000111, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
+    /// BitInsertOp creates byte "insert" operation. Server inserts value bytes into []byte bin
+    /// at byteOffset. Server does not return a value.
     pub fn insert(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9095,31 +6544,19 @@ impl CdtBitwiseOperation {
         value: Vec<u8>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::insert(
+            &bin_name,
+            byte_offset,
+            aero::Value::Blob(value),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Insert.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(byte_offset).into(),
-                    PHPValue::Blob(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitRemoveOp creates byte "remove" operation.
-    /// Server removes bytes from []byte bin at byteOffset for byteSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	$bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	$byteOffset = 2
-    ///	$byteSize = 3
-    ///	$bin result = [0b00000001, 0b01000010]
+    /// BitRemoveOp creates byte "remove" operation. Server removes bytes from []byte bin at
+    /// byteOffset for byteSize. Server does not return a value.
     pub fn remove(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9127,32 +6564,14 @@ impl CdtBitwiseOperation {
         byte_size: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::remove(&bin_name, byte_offset, byte_size, &policy._as);
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Remove.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(byte_offset).into(),
-                    PHPValue::Int(byte_size).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitSetOp creates bit "set" operation.
-    /// Server sets value on []byte bin at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	$bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	$bitOffset = 13
-    ///	$bitSize = 3
-    ///	$value = [0b11100000]
-    ///	$bin result = [0b00000001, 0b01000111, 0b00000011, 0b00000100, 0b00000101]
+    /// BitSetOp creates bit "set" operation. Server sets value on []byte bin at bitOffset for
+    /// bitSize. Server does not return a value.
     pub fn set(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9161,33 +6580,19 @@ impl CdtBitwiseOperation {
         value: Vec<u8>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::set(
+            &bin_name,
+            bit_offset,
+            bit_size,
+            aero::Value::Blob(value),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Set.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Blob(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// BitOrOp creates bit "or" operation.
-    /// Server performs bitwise "or" on value and []byte bin at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	$bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	$bitOffset = 17
-    ///	$bitSize = 6
-    ///	$value = [0b10101000]
-    ///	bin result = [0b00000001, 0b01000010, 0b01010111, 0b00000100, 0b00000101]
     pub fn or(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9196,33 +6601,19 @@ impl CdtBitwiseOperation {
         value: Vec<u8>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::or(
+            &bin_name,
+            bit_offset,
+            bit_size,
+            aero::Value::Blob(value),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Or.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Blob(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// BitXorOp creates bit "exclusive or" operation.
-    /// Server performs bitwise "xor" on value and []byte bin at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 17
-    ///	bitSize = 6
-    ///	value = [0b10101100]
-    ///	bin result = [0b00000001, 0b01000010, 0b01010101, 0b00000100, 0b00000101]
     pub fn xor(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9231,33 +6622,19 @@ impl CdtBitwiseOperation {
         value: Vec<u8>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::xor(
+            &bin_name,
+            bit_offset,
+            bit_size,
+            aero::Value::Blob(value),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Xor.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Blob(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// BitAndOp creates bit "and" operation.
-    /// Server performs bitwise "and" on value and []byte bin at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 23
-    ///	bitSize = 9
-    ///	value = [0b00111100, 0b10000000]
-    ///	bin result = [0b00000001, 0b01000010, 0b00000010, 0b00000000, 0b00000101]
     pub fn and(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9266,32 +6643,20 @@ impl CdtBitwiseOperation {
         value: Vec<u8>,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::and(
+            &bin_name,
+            bit_offset,
+            bit_size,
+            aero::Value::Blob(value),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::And.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Blob(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitNotOp creates bit "not" operation.
-    /// Server negates []byte bin starting at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 25
-    ///	bitSize = 6
-    ///	bin result = [0b00000001, 0b01000010, 0b00000011, 0b01111010, 0b00000101]
+    /// BitNotOp creates bit "not" operation. Server negates []byte bin starting at bitOffset
+    /// for bitSize.
     pub fn not(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9299,32 +6664,13 @@ impl CdtBitwiseOperation {
         bit_size: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op = aero::operations::bitwise::not(&bin_name, bit_offset, bit_size, &policy._as);
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Not.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// BitLShiftOp creates bit "left shift" operation.
-    /// Server shifts left []byte bin starting at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 32
-    ///	bitSize = 8
-    ///	shift = 3
-    ///	bin result = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00101000]
     pub fn lshift(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9333,33 +6679,14 @@ impl CdtBitwiseOperation {
         shift: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op =
+            aero::operations::bitwise::lshift(&bin_name, bit_offset, bit_size, shift, &policy._as);
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::LShift.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Int(shift).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// BitRShiftOp creates bit "right shift" operation.
-    /// Server shifts right []byte bin starting at bitOffset for bitSize.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 0
-    ///	bitSize = 9
-    ///	shift = 1
-    ///	bin result = [0b00000000, 0b11000010, 0b00000011, 0b00000100, 0b00000101]
     pub fn rshift(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9368,36 +6695,15 @@ impl CdtBitwiseOperation {
         shift: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op =
+            aero::operations::bitwise::rshift(&bin_name, bit_offset, bit_size, shift, &policy._as);
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::RShift.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Int(shift).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitAddOp creates bit "add" operation.
-    /// Server adds value to []byte bin starting at bitOffset for bitSize. BitSize must be <= 64.
-    /// Signed indicates if bits should be treated as a signed number.
-    /// If add overflows/underflows, BitOverflowAction is used.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 24
-    ///	bitSize = 16
-    ///	value = 128
-    ///	signed = false
-    ///	bin result = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b10000101]
+    /// BitAddOp creates bit "add" operation. Server adds value to []byte bin starting at
+    /// bitOffset for bitSize. bitSize must be <= 64.
     pub fn add(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9408,39 +6714,21 @@ impl CdtBitwiseOperation {
         action: CdtBitwiseOverflowAction,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let action: i32 = action._as.into();
+        let op = aero::operations::bitwise::add(
+            &bin_name,
+            bit_offset,
+            bit_size,
+            value,
+            signed,
+            action._as.clone(),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Add.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Int(value).into(),
-                    PHPValue::Bool(signed).into(),
-                    PHPValue::Int(action as i64).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
     /// BitSubtractOp creates bit "subtract" operation.
-    /// Server subtracts value from []byte bin starting at bitOffset for bitSize. BitSize must be <= 64.
-    /// Signed indicates if bits should be treated as a signed number.
-    /// If add overflows/underflows, BitOverflowAction is used.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 24
-    ///	bitSize = 16
-    ///	value = 128
-    ///	signed = false
-    ///	bin result = [0b00000001, 0b01000010, 0b00000011, 0b0000011, 0b10000101]
     pub fn subtract(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9451,36 +6739,22 @@ impl CdtBitwiseOperation {
         action: CdtBitwiseOverflowAction,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
-        let action: i32 = action._as.into();
+        let op = aero::operations::bitwise::subtract(
+            &bin_name,
+            bit_offset,
+            bit_size,
+            value,
+            signed,
+            action._as.clone(),
+            &policy._as,
+        );
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Subtract.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Int(value).into(),
-                    PHPValue::Bool(signed).into(),
-                    PHPValue::Int(action as i64).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitSetIntOp creates bit "setInt" operation.
-    /// Server sets value to []byte bin starting at bitOffset for bitSize. Size must be <= 64.
-    /// Server does not return a value.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 1
-    ///	bitSize = 8
-    ///	value = 127
-    ///	bin result = [0b00111111, 0b11000010, 0b00000011, 0b0000100, 0b00000101]
+    /// BitSetIntOp creates bit "setInt" operation. Server sets value to []byte bin starting at
+    /// bitOffset for bitSize. Size must be <= 64.
     pub fn set_int(
         policy: &CdtBitwisePolicy,
         bin_name: String,
@@ -9489,31 +6763,15 @@ impl CdtBitwiseOperation {
         value: i64,
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
+        let op =
+            aero::operations::bitwise::set_int(&bin_name, bit_offset, bit_size, value, &policy._as);
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::SetInt.into(),
-                policy: Some(policy._as.clone()),
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Int(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(op, ctx),
         }
     }
 
-    /// BitGetOp creates bit "get" operation.
-    /// Server returns bits from []byte bin starting at bitOffset for bitSize.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 9
-    ///	bitSize = 5
-    ///	returns [0b1000000]
+    /// BitGetOp creates bit "get" operation. Server returns bits from []byte bin starting at
+    /// bitOffset for bitSize.
     pub fn get(
         bin_name: String,
         bit_offset: i64,
@@ -9521,29 +6779,15 @@ impl CdtBitwiseOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Get.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::bitwise::get(&bin_name, bit_offset, bit_size),
+                ctx,
+            ),
         }
     }
 
-    /// BitCountOp creates bit "count" operation.
-    /// Server returns integer count of set bits from []byte bin starting at bitOffset for bitSize.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 20
-    ///	bitSize = 4
-    ///	returns 2
+    /// BitCountOp creates bit "count" operation. Server returns count of set bits from []byte
+    /// bin starting at bitOffset for bitSize.
     pub fn count(
         bin_name: String,
         bit_offset: i64,
@@ -9551,31 +6795,15 @@ impl CdtBitwiseOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::Count.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::bitwise::count(&bin_name, bit_offset, bit_size),
+                ctx,
+            ),
         }
     }
 
-    /// BitLScanOp creates bit "left scan" operation.
-    /// Server returns integer bit offset of the first specified value bit in []byte bin
-    /// starting at bitOffset for bitSize.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 24
-    ///	bitSize = 8
-    ///	value = true
-    ///	returns 5
+    /// BitLScanOp creates bit "left scan" operation. Server returns offset of the first
+    /// specified value bit in []byte bin starting at bitOffset for bitSize.
     pub fn lscan(
         bin_name: String,
         bit_offset: i64,
@@ -9584,32 +6812,15 @@ impl CdtBitwiseOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::LScan.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Bool(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::bitwise::lscan(&bin_name, bit_offset, bit_size, value),
+                ctx,
+            ),
         }
     }
 
-    /// BitRScanOp creates bit "right scan" operation.
-    /// Server returns integer bit offset of the last specified value bit in []byte bin
-    /// starting at bitOffset for bitSize.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 32
-    ///	bitSize = 8
-    ///	value = true
-    ///	returns 7
+    /// BitRScanOp creates bit "right scan" operation. Server returns offset of the last
+    /// specified value bit in []byte bin starting at bitOffset for bitSize.
     pub fn rscan(
         bin_name: String,
         bit_offset: i64,
@@ -9618,32 +6829,16 @@ impl CdtBitwiseOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::RScan.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Bool(value).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::bitwise::rscan(&bin_name, bit_offset, bit_size, value),
+                ctx,
+            ),
         }
     }
 
-    /// BitGetIntOp creates bit "get integer" operation.
-    /// Server returns integer from []byte bin starting at bitOffset for bitSize.
-    /// Signed indicates if bits should be treated as a signed number.
-    /// Example:
-    ///
-    ///	bin = [0b00000001, 0b01000010, 0b00000011, 0b00000100, 0b00000101]
-    ///	bitOffset = 8
-    ///	bitSize = 16
-    ///	signed = false
-    ///	returns 16899
+    /// BitGetIntOp creates bit "get integer" operation. Server returns integer from []byte bin
+    /// starting at bitOffset for bitSize. Signed indicates if bits should be treated as a
+    /// signed number.
     pub fn get_int(
         bin_name: String,
         bit_offset: i64,
@@ -9652,20 +6847,438 @@ impl CdtBitwiseOperation {
         ctx: Option<Vec<&CDTContext>>,
     ) -> Operation {
         Operation {
-            _as: proto::operation::Op::Bitwise(proto::CdtBitwiseOperation {
-                op: proto::CdtBitwiseCommandOp::GetInt.into(),
-                policy: None,
-                bin_name: bin_name,
-                args: vec![
-                    PHPValue::Int(bit_offset).into(),
-                    PHPValue::Int(bit_size).into(),
-                    PHPValue::Bool(signed).into(),
-                ],
-                ctx: ctx
-                    .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                    .unwrap_or(vec![]),
-            }),
+            _as: with_ctx(
+                aero::operations::bitwise::get_int(&bin_name, bit_offset, bit_size, signed),
+                ctx,
+            ),
         }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+//
+//  ClientPolicy
+//
+////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Build a rustls `ClientConfig` for the Aerospike client from PEM files on disk.
+///
+/// Returns a fully-configured `tokio_rustls::rustls::ClientConfig`:
+/// - When `ca_file` is `None`, Mozilla's webpki-roots bundle is the trust store.
+/// - When `cert_file` + `key_file` are both `Some`, mutual TLS is configured.
+/// - Providing exactly one of `cert_file`/`key_file` is a usage error.
+fn build_tls_config(
+    ca_file: Option<&str>,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> PhpResult<tokio_rustls::rustls::ClientConfig> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let mut roots = RootCertStore::empty();
+    match ca_file {
+        Some(path) => {
+            let file = File::open(path).map_err(|e| {
+                PhpException::default(format!("TLS: cannot open ca_file '{path}': {e}"))
+            })?;
+            let mut reader = BufReader::new(file);
+            let mut added = 0usize;
+            for cert in rustls_pemfile::certs(&mut reader) {
+                let cert = cert.map_err(|e| {
+                    PhpException::default(format!("TLS: failed to parse ca_file '{path}': {e}"))
+                })?;
+                roots.add(cert).map_err(|e| {
+                    PhpException::default(format!("TLS: rejected ca_file cert '{path}': {e}"))
+                })?;
+                added += 1;
+            }
+            if added == 0 {
+                return Err(PhpException::default(format!(
+                    "TLS: ca_file '{path}' contained no PEM certificates"
+                )));
+            }
+        }
+        None => {
+            // Mozilla's CA bundle for the common case (public TLS endpoints).
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+    }
+
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+
+    let cfg = match (cert_file, key_file) {
+        (Some(cert_path), Some(key_path)) => {
+            // Client certificate chain.
+            let cert_file = File::open(cert_path).map_err(|e| {
+                PhpException::default(format!("TLS: cannot open cert_file '{cert_path}': {e}"))
+            })?;
+            let mut cert_reader = BufReader::new(cert_file);
+            let mut chain: Vec<CertificateDer<'static>> = Vec::new();
+            for cert in rustls_pemfile::certs(&mut cert_reader) {
+                let cert = cert.map_err(|e| {
+                    PhpException::default(format!(
+                        "TLS: failed to parse cert_file '{cert_path}': {e}"
+                    ))
+                })?;
+                chain.push(cert);
+            }
+            if chain.is_empty() {
+                return Err(PhpException::default(format!(
+                    "TLS: cert_file '{cert_path}' contained no PEM certificates"
+                )));
+            }
+
+            // Private key — accept PKCS#8, PKCS#1, or SEC1.
+            let key_file = File::open(key_path).map_err(|e| {
+                PhpException::default(format!("TLS: cannot open key_file '{key_path}': {e}"))
+            })?;
+            let mut key_reader = BufReader::new(key_file);
+            let key = rustls_pemfile::private_key(&mut key_reader)
+                .map_err(|e| {
+                    PhpException::default(format!("TLS: failed to read key_file '{key_path}': {e}"))
+                })?
+                .ok_or_else(|| {
+                    PhpException::default(format!(
+                        "TLS: key_file '{key_path}' contained no parseable private key"
+                    ))
+                })?;
+
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| PhpException::default(format!("TLS: invalid client cert/key: {e}")))?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(PhpException::default(
+                "TLS: cert_file and key_file must be provided together (or both omitted)"
+                    .to_string(),
+            ));
+        }
+    };
+
+    Ok(cfg)
+}
+
+/// `ClientPolicy` encapsulates parameters for creating a new `Client`. Pass an optional
+/// `ClientPolicy` to `Client::connect(hosts, ?policy)` to control authentication, connection
+/// pooling, cluster tending, IP translation, and TLS.
+///
+/// TLS is opt-in via `set_tls(ca_file, cert_file, key_file, server_name)`. With TLS disabled
+/// (the default), connections are clear-text.
+#[php_class]
+#[php(name = "Aerospike\\ClientPolicy")]
+#[derive(Clone, Default)]
+pub struct ClientPolicy {
+    _as: aero::ClientPolicy,
+    /// SipHash13 of (ca_bytes, cert_bytes, key_bytes, server_name) computed when `set_tls()`
+    /// succeeds. `0` when TLS is disabled. Mixed into `fingerprint()` so two policies with
+    /// the same hosts but different mTLS material do not share a cached Client (this is what
+    /// breaks cert rotation and lets two LDAP users with different certs reuse each other's
+    /// pool).
+    tls_fingerprint: u64,
+}
+
+impl FromZval<'_> for ClientPolicy {
+    const TYPE: DataType = DataType::Mixed;
+
+    fn from_zval(zval: &Zval) -> Option<Self> {
+        let f: &ClientPolicy = zval.extract()?;
+        Some(ClientPolicy {
+            _as: f._as.clone(),
+            tls_fingerprint: f.tls_fingerprint,
+        })
+    }
+}
+
+/// Hashes the raw bytes of CA / client cert / client key files plus the server name to
+/// produce a stable per-process fingerprint of the TLS material. Used by `ClientPolicy`
+/// so cert rotation (or two distinct identities sharing a hosts string) invalidates the
+/// cached `Arc<Client>` instead of silently reusing the previous one.
+fn tls_material_fingerprint(
+    ca: Option<&str>,
+    cert: Option<&str>,
+    key: Option<&str>,
+    server_name: Option<&str>,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    "tls_v1".hash(&mut h);
+    ca.is_some().hash(&mut h);
+    cert.is_some().hash(&mut h);
+    key.is_some().hash(&mut h);
+    server_name.hash(&mut h);
+
+    for path in [ca, cert, key].into_iter().flatten() {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                bytes.len().hash(&mut h);
+                bytes.hash(&mut h);
+            }
+            // If the file is unreadable, `build_tls_config` will surface the IO error to
+            // the caller. Mix the path itself so a missing-file fingerprint still differs
+            // from a clear-text one.
+            Err(_) => path.hash(&mut h),
+        }
+    }
+
+    h.finish()
+}
+
+#[php_impl]
+impl ClientPolicy {
+    pub fn __construct() -> Self {
+        ClientPolicy::default()
+    }
+
+    /// Configure internal authentication. The server stores a hashed password; the client never
+    /// sends the password in clear over the wire. This is the recommended default when running
+    /// against a security-enabled cluster.
+    pub fn set_auth(&mut self, user: String, password: String) {
+        self._as.auth_mode = aero::AuthMode::Internal(user, password);
+    }
+
+    /// Configure external authentication (LDAP). The password is sent in clear at login,
+    /// so `Client::connect()` will throw an `AerospikeException` unless `set_tls(...)`
+    /// has also been called on this policy. The check fires at connect time rather than
+    /// here because the order of `set_auth_external` / `set_tls` calls is up to the user.
+    pub fn set_auth_external(&mut self, user: String, password: String) {
+        self._as.auth_mode = aero::AuthMode::External(user, password);
+    }
+
+    /// Configure PKI authentication. Requires server v5.7+ and TLS configured with a client
+    /// certificate via `set_tls(ca_file, Some(cert_file), Some(key_file), None)`. No
+    /// user/password is required — identity is derived from the certificate.
+    pub fn set_auth_pki(&mut self) {
+        self._as.auth_mode = aero::AuthMode::PKI;
+    }
+
+    /// Disable authentication. The default for an unsecured cluster.
+    pub fn set_auth_none(&mut self) {
+        self._as.auth_mode = aero::AuthMode::None;
+    }
+
+    /// Enable TLS for cluster connections.
+    ///
+    /// * `ca_file` — path to a PEM file with one or more trusted root certificates. When
+    ///   `None`, Mozilla's webpki-roots bundle is used as the trust anchor set.
+    /// * `cert_file` / `key_file` — when both are provided, configure mutual TLS using a
+    ///   client certificate chain (PEM) and a private key (PEM, PKCS#8 / PKCS#1 / SEC1).
+    ///   Provide both or neither; mixing one with the other is rejected.
+    /// * `server_name` — currently unused (rustls validates the SNI/peer name supplied by
+    ///   the aerospike client during connect). Accepted for forward compatibility.
+    ///
+    /// Throws an `AerospikeException` if a file is missing, contains no parseable
+    /// certificates, or the key cannot be loaded. After this call the file contents are
+    /// hashed into `fingerprint()` so cached clients are not reused across cert rotation
+    /// or distinct mTLS identities.
+    pub fn set_tls(
+        &mut self,
+        ca_file: Option<String>,
+        cert_file: Option<String>,
+        key_file: Option<String>,
+        server_name: Option<String>,
+    ) -> PhpResult<()> {
+        let cfg = build_tls_config(
+            ca_file.as_deref(),
+            cert_file.as_deref(),
+            key_file.as_deref(),
+        )?;
+        self.tls_fingerprint = tls_material_fingerprint(
+            ca_file.as_deref(),
+            cert_file.as_deref(),
+            key_file.as_deref(),
+            server_name.as_deref(),
+        );
+        self._as.tls_config = Some(cfg);
+        Ok(())
+    }
+
+    /// Disable TLS, reverting the policy to clear-text connections.
+    pub fn set_tls_none(&mut self) {
+        self._as.tls_config = None;
+        self.tls_fingerprint = 0;
+    }
+
+    /// Returns true if a TLS configuration is attached to this policy.
+    pub fn get_tls_enabled(&self) -> bool {
+        self._as.tls_config.is_some()
+    }
+
+    /// Username for internal or external authentication, if set.
+    pub fn get_user(&self) -> Option<String> {
+        match &self._as.auth_mode {
+            aero::AuthMode::Internal(u, _) | aero::AuthMode::External(u, _) => Some(u.clone()),
+            _ => None,
+        }
+    }
+
+    /// Authentication mode as a lowercase string: "none", "internal", "external", or "pki".
+    pub fn get_auth_mode(&self) -> String {
+        match &self._as.auth_mode {
+            aero::AuthMode::None => "none",
+            aero::AuthMode::Internal(_, _) => "internal",
+            aero::AuthMode::External(_, _) => "external",
+            aero::AuthMode::PKI => "pki",
+        }
+        .into()
+    }
+
+    /// Expected cluster name. If set, server nodes must return this name during cluster tending
+    /// or they are excluded from the cluster view.
+    pub fn get_cluster_name(&self) -> Option<String> {
+        self._as.cluster_name.clone()
+    }
+    pub fn set_cluster_name(&mut self, name: Option<String>) {
+        self._as.cluster_name = name;
+    }
+
+    /// Initial host connection timeout in milliseconds.
+    pub fn get_timeout(&self) -> u32 {
+        self._as.timeout
+    }
+    pub fn set_timeout(&mut self, timeout_millis: u32) {
+        self._as.timeout = timeout_millis;
+    }
+
+    /// Connection idle timeout in milliseconds. Connections idle longer than this are closed
+    /// and discarded from the pool.
+    pub fn get_idle_timeout(&self) -> u32 {
+        self._as.idle_timeout
+    }
+    pub fn set_idle_timeout(&mut self, timeout_millis: u32) {
+        self._as.idle_timeout = timeout_millis;
+    }
+
+    /// Minimum number of connections preallocated per server node.
+    pub fn get_min_conns_per_node(&self) -> u32 {
+        self._as.min_conns_per_node as u32
+    }
+    pub fn set_min_conns_per_node(&mut self, n: u32) {
+        self._as.min_conns_per_node = n as usize;
+    }
+
+    /// Maximum number of synchronous connections allowed per server node.
+    pub fn get_max_conns_per_node(&self) -> u32 {
+        self._as.max_conns_per_node as u32
+    }
+    pub fn set_max_conns_per_node(&mut self, n: u32) {
+        self._as.max_conns_per_node = n as usize;
+    }
+
+    /// Number of connection pools per server node. Higher values reduce contention on
+    /// many-core machines at the cost of more open sockets.
+    pub fn get_conn_pools_per_node(&self) -> u32 {
+        u32::from(self._as.conn_pools_per_node)
+    }
+    pub fn set_conn_pools_per_node(&mut self, n: u32) {
+        self._as.conn_pools_per_node = n.min(255) as u8;
+    }
+
+    /// Throw an exception if the initial host connection fails. Default `true`.
+    pub fn get_fail_if_not_connected(&self) -> bool {
+        self._as.fail_if_not_connected
+    }
+    pub fn set_fail_if_not_connected(&mut self, fail: bool) {
+        self._as.fail_if_not_connected = fail;
+    }
+
+    /// Interval (ms) between cluster-tend checks. Minimum is 10 ms.
+    pub fn get_tend_interval(&self) -> u32 {
+        self._as.tend_interval
+    }
+    pub fn set_tend_interval(&mut self, millis: u32) {
+        self._as.tend_interval = millis;
+    }
+
+    /// Use `services-alternate` in cluster tending instead of `services`. Required when the
+    /// client and server are on different sides of NAT/firewall. Mutually exclusive with `ip_map`.
+    pub fn get_use_services_alternate(&self) -> bool {
+        self._as.use_services_alternate
+    }
+    pub fn set_use_services_alternate(&mut self, alt: bool) {
+        self._as.use_services_alternate = alt;
+    }
+
+    /// IP translation map: server-reported IP → real IP the client should dial. Empty map
+    /// disables translation. Mutually exclusive with `use_services_alternate`.
+    pub fn get_ip_map(&self) -> HashMap<String, String> {
+        self._as.ip_map.clone().unwrap_or_default()
+    }
+    pub fn set_ip_map(&mut self, map: HashMap<String, String>) {
+        self._as.ip_map = if map.is_empty() { None } else { Some(map) };
+    }
+
+    /// Optional application identifier. Used by the server to correlate client operations with
+    /// server-side metrics. Defaults to the auth user when unset.
+    pub fn get_application_id(&self) -> Option<String> {
+        self._as.application_id.clone()
+    }
+    pub fn set_application_id(&mut self, id: Option<String>) {
+        self._as.application_id = id;
+    }
+
+    /// Returns a deterministic fingerprint for this policy used to key the per-process
+    /// client cache. Two policies with the same fingerprint produce equivalent clients and
+    /// may share the cached instance. The password is hashed (never printed in clear) so
+    /// password rotation invalidates the cached client without leaking the secret.
+    ///
+    /// All fields that influence cluster connectivity or behavior are mixed in — a change
+    /// to any of them (e.g. `ip_map`, `tend_interval`, TLS config presence) produces a
+    /// different cache key so the second `Client::connect` call gets a fresh client
+    /// instead of silently reusing a stale one.
+    pub fn fingerprint(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+
+        let auth_mode = self.get_auth_mode();
+        auth_mode.hash(&mut h);
+
+        if let Some(user) = self.get_user() {
+            user.hash(&mut h);
+        }
+        if let aero::AuthMode::Internal(_, p) | aero::AuthMode::External(_, p) = &self._as.auth_mode
+        {
+            p.as_str().hash(&mut h);
+        }
+
+        self._as.cluster_name.hash(&mut h);
+        self._as.timeout.hash(&mut h);
+        self._as.idle_timeout.hash(&mut h);
+        self._as.min_conns_per_node.hash(&mut h);
+        self._as.max_conns_per_node.hash(&mut h);
+        self._as.conn_pools_per_node.hash(&mut h);
+        self._as.use_services_alternate.hash(&mut h);
+        self._as.fail_if_not_connected.hash(&mut h);
+        self._as.tend_interval.hash(&mut h);
+        self._as.buffer_reclaim_threshold.hash(&mut h);
+        self._as.application_id.hash(&mut h);
+
+        // HashMap iteration is unordered: hash a sorted copy so the fingerprint is stable.
+        if let Some(ref m) = self._as.ip_map {
+            let mut entries: Vec<(&String, &String)> = m.iter().collect();
+            entries.sort();
+            entries.hash(&mut h);
+        }
+
+        // rack_ids is a HashSet — sort for deterministic hashing.
+        if let Some(ref rs) = self._as.rack_ids {
+            let mut entries: Vec<usize> = rs.iter().copied().collect();
+            entries.sort_unstable();
+            entries.hash(&mut h);
+        }
+
+        // TLS config does not implement Hash, so we keep a separately-computed digest of
+        // the CA / client cert / key bytes (populated by `set_tls`). This guarantees a
+        // distinct fingerprint per identity, breaking the previous bug where two policies
+        // with different mTLS material but the same `hosts` would share the cached client.
+        self._as.tls_config.is_some().hash(&mut h);
+        self.tls_fingerprint.hash(&mut h);
+
+        format!("{:016x}", h.finish())
     }
 }
 
@@ -9675,421 +7288,271 @@ impl CdtBitwiseOperation {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Instantiate a Client instance to access an Aerospike database cluster and perform database
-/// operations.
-///
-/// The client is thread-safe. Only one client instance should be used per cluster. Multiple
-/// threads should share this cluster instance.
-///
-/// Your application uses this class' API to perform database operations such as writing and
-/// reading records, and selecting sets of records. Write operations include specialized
-/// functionality such as append/prepend and arithmetic addition.
-///
-/// Each record may have multiple bins, unless the Aerospike server nodes are configured as
-/// "single-bin". In "multi-bin" mode, partial records may be written or read by specifying the
-/// relevant subset of bins.
-fn new_aerospike_client(socket: &str) -> PhpResult<grpc::BlockingClient> {
-    let client = grpc::BlockingClient::connect(socket.into()).map_err(|e| e.to_string())?;
-    Ok(client)
+/// Build an `aero::AdminPolicy` from a `total_timeout` (milliseconds). Used to forward
+/// the caller-supplied timeout into operations that internally take `AdminPolicy`
+/// (truncate, index create/drop, UDF register/remove/list).
+fn admin_policy_with_timeout(timeout_ms: u32) -> aero::AdminPolicy {
+    let mut ap = aero::AdminPolicy::default();
+    if timeout_ms > 0 {
+        ap.timeout = timeout_ms;
+    }
+    ap
 }
 
-#[php_class(name = "Aerospike\\Client")]
+/// Helper: convert PHP bin-name list to aero::Bins selector.
+/// `None` or empty list → `Bins::All` (all bins), non-empty list → `Bins::Some(names)`.
+fn php_bins_to_aero(bins: Option<Vec<String>>) -> aero::Bins {
+    match bins {
+        None => aero::Bins::All,
+        Some(ref v) if v.is_empty() => aero::Bins::All,
+        Some(names) => aero::Bins::Some(names),
+    }
+}
+
+#[php_class]
+#[php(name = "Aerospike\\Client")]
 pub struct Client {
-    client: Arc<Mutex<grpc::BlockingClient>>,
-    socket: String,
+    client: Arc<aero::Client>,
+    hosts: String,
+    /// Retained for diagnostics; cache eviction is keyed off the cache map itself.
+    #[allow(dead_code)]
+    policy_fingerprint: String,
 }
 
-/// This trivial implementation of `drop` adds a print to console.
 impl Drop for Client {
     fn drop(&mut self) {
-        trace!("Dropping client: {}, ptr: {:p}", self.socket, &self);
+        trace!("Dropping client: {}, ptr: {:p}", self.hosts, &self);
     }
 }
 
 /// Client encapsulates an Aerospike cluster.
 /// All database operations are available against this object.
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Client {
-    /// Connects to the Aerospike database using the provided socket address.
+    /// Connect to the Aerospike database cluster.
     ///
-    /// If a persisted client object is found for the given socket address, it is returned.
-    /// Otherwise, a new client object is created, persisted, and returned.
+    /// v2 BREAKING: takes a hosts string ("host:port,...") instead of a Unix socket path.
     ///
     /// # Arguments
     ///
-    /// * `socket` - A string representing the socket address of the Aerospike database.
-    ///
-    /// # Returns
-    ///
-    /// * `Err("Error connecting to the database".into())` - If an error occurs during connection.
-    pub fn connect(socket: &str) -> PhpResult<Zval> {
-        match get_persisted_client(socket) {
-            Some(c) => {
-                trace!("Found Aerospike Client object for {}", socket);
-                return Ok(c);
+    /// * `hosts` - Comma-separated list of host:port pairs, e.g. "127.0.0.1:3000"
+    /// * `policy` - Optional client policy controlling auth, pool sizes, timeouts, etc.
+    pub fn connect(hosts: &str, policy: Option<&ClientPolicy>) -> PhpResult<Zval> {
+        let fp = policy.map(|p| p.fingerprint()).unwrap_or_default();
+        let cache_key = format!("{hosts}|{fp}");
+
+        // Single critical section: lookup + insert under the same lock guards against the
+        // ZTS race where two threads simultaneously miss the cache and each build a fresh
+        // client (with its own connection pool). The first writer wins; subsequent waiters
+        // observe the cached entry and skip the expensive `aero::Client::new`.
+        {
+            let mut clients = CLIENTS
+                .lock()
+                .map_err(|_| PhpException::default("client cache mutex poisoned".into()))?;
+
+            if let Some(entry) = clients.get(&cache_key) {
+                trace!("Found Aerospike Client object for {hosts}");
+                return zval_from_entry(entry);
             }
-            None => (),
-        }
 
-        trace!("Creating a new Aerospike Client object for {}", socket);
+            trace!("Creating a new Aerospike Client object for {hosts}");
+            let aero_policy = policy.map(|p| p._as.clone()).unwrap_or_default();
 
-        let c = Arc::new(Mutex::new(new_aerospike_client(&socket)?));
-
-        // check if version numbers match
-        let request = tonic::Request::new(proto::AerospikeVersionRequest {});
-        let grpcClient = c.clone();
-        let mut client = grpcClient.lock().unwrap();
-        let res = client.version(request).map_err(|e| e.to_string())?;
-        // Or match the comparison operators
-        let vClient = Version::from(VERSION).unwrap();
-        let vServer = Version::from(&res.get_ref().version).unwrap();
-        if vServer.compare(&vClient) != Cmp::Eq {
-            return Err(format!(
-                "Rust Client version `{}` does not match the connection manager version `{}`",
-                vClient, vServer,
-            )
-            .into());
-        };
-
-        persist_client(socket, c)?;
-
-        match get_persisted_client(socket) {
-            Some(c) => {
-                return Ok(c);
+            // External (LDAP) auth sends the password in clear at login — refuse to connect
+            // if TLS is not configured. We enforce this here (rather than in
+            // `set_auth_external`) so the user can set TLS and auth in either order.
+            if matches!(aero_policy.auth_mode, aero::AuthMode::External(_, _))
+                && aero_policy.tls_config.is_none()
+            {
+                return throw_msg(
+                    "AuthMode::External requires TLS — call ClientPolicy::setTls() before connect()",
+                    Zval::new(),
+                );
             }
-            None => Err("Error connecting to the database".into()),
+
+            let c = {
+                let _guard = TOKIO_RT.enter();
+                match aero::Client::new(&aero_policy, &hosts) {
+                    Ok(c) => Arc::new(c),
+                    // Preserve the structured AerospikeException (code + in_doubt) instead
+                    // of flattening to a string with `e.to_string()`.
+                    Err(e) => return throw_aero_error(&e, Zval::new()),
+                }
+            };
+
+            let entry = ClientEntry {
+                client: c,
+                hosts: hosts.to_string(),
+                policy_fingerprint: fp,
+            };
+            let inserted = clients.entry(cache_key.clone()).or_insert(entry);
+            zval_from_entry(inserted)
         }
     }
 
-    /// Retrieves the socket address associated with this client.
-    ///
-    /// # Returns
-    ///
-    /// A string representing the socket address.
-    #[getter]
-    pub fn socket(&self) -> String {
-        self.socket.clone()
+    /// Returns the hosts string this client was connected to.
+    pub fn get_hosts(&self) -> String {
+        self.hosts.clone()
+    }
+
+    /// v1 compatibility shim: forwards `$client->hosts` to `getHosts()`.
+    pub fn __get(&self, name: &str) -> PhpResult<Zval> {
+        let mut zv = Zval::new();
+        match name {
+            "hosts" => zv.set_string(&self.get_hosts(), false)?,
+            _ => zv.set_null(),
+        }
+        Ok(zv)
     }
 
     /// Write record bin(s). The policy specifies the transaction timeout, record expiration and
     /// how the transaction is handled when the record already exists.
     pub fn put(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
-        let bins: Vec<proto::Bin> = bins.into_iter().map(|b| b.into()).collect();
-
-        let request = tonic::Request::new(proto::AerospikePutRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-            bins: bins.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.put(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::Error {
-                result_code: 0,
-                in_doubt: _,
-            } => Ok(()),
-            pe => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
+        let _guard = TOKIO_RT.enter();
+        match self.client.put(&policy._as, &key._as, &aero_bins) {
+            Ok(()) => Ok(()),
+            Err(e) => throw_aero_error(&e, ()),
         }
     }
 
     /// Read record for the specified key. Depending on the bins value provided, all record bins,
-    /// only selected record bins or only the record headers will be returned. The policy can be
-    /// used to specify timeouts.
+    /// only selected record bins or only the record headers will be returned.
     pub fn get(
-        &mut self,
+        &self,
         policy: &ReadPolicy,
         key: &Key,
         bins: Option<Vec<String>>,
     ) -> PhpResult<Option<Record>> {
-        let request = tonic::Request::new(proto::AerospikeGetRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-            bin_names: bins.unwrap_or(vec![]),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.get(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeSingleResponse {
-                error: None,
-                record: Some(rec),
-            } => Ok(Some(Record {
-                _as: (*rec).clone(),
-            })),
-            // Not found: Do not throw an exception
-            proto::AerospikeSingleResponse {
-                error:
-                    Some(proto::Error {
-                        result_code: ResultCode::KEY_NOT_FOUND_ERROR,
-                        in_doubt: false,
-                    }),
-                record: None,
-            } => Ok(None),
-            proto::AerospikeSingleResponse {
-                error: Some(pe),
-                record: None,
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(None)
-            }
-            _ => unreachable!(),
+        let aero_bins = php_bins_to_aero(bins);
+        let _guard = TOKIO_RT.enter();
+        match self.client.get(&policy._as, &key._as, aero_bins) {
+            Ok(record) => Ok(Some(Record { _as: record })),
+            Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
+            Err(e) => throw_aero_error(&e, None),
         }
     }
 
-    /// Read record for the specified key. Depending on the bins value provided, all record bins,
-    /// only selected record bins or only the record headers will be returned. The policy can be
-    /// used to specify timeouts.
-    pub fn get_header(&mut self, policy: &ReadPolicy, key: &Key) -> PhpResult<Option<Record>> {
-        let request = tonic::Request::new(proto::AerospikeGetHeaderRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.get_header(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeSingleResponse {
-                error: None,
-                record: Some(rec),
-            } => Ok(Some(Record {
-                _as: (*rec).clone(),
-            })),
-            // Not found: Do not throw an exception
-            proto::AerospikeSingleResponse {
-                error:
-                    Some(proto::Error {
-                        result_code: ResultCode::KEY_NOT_FOUND_ERROR,
-                        in_doubt: false,
-                    }),
-                record: None,
-            } => Ok(None),
-            proto::AerospikeSingleResponse {
-                error: Some(pe),
-                record: None,
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(None)
-            }
-            _ => unreachable!(),
+    /// Read record header (generation, expiration) only. No bins are returned.
+    pub fn get_header(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<Option<Record>> {
+        let _guard = TOKIO_RT.enter();
+        match self.client.get(&policy._as, &key._as, aero::Bins::None) {
+            Ok(record) => Ok(Some(Record { _as: record })),
+            Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
+            Err(e) => throw_aero_error(&e, None),
         }
     }
 
-    /// Add integer bin values to existing record bin values. The policy specifies the transaction
-    /// timeout, record expiration and how the transaction is handled when the record already
-    /// exists. This call only works for integer values.
+    /// Add integer bin values to existing record bin values.
     pub fn add(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
-        let bins: Vec<proto::Bin> = bins.into_iter().map(|b| b.into()).collect();
-
-        let request = tonic::Request::new(proto::AerospikePutRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-            bins: bins.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.add(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::Error {
-                result_code: 0,
-                in_doubt: _,
-            } => Ok(()),
-            pe => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
+        let _guard = TOKIO_RT.enter();
+        match self.client.add(&policy._as, &key._as, &aero_bins) {
+            Ok(()) => Ok(()),
+            Err(e) => throw_aero_error(&e, ()),
         }
     }
 
-    /// Append bin string values to existing record bin values. The policy specifies the
-    /// transaction timeout, record expiration and how the transaction is handled when the record
-    /// already exists. This call only works for string values.
+    /// Append bin string values to existing record bin values.
     pub fn append(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
-        let bins: Vec<proto::Bin> = bins.into_iter().map(|b| b.into()).collect();
-
-        let request = tonic::Request::new(proto::AerospikePutRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-            bins: bins.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.append(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::Error {
-                result_code: 0,
-                in_doubt: _,
-            } => Ok(()),
-            pe => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
+        let _guard = TOKIO_RT.enter();
+        match self.client.append(&policy._as, &key._as, &aero_bins) {
+            Ok(()) => Ok(()),
+            Err(e) => throw_aero_error(&e, ()),
         }
     }
 
-    /// Prepend bin string values to existing record bin values. The policy specifies the
-    /// transaction timeout, record expiration and how the transaction is handled when the record
-    /// already exists. This call only works for string values.
+    /// Prepend bin string values to existing record bin values.
     pub fn prepend(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
-        let bins: Vec<proto::Bin> = bins.into_iter().map(|b| b.into()).collect();
-
-        let request = tonic::Request::new(proto::AerospikePutRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-            bins: bins.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.prepend(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::Error { result_code: 0, .. } => Ok(()),
-            pe => {
-                let error: AerospikeException = pe.into();
-                Ok(throw_object(error.into_zval(false)?)?)
-            }
+        let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
+        let _guard = TOKIO_RT.enter();
+        match self.client.prepend(&policy._as, &key._as, &aero_bins) {
+            Ok(()) => Ok(()),
+            Err(e) => throw_aero_error(&e, ()),
         }
     }
 
-    /// Delete record for specified key. The policy specifies the transaction timeout.
-    /// The call returns `true` if the record existed on the server before deletion.
+    /// Delete record for specified key. Returns `true` if the record existed before deletion.
     pub fn delete(&self, policy: &WritePolicy, key: &Key) -> PhpResult<bool> {
-        let request = tonic::Request::new(proto::AerospikeDeleteRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.delete(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeDeleteResponse {
-                error: None,
-                existed,
-            } => Ok(existed.is_some()),
-            proto::AerospikeDeleteResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(false)
-            }
+        let _guard = TOKIO_RT.enter();
+        match self.client.delete(&policy._as, &key._as) {
+            Ok(existed) => Ok(existed),
+            Err(e) => throw_aero_error(&e, false),
         }
     }
 
-    /// Reset record's time to expiration using the policy's expiration. Fail if the record does
-    /// not exist.
+    /// Reset record's time to expiration using the policy's expiration.
     pub fn touch(&self, policy: &WritePolicy, key: &Key) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeTouchRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.touch(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::Error { result_code: 0, .. } => Ok(()),
-            pe => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let _guard = TOKIO_RT.enter();
+        match self.client.touch(&policy._as, &key._as) {
+            Ok(()) => Ok(()),
+            Err(e) => throw_aero_error(&e, ()),
         }
     }
 
-    /// Determine if a record key exists. The policy can be used to specify timeouts.
+    /// Determine if a record key exists.
     pub fn exists(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<bool> {
-        let request = tonic::Request::new(proto::AerospikeExistsRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.exists(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeExistsResponse {
-                error: None,
-                exists,
-            } => Ok(exists.unwrap()),
-            proto::AerospikeExistsResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(false)
-            }
+        let _guard = TOKIO_RT.enter();
+        match self.client.exists(&policy._as, &key._as) {
+            Ok(exists) => Ok(exists),
+            Err(e) => throw_aero_error(&e, false),
         }
     }
 
-    /// BatchExecute will read/write multiple records for specified batch keys in one batch call.
-    /// This method allows different namespaces/bins for each key in the batch.
-    /// The returned records are located in the same list.
+    /// Apply a list of `Operation` instances to a single record atomically on the server.
     ///
-    /// BatchRecord can be *BatchRead, *BatchWrite, *BatchDelete or *BatchUDF.
+    /// Use this for CDT list/map/bitwise/HLL operations and for combined read/write/touch
+    /// flows on one key. For multi-key batches use `batch()` with `BatchWrite`/`BatchRead`.
     ///
-    /// Requires server version 6.0+
+    /// Returns the record assembled from operation results (some ops return nothing, some
+    /// return a value into the named bin), or `None` when the operations produced no
+    /// readable output and the underlying record was not present.
+    pub fn operate(
+        &self,
+        policy: &WritePolicy,
+        key: &Key,
+        ops: Vec<&Operation>,
+    ) -> PhpResult<Option<Record>> {
+        let aero_ops: Vec<aero::operations::Operation> =
+            ops.iter().map(|o| o._as.clone()).collect();
+        let _guard = TOKIO_RT.enter();
+        match self.client.operate(&policy._as, &key._as, &aero_ops) {
+            Ok(record) => Ok(Some(Record { _as: record })),
+            Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
+            Err(e) => throw_aero_error(&e, None),
+        }
+    }
+
+    /// Execute read/write operations on multiple records in one batch call.
+    /// Each element in `cmds` must be a BatchRead, BatchWrite, BatchDelete, or BatchUdf object.
+    /// Requires server version 6.0+.
     pub fn batch(&self, policy: &BatchPolicy, cmds: Vec<&Zval>) -> PhpResult<Vec<BatchRecord>> {
-        let mut res = Vec::<proto::BatchOperate>::with_capacity(cmds.len());
-        cmds.into_iter().for_each(|v| {
-            if let Some(&BatchRead { ref _as }) = v.extract() {
-                res.push(proto::BatchOperate {
-                    br: Some((*_as).clone()),
-                    ..proto::BatchOperate::default()
-                });
-            } else if let Some(&BatchWrite { ref _as }) = v.extract() {
-                res.push(proto::BatchOperate {
-                    bw: Some((*_as).clone()),
-                    ..proto::BatchOperate::default()
-                });
-            } else if let Some(&BatchDelete { ref _as }) = v.extract() {
-                res.push(proto::BatchOperate {
-                    bd: Some((*_as).clone()),
-                    ..proto::BatchOperate::default()
-                });
-            } else if let Some(&BatchUdf { ref _as }) = v.extract() {
-                res.push(proto::BatchOperate {
-                    bu: Some((*_as).clone()),
-                    ..proto::BatchOperate::default()
-                });
+        let mut batch_ops = Vec::<aero::BatchOperation>::with_capacity(cmds.len());
+        for v in &cmds {
+            if let Some(br) = v.extract::<&BatchRead>() {
+                batch_ops.push(br._as.clone());
+            } else if let Some(bw) = v.extract::<&BatchWrite>() {
+                batch_ops.push(bw._as.clone());
+            } else if let Some(bd) = v.extract::<&BatchDelete>() {
+                batch_ops.push(bd._as.clone());
+            } else if let Some(bu) = v.extract::<&BatchUdf>() {
+                batch_ops.push(bu._as.clone());
             } else {
-                let error = AerospikeException::new("Invalid Batch command".into());
-                let _ = throw_object(error.into_zval(true).unwrap());
+                return throw_msg("Invalid Batch command", vec![]);
             }
-        });
-
-        let request = tonic::Request::new(proto::AerospikeBatchOperateRequest {
-            policy: Some(policy._as.clone()),
-            records: res,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.batch_operate(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeBatchOperateResponse {
-                error: None,
-                records,
-            } => Ok(records
+        }
+        let _guard = TOKIO_RT.enter();
+        match self.client.batch(&policy._as, &batch_ops) {
+            Ok(results) => Ok(results
                 .into_iter()
-                .map(|v| BatchRecord { _as: (*v).clone() })
+                .map(|br| BatchRecord { _as: br })
                 .collect()),
-            proto::AerospikeBatchOperateResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(vec![])
-            }
+            Err(e) => throw_aero_error(&e, vec![]),
         }
     }
 
-    /// Removes all records in the specified namespace/set efficiently.
+    /// Remove all records in the specified namespace/set efficiently.
     pub fn truncate(
         &self,
         policy: &InfoPolicy,
@@ -10097,103 +7560,79 @@ impl Client {
         set_name: &str,
         before_nanos: Option<i64>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeTruncateRequest {
-            policy: Some(policy._as.clone()),
-            namespace: namespace.into(),
-            set_name: set_name.into(),
-            before_nanos: before_nanos,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.truncate(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeTruncateResponse { error: None } => Ok(()),
-            proto::AerospikeTruncateResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let admin = admin_policy_with_timeout(policy.timeout);
+        let _guard = TOKIO_RT.enter();
+        match self
+            .client
+            .truncate(&admin, namespace, set_name, before_nanos.unwrap_or(0))
+        {
+            Ok(()) => Ok(()),
+            Err(e) => throw_aero_error(&e, ()),
         }
     }
 
-    /// Read all records in the specified namespace and set and return a record iterator. The scan
-    /// executor puts records on a queue in separate threads. The calling thread concurrently pops
-    /// records off the queue through the record iterator. Up to `policy.max_concurrent_nodes`
-    /// nodes are scanned in parallel. If concurrent nodes is set to zero, the server nodes are
-    /// read in series.
+    /// Read all records in the specified namespace and set. In v2, scan is implemented
+    /// as a query with no secondary-index filters.
+    ///
+    /// The `partition_filter` doubles as a cursor — when the returned `Recordset` is
+    /// exhausted, its post-scan state is written back into the original `PartitionFilter`
+    /// so a subsequent `scan()` with the same instance resumes from the next digest. Use
+    /// `ScanPolicy::setMaxRecords(...)` to bound each page.
     pub fn scan(
         &self,
         policy: &ScanPolicy,
-        mut partition_filter: PartitionFilter,
+        partition_filter: PartitionFilter,
         namespace: &str,
         set_name: &str,
         bins: Option<Vec<String>>,
     ) -> PhpResult<Recordset> {
-        let res = {
-            let pf = partition_filter._as.lock().unwrap();
-            let request = tonic::Request::new(proto::AerospikeScanRequest {
-                policy: Some(policy._as.clone()),
-                namespace: namespace.into(),
-                set_name: set_name.into(),
-                bin_names: bins.unwrap_or(vec![]),
-                partition_filter: Some(pf.clone()),
-            });
-
-            let mut client = self.client.lock().unwrap();
-            client.scan(request).map_err(|e| e.to_string())?
-        };
-
-        // init the partition_status status
-        // we late init it to avoid sending it to the server when the value is default
-        // since it will be initialized there anyway
-        partition_filter.init_partition_status();
-
-        Ok(Recordset {
-            _as: Some(res.into_inner()),
-            client: self.client.clone(),
-            partition_filter: partition_filter,
-        })
+        let aero_bins = php_bins_to_aero(bins);
+        let stmt = aero::Statement::new(namespace, set_name, aero_bins);
+        let pf_arc = partition_filter._as.clone();
+        let pf = pf_arc
+            .lock()
+            .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
+            .clone();
+        let _guard = TOKIO_RT.enter();
+        match self.client.query(&policy._as, pf, stmt) {
+            Ok(arc_rs) => Ok(Recordset {
+                _as: Some(arc_rs),
+                partition_filter: Some(pf_arc),
+                pf_synced: false,
+            }),
+            Err(e) => throw_aero_error(&e, Recordset::default()),
+        }
     }
 
-    /// Execute a query on all server nodes and return a record iterator. The query executor puts
-    /// records on a queue in separate threads. The calling thread concurrently pops records off
-    /// the queue through the record iterator.
+    /// Execute a query on all server nodes and return a record iterator. See `scan()` for
+    /// pagination semantics around `PartitionFilter`.
     pub fn query(
         &self,
         policy: &QueryPolicy,
-        mut partition_filter: PartitionFilter,
+        partition_filter: PartitionFilter,
         statement: &mut Statement,
     ) -> PhpResult<Recordset> {
-        let res = {
-            let pf = partition_filter._as.lock().unwrap();
-            let request = tonic::Request::new(proto::AerospikeQueryRequest {
-                policy: Some(policy._as.clone()),
-                partition_filter: Some(pf.clone()),
-                statement: statement._as.clone().into(),
-            });
-
-            let mut client = self.client.lock().unwrap();
-            client.query(request).map_err(|e| e.to_string())?
-        };
-
-        // init the partition_status status
-        // we late init it to avoid sending it to the server when the value is default
-        // since it will be initialized there anyway
-        partition_filter.init_partition_status();
-
-        Ok(Recordset {
-            _as: Some(res.into_inner()),
-            client: self.client.clone(),
-            partition_filter: partition_filter,
-        })
+        let stmt = statement._as.clone();
+        let pf_arc = partition_filter._as.clone();
+        let pf = pf_arc
+            .lock()
+            .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
+            .clone();
+        let _guard = TOKIO_RT.enter();
+        match self.client.query(&policy._as, pf, stmt) {
+            Ok(arc_rs) => Ok(Recordset {
+                _as: Some(arc_rs),
+                partition_filter: Some(pf_arc),
+                pf_synced: false,
+            }),
+            Err(e) => throw_aero_error(&e, Recordset::default()),
+        }
     }
 
-    /// CreateIndex creates a secondary index.
-    /// This asynchronous server call will return before the command is complete.
-    /// The user can optionally wait for command completion by using the returned
-    /// IndexTask instance.
-    /// This method is only supported by Aerospike 3+ servers.
-    /// If the policy is nil, the default relevant policy will be used.
+    /// Create a secondary index on a bin.
+    ///
+    /// v2 BREAKING: `ctx` is currently ignored; the underlying aerospike crate does not yet
+    /// expose ctx-aware index creation through `create_index_on_bin`.
     pub fn create_index(
         &self,
         policy: &WritePolicy,
@@ -10203,38 +7642,32 @@ impl Client {
         index_name: &str,
         index_type: &IndexType,
         cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
+        _ctx: Option<Vec<&CDTContext>>,
     ) -> PhpResult<()> {
-        let ictDefault = &IndexCollectionType::Default();
-        let cit = cit.unwrap_or(ictDefault);
-        let request = tonic::Request::new(proto::AerospikeCreateIndexRequest {
-            policy: Some(policy._as.clone()),
-            namespace: namespace.into(),
-            set_name: set_name.into(),
-            index_name: index_name.into(),
-            bin_name: bin_name.into(),
-            index_type: index_type._as.into(),
-            index_collection_type: cit._as.into(),
-            ctx: ctx
-                .map(|ctx| ctx.iter().map(|ctx| ctx._as.clone()).collect())
-                .unwrap_or(vec![]),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.create_index(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeCreateIndexResponse { error: None } => Ok(()),
-            proto::AerospikeCreateIndexResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
+        let cit_val = cit
+            .map(|c| c._as.clone())
+            .unwrap_or(aero::CollectionIndexType::Default);
+        let task = match TOKIO_RT.block_on(self.client.create_index_on_bin(
+            &admin,
+            namespace,
+            set_name,
+            bin_name,
+            index_name,
+            index_type._as.clone(),
+            cit_val,
+            None,
+        )) {
+            Ok(t) => t,
+            Err(e) => return throw_aero_error(&e, ()),
+        };
+        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// DropIndex deletes a secondary index. It will block until index is dropped on all nodes.
-    /// This method is only supported by Aerospike 3+ servers.
-    /// If the policy is nil, the default relevant policy will be used.
+    /// Delete a secondary index.
     pub fn drop_index(
         &self,
         policy: &WritePolicy,
@@ -10242,32 +7675,24 @@ impl Client {
         set_name: &str,
         index_name: &str,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeDropIndexRequest {
-            policy: Some(policy._as.clone()),
-            namespace: namespace.into(),
-            set_name: set_name.into(),
-            index_name: index_name.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.drop_index(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeDropIndexResponse { error: None } => Ok(()),
-            proto::AerospikeDropIndexResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
+        let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
+        let task = {
+            let _guard = TOKIO_RT.enter();
+            match self
+                .client
+                .drop_index(&admin, namespace, set_name, index_name)
+            {
+                Ok(t) => t,
+                Err(e) => return throw_aero_error(&e, ()),
             }
+        };
+        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
     /// RegisterUDF registers a package containing user defined functions with server.
-    /// This asynchronous server call will return before command is complete.
-    /// The user can optionally wait for command completion by using the returned
-    /// RegisterTask instance.
-    ///
-    /// This method is only supported by Aerospike 3+ servers.
-    /// If the policy is nil, the default relevant policy will be used.
     pub fn register_udf(
         &self,
         policy: &WritePolicy,
@@ -10275,86 +7700,104 @@ impl Client {
         package_name: &str,
         language: Option<UdfLanguage>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeRegisterUdfRequest {
-            policy: Some(policy._as.clone()),
-            udf_body: udf_body.into(),
-            package_name: package_name.into(),
-            language: language.unwrap_or(UdfLanguage::Lua()).into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.register_udf(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeRegisterUdfResponse { error: None } => Ok(()),
-            proto::AerospikeRegisterUdfResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
+        let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
+        let lang = language.map(|l| l._as).unwrap_or(aero::UDFLang::Lua);
+        let task = {
+            let _guard = TOKIO_RT.enter();
+            match self
+                .client
+                .register_udf(&admin, udf_body.as_bytes(), package_name, lang)
+            {
+                Ok(t) => t,
+                Err(e) => return throw_aero_error(&e, ()),
             }
+        };
+        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// DropUDF removes a package containing user defined functions in the server.
-    /// This asynchronous server call will return before command is complete.
-    /// The user can optionally wait for command completion by using the returned
-    /// RemoveTask instance.
-    ///
-    /// This method is only supported by Aerospike 3+ servers.
-    /// If the policy is nil, the default relevant policy will be used.
     pub fn drop_udf(&self, policy: &WritePolicy, package_name: &str) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeDropUdfRequest {
-            policy: Some(policy._as.clone()),
-            package_name: package_name.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.drop_udf(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeDropUdfResponse { error: None } => Ok(()),
-            proto::AerospikeDropUdfResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
+        let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
+        let task = {
+            let _guard = TOKIO_RT.enter();
+            match self.client.remove_udf(&admin, package_name) {
+                Ok(t) => t,
+                Err(e) => return throw_aero_error(&e, ()),
             }
+        };
+        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// ListUDF lists all packages containing user defined functions in the server.
-    /// This method is only supported by Aerospike 3+ servers.
-    /// If the policy is nil, the default relevant policy will be used.
     pub fn list_udf(&self, policy: &ReadPolicy) -> PhpResult<Vec<UdfMeta>> {
-        let request = tonic::Request::new(proto::AerospikeListUdfRequest {
-            policy: Some(policy._as.clone()),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.list_udf(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeListUdfResponse {
-                error: None,
-                udf_list,
-            } => Ok(udf_list
-                .into_iter()
-                .map(|v| UdfMeta { _as: (*v).clone() })
-                .collect()),
-            proto::AerospikeListUdfResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(vec![])
+        let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
+        let nodes = self.client.nodes();
+        let node = match nodes.first() {
+            Some(n) => n.clone(),
+            None => return Ok(vec![]),
+        };
+        let result = match TOKIO_RT.block_on(node.info(&admin, &["udf-list"])) {
+            Ok(r) => r,
+            Err(e) => return throw_aero_error(&e, vec![]),
+        };
+        let raw = result.get("udf-list").map(String::as_str).unwrap_or("");
+        let mut udfs = Vec::new();
+        for entry in raw.split(';') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let mut filename = String::new();
+            let mut hash = String::new();
+            let mut language = String::new();
+            for field in entry.split(',') {
+                if let Some((k, v)) = field.split_once('=') {
+                    match k {
+                        "filename" => filename = v.to_string(),
+                        "hash" => hash = v.to_string(),
+                        "type" => language = v.to_lowercase(),
+                        _ => {}
+                    }
+                }
+            }
+            if !filename.is_empty() {
+                let package_name = filename
+                    .strip_suffix(".lua")
+                    .unwrap_or(&filename)
+                    .to_string();
+                udfs.push(UdfMeta {
+                    package_name,
+                    hash,
+                    language,
+                });
             }
         }
+        Ok(udfs)
     }
 
-    /// Execute executes a user defined function on server and return results.
-    /// The function operates on a single record.
-    /// The package name is used to locate the udf file location:
-    ///
-    /// udf file = <server udf dir>/<package name>.lua
-    ///
-    /// This method is only supported by Aerospike 3+ servers.
-    /// If the policy is nil, the default relevant policy will be used.
+    /// Returns the server build version string for each node in the cluster.
+    /// The returned HashMap maps node name (host:port) to version string (e.g. "7.0.0.1").
+    pub fn server_version(&self) -> PhpResult<HashMap<String, String>> {
+        let nodes = self.client.nodes();
+        let mut versions = std::collections::HashMap::new();
+        for node in &nodes {
+            match TOKIO_RT.block_on(node.info(&aero::AdminPolicy::default(), &["build"])) {
+                Ok(result) => {
+                    let ver = result.get("build").cloned().unwrap_or_default();
+                    versions.insert(node.name().to_string(), ver);
+                }
+                Err(_) => {
+                    versions.insert(node.name().to_string(), String::new());
+                }
+            }
+        }
+        Ok(versions)
+    }
+
     pub fn udf_execute(
         &self,
         policy: &WritePolicy,
@@ -10363,33 +7806,23 @@ impl Client {
         function_name: String,
         args: Vec<PHPValue>,
     ) -> PhpResult<PHPValue> {
-        let args: Vec<proto::Value> = args.into_iter().map(|v| v.into()).collect();
-
-        let request = tonic::Request::new(proto::AerospikeUdfExecuteRequest {
-            policy: Some(policy._as.clone()),
-            key: Some(key._as.clone()),
-            package_name: package_name,
-            function_name: function_name,
-            args: args.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.udf_execute(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeUdfExecuteResponse {
-                error: None,
-                result,
-            } => Ok(match result {
-                Some(v) => v.clone().into(),
-                None => PHPValue::Nil,
-            }),
-            proto::AerospikeUdfExecuteResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(Value::nil())
-            }
+        let aero_args: Vec<aero::Value> = args.into_iter().map(aero::Value::from).collect();
+        let args_ref: Option<&[aero::Value]> = if aero_args.is_empty() {
+            None
+        } else {
+            Some(&aero_args)
+        };
+        let _guard = TOKIO_RT.enter();
+        match self.client.execute_udf(
+            &policy._as,
+            &key._as,
+            &package_name,
+            &function_name,
+            args_ref,
+        ) {
+            Ok(Some(v)) => Ok(PHPValue::from(v)),
+            Ok(None) => Ok(PHPValue::Nil),
+            Err(e) => throw_aero_error(&e, PHPValue::Nil),
         }
     }
 
@@ -10397,8 +7830,6 @@ impl Client {
     // User administration
     //-------------------------------------------------------
 
-    /// CreateUser creates a new user with password and roles. Clear-text password will be hashed using bcrypt
-    /// before sending to server.
     pub fn create_user(
         &self,
         policy: &AdminPolicy,
@@ -10406,177 +7837,88 @@ impl Client {
         password: String,
         roles: Vec<String>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeCreateUserRequest {
-            policy: Some(policy._as.clone()),
-            user: user.into(),
-            password: password.into(),
-            roles: roles.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.create_user(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeCreateUserResponse { error: None } => Ok(()),
-            proto::AerospikeCreateUserResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
+        if let Err(e) =
+            TOKIO_RT.block_on(
+                self.client
+                    .create_user(&policy._as, &user, &password, &roles_ref),
+            )
+        {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// DropUser removes a user from the cluster.
     pub fn drop_user(&self, policy: &AdminPolicy, user: String) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeDropUserRequest {
-            policy: Some(policy._as.clone()),
-            user: user.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.drop_user(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeDropUserResponse { error: None } => Ok(()),
-            proto::AerospikeDropUserResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        if let Err(e) = TOKIO_RT.block_on(self.client.drop_user(&policy._as, &user)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// ChangePassword changes a user's password. Clear-text password will be hashed using bcrypt before sending to server.
     pub fn change_password(
         &self,
         policy: &AdminPolicy,
         user: String,
         password: String,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeChangePasswordRequest {
-            policy: Some(policy._as.clone()),
-            user: user.into(),
-            password: password.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.change_password(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeChangePasswordResponse { error: None } => Ok(()),
-            proto::AerospikeChangePasswordResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        if let Err(e) =
+            TOKIO_RT.block_on(self.client.change_password(&policy._as, &user, &password))
+        {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// GrantRoles adds roles to user's list of roles.
     pub fn grant_roles(
         &self,
         policy: &AdminPolicy,
         user: String,
         roles: Vec<String>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeGrantRolesRequest {
-            policy: Some(policy._as.clone()),
-            user: user.into(),
-            roles: roles.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.grant_roles(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeGrantRolesResponse { error: None } => Ok(()),
-            proto::AerospikeGrantRolesResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
+        if let Err(e) = TOKIO_RT.block_on(self.client.grant_roles(&policy._as, &user, &roles_ref)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// RevokeRoles removes roles from user's list of roles.
     pub fn revoke_roles(
         &self,
         policy: &AdminPolicy,
         user: String,
         roles: Vec<String>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeRevokeRolesRequest {
-            policy: Some(policy._as.clone()),
-            user: user.into(),
-            roles: roles.into(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.revoke_roles(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeRevokeRolesResponse { error: None } => Ok(()),
-            proto::AerospikeRevokeRolesResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
+        if let Err(e) = TOKIO_RT.block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))
+        {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// QueryUser retrieves roles for a given user.
     pub fn query_users(
         &self,
         policy: &AdminPolicy,
         user: Option<String>,
     ) -> PhpResult<Vec<UserRole>> {
-        let request = tonic::Request::new(proto::AerospikeQueryUsersRequest {
-            policy: Some(policy._as.clone()),
-            user: user,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.query_users(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeQueryUsersResponse {
-                error: None,
-                user_roles,
-            } => Ok(user_roles.iter().map(|v| v.into()).collect()),
-            proto::AerospikeQueryUsersResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(vec![])
-            }
+        match TOKIO_RT.block_on(self.client.query_users(&policy._as, user.as_deref())) {
+            Ok(users) => Ok(users.into_iter().map(UserRole::from).collect()),
+            Err(e) => throw_aero_error(&e, vec![]),
         }
     }
 
-    /// QueryRole retrieves privileges for a given role.
     pub fn query_roles(
         &self,
         policy: &AdminPolicy,
         role_name: Option<String>,
     ) -> PhpResult<Vec<Role>> {
-        let request = tonic::Request::new(proto::AerospikeQueryRolesRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.query_roles(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeQueryRolesResponse { error: None, roles } => {
-                Ok(roles.iter().map(|v| v.into()).collect())
-            }
-            proto::AerospikeQueryRolesResponse {
-                error: Some(pe), ..
-            } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(vec![])
-            }
+        match TOKIO_RT.block_on(self.client.query_roles(&policy._as, role_name.as_deref())) {
+            Ok(roles) => Ok(roles.into_iter().map(Role::from).collect()),
+            Err(e) => throw_aero_error(&e, vec![]),
         }
     }
 
-    /// CreateRole creates a user-defined role.
-    /// Quotas require server security configuration "enable-quotas" to be set to true.
-    /// Pass 0 for quota values for no limit.
     pub fn create_role(
         &self,
         policy: &AdminPolicy,
@@ -10586,128 +7928,79 @@ impl Client {
         read_quota: u32,
         write_quota: u32,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeCreateRoleRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-            privileges: privileges.iter().map(|v| v._as.clone()).collect(),
-            allowlist: allowlist,
-            read_quota: read_quota,
-            write_quota: write_quota,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.create_role(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeCreateRoleResponse { error: None } => Ok(()),
-            proto::AerospikeCreateRoleResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
+        let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
+        if let Err(e) = TOKIO_RT.block_on(self.client.create_role(
+            &policy._as,
+            &role_name,
+            &privs,
+            &allowlist_ref,
+            read_quota,
+            write_quota,
+        )) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// DropRole removes a user-defined role.
     pub fn drop_role(&self, policy: &AdminPolicy, role_name: String) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeDropRoleRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.drop_role(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeDropRoleResponse { error: None } => Ok(()),
-            proto::AerospikeDropRoleResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        if let Err(e) = TOKIO_RT.block_on(self.client.drop_role(&policy._as, &role_name)) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// GrantPrivileges grant privileges to a user-defined role.
     pub fn grant_privileges(
         &self,
         policy: &AdminPolicy,
         role_name: String,
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeGrantPrivilegesRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-            privileges: privileges.iter().map(|v| v._as.clone()).collect(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client
-            .grant_privileges(request)
-            .map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeGrantPrivilegesResponse { error: None } => Ok(()),
-            proto::AerospikeGrantPrivilegesResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
+        if let Err(e) = TOKIO_RT.block_on(self.client.grant_privileges(
+            &policy._as,
+            &role_name,
+            &privs,
+        )) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// RevokePrivileges revokes privileges from a user-defined role.
     pub fn revoke_privileges(
         &self,
         policy: &AdminPolicy,
         role_name: String,
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeRevokePrivilegesRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-            privileges: privileges.iter().map(|v| v._as.clone()).collect(),
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client
-            .revoke_privileges(request)
-            .map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeRevokePrivilegesResponse { error: None } => Ok(()),
-            proto::AerospikeRevokePrivilegesResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
+        if let Err(e) = TOKIO_RT.block_on(self.client.revoke_privileges(
+            &policy._as,
+            &role_name,
+            &privs,
+        )) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// SetAllowlist sets IP address whitelist for a role. If whitelist is nil or empty, it removes existing whitelist from role.
     pub fn set_allowlist(
         &self,
         policy: &AdminPolicy,
         role_name: String,
         allowlist: Vec<String>,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeSetAllowlistRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-            allowlist: allowlist,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.set_allowlist(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeSetAllowlistResponse { error: None } => Ok(()),
-            proto::AerospikeSetAllowlistResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
+        if let Err(e) = TOKIO_RT.block_on(self.client.set_allowlist(
+            &policy._as,
+            &role_name,
+            &allowlist_ref,
+        )) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 
-    /// SetQuotas sets maximum reads/writes per second limits for a role.  If a quota is zero, the limit is removed.
-    /// Quotas require server security configuration "enable-quotas" to be set to true.
-    /// Pass 0 for quota values for no limit.
     pub fn set_quotas(
         &self,
         policy: &AdminPolicy,
@@ -10715,23 +8008,15 @@ impl Client {
         read_quota: u32,
         write_quota: u32,
     ) -> PhpResult<()> {
-        let request = tonic::Request::new(proto::AerospikeSetQuotasRequest {
-            policy: Some(policy._as.clone()),
-            role_name: role_name,
-            read_quota: read_quota,
-            write_quota: write_quota,
-        });
-
-        let mut client = self.client.lock().unwrap();
-        let res = client.set_quotas(request).map_err(|e| e.to_string())?;
-        match res.get_ref() {
-            proto::AerospikeSetQuotasResponse { error: None } => Ok(()),
-            proto::AerospikeSetQuotasResponse { error: Some(pe) } => {
-                let error: AerospikeException = pe.into();
-                throw_object(error.into_zval(true)?)?;
-                Ok(())
-            }
+        if let Err(e) = TOKIO_RT.block_on(self.client.set_quotas(
+            &policy._as,
+            &role_name,
+            read_quota,
+            write_quota,
+        )) {
+            return throw_aero_error(&e, ());
         }
+        Ok(())
     }
 }
 
@@ -10742,15 +8027,16 @@ impl Client {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Represents an exception specific to the Aerospike database operations.
-#[php_class(name = "Aerospike\\AerospikeException")]
-#[extends(ext_php_rs::zend::ce::exception())]
-#[derive(Debug, Clone)]
+#[php_class]
+#[php(name = "Aerospike\\AerospikeException")]
+#[php(extends(ce = ext_php_rs::zend::ce::exception, stub = "\\Exception"))]
+#[derive(Debug, Clone, Default)]
 pub struct AerospikeException {
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    #[php(prop, flags = ext_php_rs::flags::PropertyFlags::Public)]
     message: String,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    #[php(prop, flags = ext_php_rs::flags::PropertyFlags::Public)]
     code: i32,
-    #[prop(flags = ext_php_rs::flags::PropertyFlags::Public)]
+    #[php(prop, flags = ext_php_rs::flags::PropertyFlags::Public)]
     in_doubt: bool,
 }
 
@@ -10773,13 +8059,103 @@ impl AerospikeException {
     }
 }
 
-impl From<&proto::Error> for AerospikeException {
-    fn from(error: &proto::Error) -> AerospikeException {
-        let msg: String = ResultCode::to_string(error.result_code);
+/// Map an `aerospike::ResultCode` enum variant back to the wire-protocol i32
+/// used by the PHP-side `Aerospike\\ResultCode` constants.
+fn aero_result_code_to_i32(rc: aero::ResultCode) -> i32 {
+    use aero::ResultCode as RC;
+    match rc {
+        RC::Ok => 0,
+        RC::ServerError => 1,
+        RC::KeyNotFoundError => 2,
+        RC::GenerationError => 3,
+        RC::ParameterError => 4,
+        RC::KeyExistsError => 5,
+        RC::BinExistsError => 6,
+        RC::ClusterKeyMismatch => 7,
+        RC::ServerMemError => 8,
+        RC::Timeout => 9,
+        RC::AlwaysForbidden => 10,
+        RC::PartitionUnavailable => 11,
+        RC::BinTypeError => 12,
+        RC::RecordTooBig => 13,
+        RC::KeyBusy => 14,
+        RC::ScanAbort => 15,
+        RC::UnsupportedFeature => 16,
+        RC::BinNotFound => 17,
+        RC::DeviceOverload => 18,
+        RC::KeyMismatch => 19,
+        RC::InvalidNamespace => 20,
+        RC::BinNameTooLong => 21,
+        RC::FailForbidden => 22,
+        RC::ElementNotFound => 23,
+        RC::ElementExists => 24,
+        RC::EnterpriseOnly => 25,
+        RC::OpNotApplicable => 26,
+        RC::FilteredOut => 27,
+        RC::LostConflict => 28,
+        RC::XDRKeyBusy => 32,
+        RC::QueryEnd => 50,
+        RC::SecurityNotSupported => 51,
+        RC::SecurityNotEnabled => 52,
+        RC::SecuritySchemeNotSupported => 53,
+        RC::InvalidCommand => 54,
+        RC::InvalidField => 55,
+        RC::IllegalState => 56,
+        RC::InvalidUser => 60,
+        RC::UserAlreadyExists => 61,
+        RC::InvalidPassword => 62,
+        RC::ExpiredPassword => 63,
+        RC::ForbiddenPassword => 64,
+        RC::InvalidCredential => 65,
+        RC::ExpiredSession => 66,
+        RC::InvalidRole => 70,
+        RC::RoleAlreadyExists => 71,
+        RC::InvalidPrivilege => 72,
+        RC::InvalidAllowlist => 73,
+        RC::QuotasNotEnabled => 74,
+        RC::InvalidQuota => 75,
+        RC::NotAuthenticated => 80,
+        RC::RoleViolation => 81,
+        RC::NotAllowlisted => 82,
+        RC::QuotaExceeded => 83,
+        RC::UdfBadResponse => 100,
+        RC::BatchDisabled => 150,
+        RC::BatchMaxRequestsExceeded => 151,
+        RC::BatchQueuesFull => 152,
+        RC::InvalidGeojson => 160,
+        RC::IndexFound => 200,
+        RC::IndexNotFound => 201,
+        RC::IndexOom => 202,
+        RC::IndexNotReadable => 203,
+        RC::IndexGeneric => 204,
+        RC::IndexNameMaxLen => 205,
+        RC::IndexMaxCount => 206,
+        RC::QueryAborted => 210,
+        RC::QueryQueueFull => 211,
+        RC::QueryTimeout => 212,
+        RC::QueryGeneric => 213,
+        RC::QueryNetioErr => 214,
+        RC::QueryDuplicate => 215,
+        RC::Unknown(code) => code as i32,
+    }
+}
+
+impl From<&aero::Error> for AerospikeException {
+    fn from(error: &aero::Error) -> AerospikeException {
+        let (code, in_doubt) = match error {
+            aero::Error::ServerError(rc, in_doubt, _node) => {
+                (aero_result_code_to_i32(*rc), *in_doubt)
+            }
+            aero::Error::BatchError(_idx, rc, in_doubt, _node)
+            | aero::Error::BatchLastError(_idx, rc, in_doubt, _node) => {
+                (aero_result_code_to_i32(*rc), *in_doubt)
+            }
+            _ => (ResultCode::COMMON_ERROR, false),
+        };
         AerospikeException {
-            message: msg,
-            code: error.result_code,
-            in_doubt: error.in_doubt,
+            message: error.to_string(),
+            code,
+            in_doubt,
         }
     }
 }
@@ -10800,85 +8176,68 @@ impl From<AerospikeException> for PhpException {
 /// an optional set name, and a user defined key which must be unique within a set.
 /// Records can also be identified by namespace/digest which is the combination used
 /// on the server.
-#[php_class(name = "Aerospike\\Key")]
+#[php_class]
+#[php(name = "Aerospike\\Key")]
 pub struct Key {
-    _as: proto::Key,
+    _as: aero::Key,
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Key {
-    pub fn __construct(namespace: &str, set: &str, key: PHPValue) -> Self {
-        let _as = proto::Key {
-            digest: None, //Some(Self::compute_digest(set, key.clone())),
-            namespace: Some(namespace.into()),
-            set: Some(set.into()),
-            value: Some(key.into()),
-        };
-        Key { _as: _as }
+    pub fn __construct(namespace: &str, set: &str, key: PHPValue) -> PhpResult<Self> {
+        let aero_value: aero::Value = key.into();
+        match aero::Key::new(namespace.to_string(), set.to_string(), aero_value) {
+            Ok(k) => Ok(Key { _as: k }),
+            Err(e) => Err(format!("Invalid key: {e}").into()),
+        }
+    }
+
+    /// v1 compatibility shim: forwards `$key->namespace`, `->set`, `->setname`, `->userKey`,
+    /// `->value`, `->digest`, `->digestBytes` to the corresponding getters.
+    pub fn __get(&self, name: &str) -> PhpResult<Zval> {
+        let mut zv = Zval::new();
+        match name {
+            "namespace" => zv.set_string(&self.get_namespace(), false)?,
+            "set" | "setname" | "setName" => zv.set_string(&self.get_setname(), false)?,
+            "userKey" | "user_key" | "value" => match self.get_value() {
+                Some(v) => v.set_zval(&mut zv, false)?,
+                None => zv.set_null(),
+            },
+            "digest" => zv.set_string(&self.get_digest(), false)?,
+            "digestBytes" | "digest_bytes" => zv.set_binary(self.get_digest_bytes()),
+            _ => zv.set_null(),
+        }
+        Ok(zv)
     }
 
     /// namespace. Equivalent to database name.
-    #[getter]
     pub fn get_namespace(&self) -> String {
-        self._as.namespace.clone().unwrap_or("".into())
+        self._as.namespace.clone()
     }
 
     /// Optional set name. Equivalent to database table.
-    #[getter]
     pub fn get_setname(&self) -> String {
-        self._as.set.clone().unwrap_or("".into())
+        self._as.set_name.clone()
     }
 
     /// getValue() returns key's value.
-    #[getter]
     pub fn get_value(&self) -> Option<PHPValue> {
-        self._as.value.clone().map(|v| v.into())
-    }
-
-    /// Generate unique server hash value from set name, key type and user defined key.
-    /// The hash function is RIPEMD-160 (a 160 bit hash).
-    fn compute_digest(&self) -> Vec<u8> {
-        let mut hash = Ripemd160::new();
-        match (self._as.set.as_ref(), self._as.value.as_ref()) {
-            (Some(set), Some(value)) => {
-                hash.input(set.as_bytes());
-                let value: PHPValue = value.clone().into();
-                hash.input(&[value.particle_type() as u8]);
-                match value.write_key_bytes(&mut hash) {
-                    Ok(()) => (),
-                    Err(_) => {
-                        return vec![];
-                    }
-                };
-                let h: [u8; 20] = hash.result().into();
-                h.into()
-            }
-            _ => vec![],
-        }
+        self._as.user_key.clone().map(Into::into)
     }
 
     /// get_digest_bytes returns key digest as byte array.
     pub fn get_digest_bytes(&self) -> Vec<u8> {
-        self._as
-            .digest
-            .as_ref()
-            .map(|digest| digest.clone())
-            .unwrap_or(self.compute_digest())
+        self._as.digest.to_vec()
     }
 
     /// get_digest returns key digest as string.
-    #[getter]
     pub fn get_digest(&self) -> String {
-        hex::encode(self.get_digest_bytes())
+        hex::encode(self._as.digest)
     }
 
     /// PartitionId returns the partition that the key belongs to.
-    #[getter]
     fn partition_id(&self) -> Option<usize> {
-        let digest = self.get_digest_bytes();
-        let mut rdr = Cursor::new(&digest[0..4]);
-        Some(rdr.read_u32::<LittleEndian>().unwrap() as usize & (PARTITIONS as usize - 1))
+        Some(self._as.partition_id())
     }
 }
 
@@ -10899,7 +8258,8 @@ impl FromZval<'_> for Key {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Implementation of the GeoJson Value for Aerospike.
-#[php_class(name = "Aerospike\\GeoJSON")]
+#[php_class]
+#[php(name = "Aerospike\\GeoJSON")]
 pub struct GeoJSON {
     v: String,
 }
@@ -10915,14 +8275,10 @@ impl FromZval<'_> for GeoJSON {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl GeoJSON {
-    #[getter]
     pub fn get_value(&self) -> String {
         self.v.clone()
     }
-
-    #[setter]
     pub fn set_value(&mut self, geo: String) {
         self.v = geo
     }
@@ -10946,7 +8302,8 @@ impl fmt::Display for GeoJSON {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Implementation of the Json (Map<String, Value>) data structure for Aerospike.
-#[php_class(name = "Aerospike\\Json")]
+#[php_class]
+#[php(name = "Aerospike\\Json")]
 pub struct Json {
     v: HashMap<String, PHPValue>,
 }
@@ -10962,16 +8319,13 @@ impl FromZval<'_> for Json {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Json {
     /// getter method to get the json value
-    #[getter]
     pub fn get_value(&self) -> HashMap<String, PHPValue> {
         self.v.clone()
     }
 
     /// setter method to set the json value
-    #[setter]
     pub fn set_value(&mut self, v: HashMap<String, PHPValue>) {
         self.v = v
     }
@@ -10995,7 +8349,8 @@ impl fmt::Display for Json {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Represents a infinity value for Aerospike.
-#[php_class(name = "Aerospike\\Infinity")]
+#[php_class]
+#[php(name = "Aerospike\\Infinity")]
 pub struct Infinity {}
 
 impl FromZval<'_> for Infinity {
@@ -11015,7 +8370,8 @@ impl FromZval<'_> for Infinity {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Represents a wildcard value for Aerospike.
-#[php_class(name = "Aerospike\\Wildcard")]
+#[php_class]
+#[php(name = "Aerospike\\Wildcard")]
 pub struct Wildcard {}
 
 impl FromZval<'_> for Wildcard {
@@ -11035,7 +8391,8 @@ impl FromZval<'_> for Wildcard {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Implementation of the BLOB data structure for Aerospike.
-#[php_class(name = "Aerospike\\BLOB")]
+#[php_class]
+#[php(name = "Aerospike\\BLOB")]
 pub struct BLOB {
     v: Vec<u8>,
 }
@@ -11051,19 +8408,13 @@ impl FromZval<'_> for BLOB {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl BLOB {
-    #[getter]
     pub fn get_binary(&self) -> Binary<u8> {
         self.v.clone().into_iter().collect::<Binary<_>>()
     }
-
-    #[getter]
     pub fn get_value(&self) -> Vec<u8> {
         self.v.clone()
     }
-
-    #[setter]
     pub fn set_value(&mut self, blob: Vec<u8>) {
         self.v = blob
     }
@@ -11074,7 +8425,7 @@ impl BLOB {
     }
 
     /// Returns a string representation of the value.
-    pub fn equals(&self, other: &Self) -> bool {
+    pub fn equals(&self, other: &BLOB) -> bool {
         self.v == other.v
     }
 }
@@ -11092,7 +8443,8 @@ impl fmt::Display for BLOB {
 ////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Implementation of the HyperLogLog (HLL) data structure for Aerospike.
-#[php_class(name = "Aerospike\\HLL")]
+#[php_class]
+#[php(name = "Aerospike\\HLL")]
 pub struct HLL {
     v: Vec<u8>,
 }
@@ -11108,14 +8460,10 @@ impl FromZval<'_> for HLL {
 }
 
 #[php_impl]
-#[derive(ZvalConvert)]
 impl HLL {
-    #[getter]
     pub fn get_value(&self) -> Vec<u8> {
         self.v.clone()
     }
-
-    #[setter]
     pub fn set_value(&mut self, hll: Vec<u8>) {
         self.v = hll
     }
@@ -11140,7 +8488,6 @@ impl fmt::Display for HLL {
 
 /// Container for bin values stored in the Aerospike database.
 #[derive(Debug, Clone, PartialEq, Eq)]
-// TODO: underlying_value; convert to proto::Value to avoid conversions
 pub enum PHPValue {
     /// Empty value.
     Nil,
@@ -11189,37 +8536,48 @@ pub enum PHPValue {
     Infinity,
 }
 
-#[allow(clippy::derive_hash_xor_eq)]
+#[allow(clippy::derived_hash_with_manual_eq)]
 impl Hash for PHPValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match *self {
-            PHPValue::Nil => {
-                let v: Option<u8> = None;
-                v.hash(state);
+        // Always mix in the discriminant so different variants never accidentally collide.
+        std::mem::discriminant(self).hash(state);
+        match self {
+            PHPValue::Nil => {}
+            PHPValue::Bool(v) => v.hash(state),
+            PHPValue::Int(v) => v.hash(state),
+            PHPValue::UInt(v) => v.hash(state),
+            PHPValue::Float(v) => v.hash(state),
+            PHPValue::String(v) | PHPValue::GeoJSON(v) => v.hash(state),
+            PHPValue::Blob(v) | PHPValue::HLL(v) => v.hash(state),
+            PHPValue::List(v) => v.hash(state),
+            // HashMap iteration order is unspecified; hashing pair-by-pair would violate
+            // the `k1 == k2 ⇒ hash(k1) == hash(k2)` contract. Fold a commutative XOR of
+            // per-entry hashes so order does not matter.
+            PHPValue::HashMap(map) => {
+                map.len().hash(state);
+                let mut acc: u64 = 0;
+                for (k, v) in map {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    k.hash(&mut h);
+                    v.hash(&mut h);
+                    acc ^= h.finish();
+                }
+                acc.hash(state);
             }
-            PHPValue::Bool(ref val) => val.hash(state),
-            PHPValue::Int(ref val) => val.hash(state),
-            PHPValue::UInt(ref val) => val.hash(state),
-            PHPValue::Float(ref val) => val.hash(state),
-            PHPValue::String(ref val) | PHPValue::GeoJSON(ref val) => val.hash(state),
-            PHPValue::Blob(ref val) | PHPValue::HLL(ref val) => val.hash(state),
-            PHPValue::List(ref val) => val.hash(state),
-            PHPValue::HashMap(_) => {
-                let error = AerospikeException::new("HashMaps cannot be used as map keys.");
-                let _ = throw_object(error.into_zval(true).unwrap());
+            PHPValue::Json(map) => {
+                map.len().hash(state);
+                let mut acc: u64 = 0;
+                for (k, v) in map {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    k.hash(&mut h);
+                    v.hash(&mut h);
+                    acc ^= h.finish();
+                }
+                acc.hash(state);
             }
-            PHPValue::Json(_) => {
-                let error = AerospikeException::new("Jsons cannot be used as map keys.");
-                let _ = throw_object(error.into_zval(true).unwrap());
+            PHPValue::Infinity | PHPValue::Wildcard => {
+                // Discriminant already mixed in above; sentinel variants carry no extra state.
             }
-            PHPValue::Infinity => {
-                let error = AerospikeException::new("Infinity cannot be used as map keys.");
-                let _ = throw_object(error.into_zval(true).unwrap());
-            }
-            PHPValue::Wildcard => {
-                let error = AerospikeException::new("Infinity cannot be used as map keys.");
-                let _ = throw_object(error.into_zval(true).unwrap());
-            } // PHPValue::OrderedMap(_) => panic!("OrderedMaps cannot be used as map keys."),
         }
     }
 }
@@ -11234,57 +8592,15 @@ impl PHPValue {
             PHPValue::Bool(ref val) => val.to_string(),
             PHPValue::Float(ref val) => val.to_string(),
             PHPValue::String(ref val) => val.to_string(),
-            PHPValue::GeoJSON(ref val) => format!("GeoJSON('{}')", val.to_string()),
-            PHPValue::Blob(ref val) => format!("Blob({:?})", val),
-            PHPValue::HLL(ref val) => format!("HLL('{:?}')", val),
-            PHPValue::List(ref val) => format!("{:?}", val),
-            PHPValue::HashMap(ref val) => format!("{:?}", val),
-            PHPValue::Json(ref val) => format!("{:?}", val),
+            PHPValue::GeoJSON(ref val) => format!("GeoJSON('{val}')"),
+            PHPValue::Blob(ref val) => format!("Blob({val:?})"),
+            PHPValue::HLL(ref val) => format!("HLL('{val:?}')"),
+            PHPValue::List(ref val) => format!("{val:?}"),
+            PHPValue::HashMap(ref val) => format!("{val:?}"),
+            PHPValue::Json(ref val) => format!("{val:?}"),
             PHPValue::Infinity => "<infinity>".to_string(),
             PHPValue::Wildcard => "<wildcard>".to_string(),
             // PHPValue::OrderedMap(ref val) => format!("{:?}", val),
-        }
-    }
-
-    fn particle_type(&self) -> u32 {
-        match *self {
-            PHPValue::Nil => 0,
-            PHPValue::Int(_) => 1,
-            PHPValue::UInt(_) => 1,
-            PHPValue::Float(_) => 2,
-            PHPValue::String(_) => 3,
-            PHPValue::Blob(_) => 4,
-            PHPValue::Bool(_) => 17,
-            PHPValue::HLL(_) => 18,
-            PHPValue::HashMap(_) => 19,
-            PHPValue::Json(_) => 19,
-            PHPValue::List(_) => 20,
-            PHPValue::GeoJSON(_) => 23,
-            PHPValue::Infinity => unreachable!(),
-            PHPValue::Wildcard => unreachable!(),
-            // PHPValue::OrderedMap(_) => format!("{:?}", val),
-        }
-    }
-
-    /// Serialize the value as a record key.
-    /// For internal use only.
-    fn write_key_bytes(self, h: &mut Ripemd160) -> Result<(), String> {
-        match self {
-            PHPValue::Int(ref val) => {
-                let mut buf = [0; 8];
-                NetworkEndian::write_i64(&mut buf, *val);
-                h.input(&buf);
-                Ok(())
-            }
-            PHPValue::String(ref val) => {
-                h.input(val.as_bytes());
-                Ok(())
-            }
-            PHPValue::Blob(ref val) => {
-                h.input(val);
-                Ok(())
-            }
-            _ => Err(format!("Data type is not supported as Key value: {}", self)),
         }
     }
 }
@@ -11297,6 +8613,7 @@ impl fmt::Display for PHPValue {
 
 impl IntoZval for PHPValue {
     const TYPE: DataType = DataType::Mixed;
+    const NULLABLE: bool = true;
 
     fn set_zval(self, zv: &mut Zval, persistent: bool) -> Result<()> {
         match self {
@@ -11310,19 +8627,17 @@ impl IntoZval for PHPValue {
             PHPValue::List(l) => zv.set_array(l)?,
             PHPValue::Json(h) => {
                 let mut arr = ZendHashTable::with_capacity(h.len() as u32);
-                h.iter().for_each(|(k, v)| {
-                    arr.insert::<PHPValue>(&k.to_string(), v.clone().into())
-                        .expect("error converting hash");
-                });
+                for (k, v) in h.iter() {
+                    arr.insert(k.to_string(), v.clone())?;
+                }
 
                 zv.set_hashtable(arr)
             }
             PHPValue::HashMap(h) => {
                 let mut arr = ZendHashTable::with_capacity(h.len() as u32);
-                h.iter().for_each(|(k, v)| {
-                    arr.insert::<PHPValue>(&k.to_string(), v.clone().into())
-                        .expect("error converting hash");
-                });
+                for (k, v) in h.iter() {
+                    arr.insert(k.to_string(), v.clone())?;
+                }
 
                 zv.set_hashtable(arr)
             }
@@ -11357,6 +8672,9 @@ impl IntoZval for PHPValue {
     }
 }
 
+/// Converts a `Zval` into a `PHPValue`. Returns `None` (and may throw a PHP exception)
+/// for objects we don't recognise or values whose contents cannot be extracted; the caller
+/// must propagate the `None` so PHP sees the thrown exception.
 fn from_zval(zval: &Zval) -> Option<PHPValue> {
     match zval.get_type() {
         DataType::Object(_) => {
@@ -11366,59 +8684,55 @@ fn from_zval(zval: &Zval) -> Option<PHPValue> {
                 return Some(PHPValue::HLL(o.v));
             } else if let Some(o) = zval.extract::<GeoJSON>() {
                 return Some(PHPValue::GeoJSON(o.v));
-            } else if let Some(_) = zval.extract::<Infinity>() {
+            } else if zval.extract::<Infinity>().is_some() {
                 return Some(PHPValue::Infinity);
-            } else if let Some(_) = zval.extract::<Wildcard>() {
+            } else if zval.extract::<Wildcard>().is_some() {
                 return Some(PHPValue::Wildcard);
             }
-            let error = AerospikeException::new("Invalid Object");
-            let _ = throw_object(error.into_zval(true).unwrap());
+            let _ = throw_msg::<()>("Invalid Object", ());
             None
         }
-        // DataType::Undef => Some(PHPValue::Nil),
         DataType::Null => Some(PHPValue::Nil),
         DataType::False => Some(PHPValue::Bool(false)),
         DataType::True => Some(PHPValue::Bool(true)),
-        DataType::Bool => zval.bool().map(|v| PHPValue::Bool(v)),
-        DataType::Long => zval.long().map(|v| PHPValue::Int(v)),
+        DataType::Bool => zval.bool().map(PHPValue::Bool),
+        DataType::Long => zval.long().map(PHPValue::Int),
         DataType::Double => zval
             .double()
             .map(|v| PHPValue::Float(ordered_float::OrderedFloat(v))),
-        DataType::String => zval.string().map(|v| PHPValue::String(v)),
+        DataType::String => zval.string().map(PHPValue::String),
         DataType::Array => {
-            zval.array().map(|arr| {
-                if arr.has_sequential_keys() {
-                    // it's an array
-                    let val_arr: Vec<PHPValue> =
-                        arr.iter().map(|(_, v)| from_zval(v).unwrap()).collect();
-                    PHPValue::List(val_arr)
-                } else if arr.has_numerical_keys() {
-                    // it's a hashmap with numerical keys
-                    let mut h = HashMap::<PHPValue, PHPValue>::with_capacity(arr.len());
-                    arr.iter().for_each(|(i, v)| match i {
-                        ArrayKey::Long(index) => {
-                            h.insert(PHPValue::UInt(index as u64), from_zval(v).unwrap());
-                        }
-                        ArrayKey::String(_) => {}
-                    });
-                    PHPValue::HashMap(h)
-                } else {
-                    // it's a hashmap with string keys
-                    let mut h = HashMap::with_capacity(arr.len());
-                    arr.iter().for_each(|(k, v)| match k {
-                        ArrayKey::Long(_) => {}
-                        ArrayKey::String(index) => {
-                            h.insert(
-                                PHPValue::String(index),
-                                from_zval(v).expect("Invalid value in hashmap".into()),
-                            );
-                        }
-                    });
-                    PHPValue::HashMap(h)
+            let arr = zval.array()?;
+            if arr.has_sequential_keys() {
+                // Sequential integer keys (0..N) → list. Propagate child failure as None
+                // instead of `.unwrap()` so a bad nested value cannot abort the process.
+                let mut val_arr: Vec<PHPValue> = Vec::with_capacity(arr.len());
+                for (_, v) in arr.iter() {
+                    val_arr.push(from_zval(v)?);
                 }
-            })
+                Some(PHPValue::List(val_arr))
+            } else {
+                // Mixed or string-keyed array → hashmap. PHP arrays may carry both
+                // integer and string keys in the same array (e.g. `[1 => 'a', 'x' => 'b']`);
+                // a single pass handles every key type without silently dropping entries.
+                let mut h = HashMap::<PHPValue, PHPValue>::with_capacity(arr.len());
+                for (k, v) in arr.iter() {
+                    let key = match k {
+                        ArrayKey::Long(i) => PHPValue::Int(i),
+                        ArrayKey::String(s) => PHPValue::String(s),
+                        ArrayKey::Str(s) => PHPValue::String(s.to_string()),
+                    };
+                    h.insert(key, from_zval(v)?);
+                }
+                Some(PHPValue::HashMap(h))
+            }
         }
-        _ => unreachable!(),
+        // Any data type we don't model yet (Reference, Resource, ...). Throw rather than
+        // panic so the host process survives encountering an unfamiliar zval.
+        _ => {
+            let _ = throw_msg::<()>("Unsupported PHP value type", ());
+            None
+        }
     }
 }
 
@@ -11430,8 +8744,8 @@ impl FromZval<'_> for PHPValue {
     }
 }
 
-impl From<HashMap<String, proto::Value>> for PHPValue {
-    fn from(h: HashMap<String, proto::Value>) -> Self {
+impl From<HashMap<String, aero::Value>> for PHPValue {
+    fn from(h: HashMap<String, aero::Value>) -> Self {
         let mut hash = HashMap::<PHPValue, PHPValue>::with_capacity(h.len());
         h.iter().for_each(|(k, v)| {
             hash.insert(PHPValue::String(k.into()), (*v).clone().into());
@@ -11446,114 +8760,89 @@ impl From<HashMap<PHPValue, PHPValue>> for PHPValue {
     }
 }
 
-impl From<PHPValue> for proto::Value {
+impl From<PHPValue> for aero::Value {
     fn from(other: PHPValue) -> Self {
         match other {
-            PHPValue::Nil => proto::Value {
-                v: Some(proto::value::V::Nil(true)),
-            },
-            PHPValue::Bool(b) => proto::Value {
-                v: Some(proto::value::V::B(b)),
-            },
-            PHPValue::Int(i) => proto::Value {
-                v: Some(proto::value::V::I(i)),
-            },
-            PHPValue::UInt(ui) => proto::Value {
-                v: Some(proto::value::V::I(ui as i64)),
-            },
-            PHPValue::Float(f) => proto::Value {
-                v: Some(proto::value::V::F(f64::from(f).into())),
-            },
-            PHPValue::String(s) => proto::Value {
-                v: Some(proto::value::V::S(s)),
-            },
-            PHPValue::Blob(b) => proto::Value {
-                v: Some(proto::value::V::Blob(b)),
-            },
-            PHPValue::List(l) => {
-                let mut nl = Vec::<proto::Value>::with_capacity(l.len());
-                l.iter().for_each(|v| nl.push(v.clone().into()));
-                proto::Value {
-                    v: Some(proto::value::V::L(proto::List { l: nl })),
+            PHPValue::Nil => aero::Value::Nil,
+            PHPValue::Bool(b) => aero::Value::Bool(b),
+            PHPValue::Int(i) => aero::Value::Int(i),
+            // Aerospike server stores all integers as signed i64. Reject values that don't
+            // fit instead of silently wrapping to a negative number (which would corrupt
+            // user data). Surfaces a PHP exception via throw_msg + Nil sentinel.
+            PHPValue::UInt(ui) => match i64::try_from(ui) {
+                Ok(v) => aero::Value::Int(v),
+                Err(_) => {
+                    let _ = throw_msg::<()>(
+                        "Value::uint exceeds i64::MAX; Aerospike integers are signed 64-bit",
+                        (),
+                    );
+                    aero::Value::Nil
                 }
-            }
+            },
+            PHPValue::Float(f) => aero::Value::Float(f64::from(f).into()),
+            PHPValue::String(s) => aero::Value::String(s),
+            PHPValue::Blob(b) => aero::Value::Blob(b),
+            PHPValue::List(l) => aero::Value::List(l.into_iter().map(Into::into).collect()),
             PHPValue::HashMap(h) => {
-                let mut arr = Vec::with_capacity(h.len());
-                h.iter().for_each(|(k, v)| {
-                    arr.push(proto::MapEntry {
-                        k: Some((*k).clone().into()),
-                        v: Some((*v).clone().into()),
-                    });
-                });
-                proto::Value {
-                    v: Some(proto::value::V::M(proto::Map { m: arr })),
+                let mut m = HashMap::<aero::Value, aero::Value>::with_capacity(h.len());
+                for (k, v) in h {
+                    m.insert(k.into(), v.into());
                 }
+                aero::Value::HashMap(m)
             }
+            // Aerospike has no separate Json type; collapse to a string-keyed HashMap.
             PHPValue::Json(h) => {
-                let mut arr = Vec::with_capacity(h.len());
-                h.iter().for_each(|(k, v)| {
-                    arr.push(proto::JsonEntry {
-                        k: k.clone(),
-                        v: Some((*v).clone().into()),
-                    });
-                });
-                proto::Value {
-                    v: Some(proto::value::V::Json(proto::Json { j: arr })),
+                let mut m = HashMap::<aero::Value, aero::Value>::with_capacity(h.len());
+                for (k, v) in h {
+                    m.insert(aero::Value::String(k), v.into());
                 }
+                aero::Value::HashMap(m)
             }
-            PHPValue::GeoJSON(gj) => proto::Value {
-                v: Some(proto::value::V::Geo(gj)),
-            },
-            PHPValue::HLL(b) => proto::Value {
-                v: Some(proto::value::V::Hll(b)),
-            },
-            PHPValue::Infinity => proto::Value {
-                v: Some(proto::value::V::Infinity(true)),
-            },
-            PHPValue::Wildcard => proto::Value {
-                v: Some(proto::value::V::Wildcard(true)),
-            },
+            PHPValue::GeoJSON(gj) => aero::Value::GeoJSON(gj),
+            PHPValue::HLL(b) => aero::Value::HLL(b),
+            PHPValue::Infinity => aero::Value::Infinity,
+            PHPValue::Wildcard => aero::Value::Wildcard,
         }
     }
 }
 
-impl From<proto::Value> for PHPValue {
-    fn from(other: proto::Value) -> Self {
-        match other.v.unwrap() {
-            proto::value::V::Nil(_) => PHPValue::Nil,
-            proto::value::V::B(b) => PHPValue::Bool(b),
-            proto::value::V::I(i) => PHPValue::Int(i),
-            proto::value::V::F(f) => PHPValue::Float(ordered_float::OrderedFloat(f.into())),
-            proto::value::V::S(s) => PHPValue::String(s.into()),
-            proto::value::V::Blob(blob) => PHPValue::Blob(blob.to_vec()),
-            proto::value::V::L(l) => {
-                let mut nl = Vec::<PHPValue>::with_capacity(l.l.len());
-                l.l.iter().for_each(|v| nl.push((*v).clone().into()));
-                PHPValue::List(nl)
+impl From<aero::Value> for PHPValue {
+    fn from(other: aero::Value) -> Self {
+        match other {
+            aero::Value::Nil => PHPValue::Nil,
+            aero::Value::Bool(b) => PHPValue::Bool(b),
+            aero::Value::Int(i) => PHPValue::Int(i),
+            aero::Value::Float(f) => PHPValue::Float(ordered_float::OrderedFloat(f64::from(f))),
+            aero::Value::String(s) => PHPValue::String(s),
+            aero::Value::Blob(b) => PHPValue::Blob(b),
+            aero::Value::List(l) | aero::Value::MultiResult(l) => {
+                PHPValue::List(l.into_iter().map(Into::into).collect())
             }
-            proto::value::V::Json(json) => {
-                let mut arr = HashMap::<String, PHPValue>::with_capacity(json.j.len());
-                json.j.iter().for_each(|me| {
-                    arr.insert(me.k.clone(), (me.v.clone().unwrap()).into());
-                });
-                PHPValue::Json(arr)
+            aero::Value::HashMap(h) => {
+                let mut m = HashMap::<PHPValue, PHPValue>::with_capacity(h.len());
+                for (k, v) in h {
+                    m.insert(k.into(), v.into());
+                }
+                PHPValue::HashMap(m)
             }
-            proto::value::V::M(h) => {
-                let mut arr = HashMap::<PHPValue, PHPValue>::with_capacity(h.m.len());
-                h.m.iter().for_each(|me| {
-                    if me.k.is_some() {
-                        arr.insert(
-                            (me.k.clone().unwrap()).into(),
-                            (me.v.clone().unwrap()).into(),
-                        );
-                    };
-                });
-                PHPValue::HashMap(arr)
+            aero::Value::OrderedMap(h) => {
+                let mut m = HashMap::<PHPValue, PHPValue>::with_capacity(h.len());
+                for (k, v) in h {
+                    m.insert(k.into(), v.into());
+                }
+                PHPValue::HashMap(m)
             }
-            proto::value::V::Geo(gj) => PHPValue::GeoJSON(gj.into()),
-            proto::value::V::Hll(b) => PHPValue::HLL(b.to_vec()),
-            proto::value::V::Infinity(_) => PHPValue::Infinity,
-            proto::value::V::Wildcard(_) => PHPValue::Wildcard,
+            aero::Value::KeyValueList(kv) => {
+                let mut m = HashMap::<PHPValue, PHPValue>::with_capacity(kv.len());
+                for (k, v) in kv {
+                    m.insert(k.into(), v.into());
+                }
+                PHPValue::HashMap(m)
+            }
+            aero::Value::GeoJSON(gj) => PHPValue::GeoJSON(gj),
+            aero::Value::HLL(b) => PHPValue::HLL(b),
+            aero::Value::Infinity => PHPValue::Infinity,
+            aero::Value::Wildcard => PHPValue::Wildcard,
         }
     }
 }
@@ -11564,12 +8853,12 @@ impl From<proto::Value> for PHPValue {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-#[php_class(name = "Aerospike\\Value")]
+#[php_class]
+#[php(name = "Aerospike\\Value")]
 pub struct Value;
 
 /// Value interface is used to efficiently serialize objects into the wire protocol.
 #[php_impl]
-#[derive(ZvalConvert)]
 impl Value {
     pub fn nil() -> PHPValue {
         PHPValue::Nil
@@ -11584,7 +8873,7 @@ impl Value {
     }
 
     pub fn float(val: f64) -> PHPValue {
-        PHPValue::Float(ordered_float::OrderedFloat(val.into()))
+        PHPValue::Float(ordered_float::OrderedFloat(val))
     }
 
     pub fn bool(val: bool) -> PHPValue {
@@ -11603,8 +8892,7 @@ impl Value {
         match from_zval(val) {
             Some(PHPValue::HashMap(hm)) => PHPValue::HashMap(hm),
             _ => {
-                let error = AerospikeException::new("Invalid value".into());
-                let _ = throw_object(error.into_zval(true).unwrap());
+                let _ = throw_msg::<()>("Invalid value", ());
                 PHPValue::Nil
             }
         }
@@ -11613,47 +8901,53 @@ impl Value {
     pub fn blob(zval: &Zval) -> PhpResult<PHPValue> {
         match zval.get_type() {
             DataType::String => {
-                if zval.binary::<u8>().is_some() {
-                    Ok(zval.binary().map(|v| PHPValue::Blob(v.into())).unwrap())
+                if let Some(bin) = zval.binary::<u8>() {
+                    Ok(PHPValue::Blob(bin))
+                } else if let Some(s) = zval.string() {
+                    Ok(PHPValue::Blob(s.into_bytes()))
                 } else {
-                    Ok(zval.string().map(|v| PHPValue::Blob(v.into())).unwrap())
+                    throw_msg(
+                        "Value::blob: failed to read string contents",
+                        PHPValue::Blob(Vec::new()),
+                    )
                 }
             }
             DataType::Array => {
-                if let Some(arr) = zval.array() {
-                    if arr.has_sequential_keys() {
-                        // it's an array
-                        let val_arr: Vec<u8> = arr
-                            .iter()
-                            .map(|(_, v)| match from_zval(v) {
-                                Some(PHPValue::Int(b)) if b >= 0 && b <= 255 => b as u8,
-                                Some(PHPValue::Int(b)) if b < 0 || b > 255 => {
-                                    let msg = format!("Invalid value {} in array for Value::blob. Must be an array of integers [0, 255]", b);
-                                    let error = AerospikeException::new(&msg);
-                                    throw_object(error.into_zval(true).unwrap()).unwrap();
-                                    0
-                                },
-                                _ => {
-                                    let error = AerospikeException::new("Invalid array for Value::blob. Must be an array of integers [0, 255]");
-                                    throw_object(error.into_zval(true).unwrap()).unwrap();
-                                    0
-                                },
-                            })
-                            .collect();
-                        return Ok(PHPValue::Blob(val_arr));
+                let arr = match zval.array() {
+                    Some(a) if a.has_sequential_keys() => a,
+                    _ => {
+                        return throw_msg(
+                            "Invalid Array type for Value::blob. Must be an array of integers [0, 255]",
+                            PHPValue::Blob(Vec::new()),
+                        );
                     }
                 };
-                return Err(format!(
-                    "Invalid Array type for Value::blob. Must be an array of integers [0, 255]"
-                )
-                .into());
+                let mut bytes: Vec<u8> = Vec::with_capacity(arr.len());
+                for (_, v) in arr.iter() {
+                    match from_zval(v) {
+                        Some(PHPValue::Int(b)) if (0..=255).contains(&b) => bytes.push(b as u8),
+                        Some(PHPValue::Int(b)) => {
+                            return throw_msg(
+                                &format!(
+                                    "Invalid value {b} in array for Value::blob. Must be an array of integers [0, 255]"
+                                ),
+                                PHPValue::Blob(Vec::new()),
+                            );
+                        }
+                        _ => {
+                            return throw_msg(
+                                "Invalid array for Value::blob. Must be an array of integers [0, 255]",
+                                PHPValue::Blob(Vec::new()),
+                            );
+                        }
+                    }
+                }
+                Ok(PHPValue::Blob(bytes))
             }
-            _ => {
-                return Err(format!(
-                    "Invalid Array type for Value::blob. Must be an array of integers [0, 255]"
-                )
-                .into())
-            }
+            _ => throw_msg(
+                "Invalid Array type for Value::blob. Must be an array of integers [0, 255]",
+                PHPValue::Blob(Vec::new()),
+            ),
         }
     }
 
@@ -11684,20 +8978,20 @@ impl Value {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Implementation of conversion traits for interoperability with the `proto` module.
-impl From<&proto::Key> for Key {
-    fn from(other: &proto::Key) -> Self {
+/// Conversion traits for interoperability with the underlying aerospike crate types.
+impl From<&aero::Key> for Key {
+    fn from(other: &aero::Key) -> Self {
         Key { _as: other.clone() }
     }
 }
 
-impl From<&proto::Record> for Record {
-    fn from(other: &proto::Record) -> Self {
+impl From<&aero::Record> for Record {
+    fn from(other: &aero::Record) -> Self {
         Record { _as: other.clone() }
     }
 }
 
-impl From<&Bin> for proto::Bin {
+impl From<&Bin> for aero::Bin {
     fn from(other: &Bin) -> Self {
         other._as.clone()
     }
@@ -11712,7 +9006,6 @@ impl std::fmt::Display for AeroPHPError {
     }
 }
 
-#[allow(non_camel_case_types)]
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
 // ResultCode
@@ -11721,11 +9014,12 @@ impl std::fmt::Display for AeroPHPError {
 
 /// ResultCode signifies the database operation error codes.
 /// The positive numbers align with the server side file kvs.h.
-#[php_class(name = "Aerospike\\ResultCode")]
-struct ResultCode {}
+#[php_class]
+#[php(name = "Aerospike\\ResultCode")]
+pub struct ResultCode {}
 
 #[php_impl]
-#[derive(ZvalConvert)]
+#[allow(non_camel_case_types)]
 impl ResultCode {
     /// GRPC_ERROR is wrapped and directly returned from the grpc library
     const GRPC_ERROR: i32 = -21;
@@ -12112,62 +9406,122 @@ impl ResultCode {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Utility methods
-fn assert_map(val: &PHPValue) -> bool {
-    match val {
-        PHPValue::HashMap(_) => true,
-        _ => {
-            let error = AerospikeException::new("Invalid type");
-            throw_object(error.into_zval(true).unwrap()).unwrap();
-            false
+/// Returns true iff every element is `PHPValue::HLL`. Throws an Aerospike exception
+/// (no panic) on the first non-HLL value encountered.
+fn assert_hll_list(val: &[PHPValue]) -> bool {
+    for v in val {
+        if !matches!(v, PHPValue::HLL(_)) {
+            let _ = throw_msg::<()>("Invalid type", ());
+            return false;
         }
     }
+    true
 }
 
-fn assert_hll_list(val: &Vec<PHPValue>) -> bool {
-    // try to find a non-hll value
-    val.iter()
-        .find(|val| match val {
-            PHPValue::HLL(_) => false,
-            _ => {
-                let error = AerospikeException::new("Invalid type");
-                throw_object(error.into_zval(true).unwrap()).unwrap();
-                return true;
-            }
-        })
-        .is_none()
-}
-
-fn persist_client(key: &str, c: Arc<Mutex<grpc::BlockingClient>>) -> Result<()> {
-    trace!("Persisting Client pointer: {:p}", &c);
-    let mut clients = CLIENTS.lock().unwrap();
-    clients.insert(key.into(), c);
-    Ok(())
-}
-
-fn get_persisted_client(key: &str) -> Option<Zval> {
-    let clients = CLIENTS.lock().unwrap();
-    let grpc_client = clients.get(key.into())?;
+/// Build a PHP `Zval` wrapping a fresh `Client` PHP object that shares the `Arc<aero::Client>`
+/// from the given cache entry. Each PHP-visible `$client` is its own Zend object; the
+/// underlying connection pool is reference-counted via `Arc`.
+fn zval_from_entry(entry: &ClientEntry) -> PhpResult<Zval> {
     let client = Client {
-        client: grpc_client.clone(),
-        socket: key.into(),
+        client: entry.client.clone(),
+        hosts: entry.hosts.clone(),
+        policy_fingerprint: entry.policy_fingerprint.clone(),
     };
-
     let mut zval = Zval::new();
-    let zo: ZBox<ZendObject> = client.into_zend_object().ok()?;
-    zo.set_zval(&mut zval, false).ok()?;
-    Some(zval)
+    let zo: ZBox<ZendObject> = client
+        .into_zend_object()
+        .map_err(|_| PhpException::default("failed to allocate Client zend object".into()))?;
+    zo.set_zval(&mut zval, false)
+        .map_err(|_| PhpException::default("failed to set Client zval".into()))?;
+    Ok(zval)
 }
 
 /// Used by the `phpinfo()` function and when you run `php -i`.
-/// This will probably be simplified with another macro eventually!
 pub extern "C" fn php_module_info(_module: *mut ModuleEntry) {
     info_table_start!();
-    info_table_row!("Aerospike Client PHP (IPC)", "enabled");
+    info_table_row!("Aerospike Client PHP", "enabled");
+    info_table_row!("Version", env!("CARGO_PKG_VERSION"));
+    info_table_row!("Transport", "native (aerospike-client-rust)");
     info_table_end!();
 }
 
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        .class::<ExpType>()
+        .class::<Expression>()
+        .class::<ReadModeAP>()
+        .class::<ReadModeSC>()
+        .class::<RecordExistsAction>()
+        .class::<QueryDuration>()
+        .class::<CommitLevel>()
+        .class::<ConsistencyLevel>()
+        .class::<GenerationPolicy>()
+        .class::<Expiration>()
+        .class::<Concurrency>()
+        .class::<ListOrderType>()
+        .class::<MapOrderType>()
+        .class::<CDTContext>()
+        .class::<ReadPolicy>()
+        .class::<AdminPolicy>()
+        .class::<InfoPolicy>()
+        .class::<WritePolicy>()
+        .class::<QueryPolicy>()
+        .class::<ScanPolicy>()
+        .class::<IndexCollectionType>()
+        .class::<ParticleType>()
+        .class::<IndexType>()
+        .class::<Filter>()
+        .class::<Statement>()
+        .class::<PartitionStatus>()
+        .class::<PartitionFilter>()
+        .class::<Recordset>()
+        .class::<Bin>()
+        .class::<Record>()
+        .class::<BatchPolicy>()
+        .class::<BatchReadPolicy>()
+        .class::<BatchWritePolicy>()
+        .class::<BatchDeletePolicy>()
+        .class::<BatchUdfPolicy>()
+        .class::<Operation>()
+        .class::<BatchRecord>()
+        .class::<BatchRead>()
+        .class::<BatchWrite>()
+        .class::<BatchDelete>()
+        .class::<BatchUdf>()
+        .class::<UdfLanguage>()
+        .class::<UdfMeta>()
+        .class::<UserRole>()
+        .class::<Role>()
+        .class::<Privilege>()
+        .class::<CdtListReturnType>()
+        .class::<CdtListWriteFlags>()
+        .class::<CdtListSortFlags>()
+        .class::<CdtListPolicy>()
+        .class::<CdtListOperation>()
+        .class::<CdtMapReturnType>()
+        .class::<CdtMapWriteMode>()
+        .class::<CdtMapWriteFlags>()
+        .class::<CdtMapPolicy>()
+        .class::<CdtMapOperation>()
+        .class::<CdtHllWriteFlags>()
+        .class::<CdtHllPolicy>()
+        .class::<CdtHllOperation>()
+        .class::<CdtBitwiseWriteFlags>()
+        .class::<CdtBitwiseResizeFlags>()
+        .class::<CdtBitwiseOverflowAction>()
+        .class::<CdtBitwisePolicy>()
+        .class::<CdtBitwiseOperation>()
+        .class::<ClientPolicy>()
+        .class::<Client>()
+        .class::<AerospikeException>()
+        .class::<Key>()
+        .class::<GeoJSON>()
+        .class::<Json>()
+        .class::<Infinity>()
+        .class::<Wildcard>()
+        .class::<BLOB>()
+        .class::<HLL>()
+        .class::<Value>()
+        .class::<ResultCode>()
 }

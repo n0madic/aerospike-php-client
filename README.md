@@ -1,244 +1,295 @@
-[![PHP version](https://img.shields.io/badge/php-%3E%3D%208.1-8892BF.svg)](https://github.com/aerospike/php-client)
-# Aerospike PHP 8 Client (v1.4.0)
+[![PHP version](https://img.shields.io/badge/php-8.1--8.5-8892BF.svg)](https://github.com/aerospike/php-client)
+# Aerospike PHP 8 Client (v2.0.0)
 
-An [Aerospike](https://www.aerospike.com/) client library for PHP 8
+An [Aerospike](https://www.aerospike.com/) client library for PHP 8, built as a native Rust extension
+using [aerospike-client-rust v2.1](https://crates.io/crates/aerospike).
 
-## PHP-Client Introduction
+## Overview
 
-This is the documentation for the Aerospike `PHP-Client`. The `PHP-Client` comprises of two essential components: 
-* the client itself, written in Rust as a PHP extension
-* the connection manager (the "Aerospike Connection Manager" or "ACM") written in Go which serves as a shared resource among PHP processes. The ACM efficiently handles all requests and responses between the PHP processes and the Aerospike server, and can be configured to run as a daemonized service.
+The PHP extension connects directly to an Aerospike cluster — no daemon, no gRPC, no Unix socket.
+Each PHP-FPM worker maintains its own persistent connection pool.
+
+> **Upgrading from v1.x?** See [CHANGELOG.md](./CHANGELOG.md) for the full list of breaking changes.
+> The most important change: `Client::connect` now takes a host string instead of a socket path.
 
 ## Dependencies
-***NOTE:*** Any missing dependencies will be installed by the installation script
 
-* PHP (v8.1-8.4)
-* Cargo (Rust package manager)
-* Aerospike server
-* Linux or MacOS (Darwin)
-* PHPUnit
-* rustc (Rust compiler) >= v1.74
-* Go Toolchain [Go Toolchains - The Go Programming Language](https://go.dev/doc/toolchain)
-* Protobuf Compiler [protoc-gen-go command - google.golang.org/protobuf/cmd/protoc-gen-go - Go Packages](https://pkg.go.dev/google.golang.org/protobuf/cmd/protoc-gen-go)
-* ext-php-rs (PHP extension) v0.13.1 [github repository link](https://github.com/davidcole1340/ext-php-rs/tree/master)
+* PHP (v8.1–8.5) with development headers (`php-dev`)
+* Rust toolchain (rustc ≥ 1.95, Cargo). Pinned via `rust-toolchain.toml`.
+* OpenSSL development headers (`libssl-dev`)
+* Aerospike Server (v6.x, v7.x, or v8.x)
+* Linux or macOS (Darwin)
 
 ## Build & Installation
-There are 2 ways to build and install the `PHP-Client`:
-1. direct script download and execution (also clones the repo for you)
-2. manually clone the repo first and then run script from there
 
-The install script builds both the `PHP-Client` and the ACM, as well as installing all of the dependencies.
-## Automatic Method: Direct download and execution of installation script:
-The installation script will clone the repo into a subfolder so execute this command directly above where you want the repo to go
+### Automatic (script)
 
-For MacOS (Darwin):
+For macOS:
 ```shell
-curl -O https://raw.githubusercontent.com/aerospike/php-client/refs/heads/main/build/install_as_php_client_mac.zsh; chmod +x install_as_php_client_mac.zsh; ./install_as_php_client_mac.zsh
+curl -O https://raw.githubusercontent.com/aerospike/php-client/refs/heads/main/build/install_as_php_client_mac.zsh
+chmod +x install_as_php_client_mac.zsh
+./install_as_php_client_mac.zsh
 ```
-***NOTE***: the default MacOS installation is an all user-local installation, requiring no root or sudo access
 
 For Linux:
 ```shell
-curl -O https://raw.githubusercontent.com/aerospike/php-client/refs/heads/main/build/install_as_php_client_linux.sh; chmod +x install_as_php_client_linux.sh; sudo ./install_as_php_client_linux.sh
+curl -O https://raw.githubusercontent.com/aerospike/php-client/refs/heads/main/build/install_as_php_client_linux.sh
+chmod +x install_as_php_client_linux.sh
+sudo ./install_as_php_client_linux.sh
 ```
-### Manual method: repo clone followed by execution of the installation script:
-1. Clone the repo
-2. Run the installation script for your system:
 
-    for MacOS (darwin):
-	```shell
-	. ./php-client/build/install_as_php_client_mac.zsh
-	 ```
-	 or for linux:
-	```shell
-	sudo ./php-client/build/install_as_php_client_linux.sh
-	 ```
+After installation, re-source your shell config (e.g. `. ~/.zshrc`).
 
-***NOTE***: the default linux installation contains system-wide installations and will require root / sudo access 
+### Manual
 
-After the installation script completes, re-source your shell env config files to make sure your `PATH` is updated.  Eg, on MacOS:
 ```shell
-. ~/.zshrc
+git clone https://github.com/aerospike/php-client.git
+cd php-client
+cargo build --release
 ```
 
-If you encounter errors during installation, you can try running the install script again as the install scripts attempt to be idempotent.  As a last resort, the script commands can be run manually one-by-one as needed.
+Copy the built extension to PHP's extension directory and enable it:
+```shell
+EXT_DIR=$(php -r 'echo ini_get("extension_dir");')
+cp target/release/libaerospike_php.so "$EXT_DIR/"
+echo "extension=libaerospike_php.so" >> "$(php --ini | grep 'Loaded Configuration' | awk '{print $NF}')"
+```
 
+On macOS, the extension is `.dylib`:
+```shell
+cp target/release/libaerospike_php.dylib "$EXT_DIR/"
+```
 
+### Running tests
 
-### Configuring the Aerospike Connection Manager:
+Start an Aerospike server and run:
+```shell
+AEROSPIKE_HOSTS=127.0.0.1:3000 ./vendor/bin/phpunit tests/
+```
 
-***NOTE:*** Please view the README.md in the [`php-client/aerospike-connection-manager`](./aerospike-connection-manager/README.md) directory for more information about the setting up the aerospike-connection-manager  and configuring the client policy.
-
-***NOTE:*** You should have an [Aerospike server](https://aerospike.com/download/) up and running to test against.
-
-### Manual Build and Install of the PHP-Client (optional)
-
-In case the installation script fails to build the `PHP-Client`, or if you just want to run specific build commands, you may do so manually:
-* To manually build and install the `PHP-Client` in the default paths run the makefile
-
-	Note: sudo is only needed when running a system-wide php installation, which is not the default install for MacOS (although it could be)
-	```shell
-	cd php-client
-	make
-	```
-* To build and install the `PHP-Client` in manually, run the following commands:
-	```shell 
-	cd php-client
-	cargo clean && cargo build --release
-	```
-
-- Once the build is successful, copy the file from `target/release/libaerospike$(EXTENSION)` [$EXTENSION = .so for Linux and .dylib for Mac and Windows] to the PHP extension directory path. 
-- Add `extension=libaerospike$(EXTENSION)` to your `php.ini` file. 
-- Run  `phpunit tests/` to ensure the setup and build were successful. 
-
-***NOTE***: The Aerospike server must be running for the tests to run successfully. 
-
-### Running your PHP Project
-
-  - Before running your project PHP scripts, the following must be running:
-  	- An Aerospike Connection Manager (ACM)
-	- An Aerospike Server that the ACM can connect to 
-  - Once the build is successful and all the pre-requisites are met, import the Aerospike namespace to your PHP script:
-	```PHP
-	namespace Aerospike;
-	```
-  - To connect to the Aerospike server via the ACM add:
-	```PHP
-	$socket = "/tmp/asld_grpc.sock";
-	$client = Client::connect($socket); 
-	```
-  - Run the php script
-  If there are no Errors then you have successfully connected to the Aerospike DB. 
-
-	***NOTE:*** If the connection manager daemon crashes, you will have to manually remove the file `/tmp/asld_grpc.sock` from its path.
-	```shell
-	sudo rm -r /tmp/asld_grpc.sock
-	```
-
-  - Policy Configuration (Read, Write, Batch and Info) - These policies can be set via getters and setter in the php code. On creation of an object of that policy class (eg, WritePolicy), the default values are initialized for that policy & can be overidden with associated setters. For example: 
-
-	```php
-	// Instantiate the WritePolicy object
-	$writePolicy = new WritePolicy();
-
-	$writePolicy->setRecordExistsAction(RecordExistsAction::Update);
-	$writePolicy->setGenerationPolicy(GenerationPolicy::ExpectGenEqual);
-	$writePolicy->setExpiration(Expiration::Seconds(3600)); // Expiring in 1 hour
-	$writePolicy->setMaxRetries(3);
-	$writePolicy->setSocketTimeout(5000);
-	```
-
-## Documentation
-
-* Reference Documentation can be found [here] (https://aerospike.github.io/php-client/)
-* Aerospike Documentation can be found [here](https://aerospike.com/docs/)
-
-## Issues
-
-If there are any bugs, feature requests or feedback -> please create an issue on [GitHub](https://github.com/aerospike/php-client/issues). Issues will be regularly reviewed by the Aerospike Client Engineering Team.
+Or via Docker:
+```shell
+docker run -d --name aerospike -p 3000:3000 aerospike/aerospike-server
+AEROSPIKE_HOSTS=127.0.0.1:3000 ./vendor/bin/phpunit tests/
+```
 
 ## Usage
 
-**The following is a very simple example of CRUD operations in an Aerospike database.**
+### Connecting
 
 ```php
 <?php
 namespace Aerospike;
 
-try {
-  $socket = "/tmp/asld_grpc.sock";
-  $client = Client::connect($socket);
-  var_dump($client->socket);
-}
-catch(AerospikeException $e) {
-  var_dump($e);
-}
+// Single node
+$client = Client::connect("127.0.0.1:3000");
 
+// Seed list for cluster discovery
+$client = Client::connect("node1:3000,node2:3000");
 
-$key = new Key("namespace", "set_name", 1);
+// With client policy (auth, TLS, pool sizes)
+$policy = new ClientPolicy();
+$client = Client::connect("127.0.0.1:3000", $policy);
+```
 
-//PUT on differnet types of values
+### TLS
+
+```php
+$policy = new ClientPolicy();
+// Trust a custom CA (PEM). Pass null to use Mozilla's webpki-roots bundle.
+$policy->setTls("/etc/aerospike/certs/ca.pem", null, null, null);
+
+// Mutual TLS with a client cert + key (both PEM):
+$policy->setTls(
+    "/etc/aerospike/certs/ca.pem",
+    "/etc/aerospike/certs/client.crt",
+    "/etc/aerospike/certs/client.key",
+    null,
+);
+
+$client = Client::connect("aerospike.example.com:4333", $policy);
+```
+
+### Single-record operate (CDT, multi-op atomicity)
+
+```php
 $wp = new WritePolicy();
-$bin1 = new Bin("bin1", 111);
-$bin2 = new Bin("bin2", "string");
-$bin3 = new Bin("bin3", 333.333);
-$bin4 = new Bin("bin4", [
-	"str", 
-	1984, 
-	333.333, 
-	[1, "string", 5.1], 
-	[
-		"integer" => 1984, 
-		"float" => 333.333, 
-		"list" => [1, "string", 5.1]
-	] 
+$key = new Key("test", "demo", "user-42");
+$ops = [
+    Operation::put(new Bin("level", 5)),
+    ListOp::append(new ListPolicy(ListOrderType::Unordered()), "tags", ["php"]),
+    Operation::get(null),
+];
+$record = $client->operate($wp, $key, $ops);
+var_dump($record?->getBins());
+```
+
+### Basic CRUD
+
+```php
+<?php
+namespace Aerospike;
+
+$client = Client::connect("127.0.0.1:3000");
+
+$key = new Key("test", "demo", 1);
+$wp  = new WritePolicy();
+
+// PUT
+$client->put($wp, $key, [
+    new Bin("name", "Alice"),
+    new Bin("age",  30),
+    new Bin("tags", ["php", "aerospike"]),
 ]);
 
-$bin5 = new Bin("bin5", [
-	"integer" => 1984, 
-	"float" => 333.333, 
-	"list" => [1, "string", 5.1], 
-	null => [
-		"integer" => 1984, 
-		"float" => 333.333, 
-		"list" => [1, "string", 5.1]
-	],
-	"" => [ 1, 2, 3 ],
-]);
-
-$client->put($wp, $key, [$bin1, $bin2, $bin3, $bin4, $bin5]);
-
-//GET
-$rp = new ReadPolicy();
+// GET
+$rp     = new ReadPolicy();
 $record = $client->get($rp, $key);
-var_dump($record->bins);
+var_dump($record->getBins());
 
-//UPDATE
-$client->prepend($wp, $key, [new Bin("bin2", "prefix_")]);
-$client->append($wp, $key, [new Bin("bin2", "_suffix")]);
+// UPDATE (append / prepend)
+$client->append($wp, $key, [new Bin("name", "!")]);
+$client->prepend($wp, $key, [new Bin("name", "Hello, ")]);
 
-//DELETE
-$deleted = $client->delete($wp, $key);
-var_dump($deleted);
-
-$client->close()
+// DELETE
+$existed = $client->delete($wp, $key);
+var_dump($existed); // bool(true)
 ```
 
-**Batch Operations Examples:**
+### Batch Operations
 
 ```php
 <?php
-
 namespace Aerospike;
 
-$namespace = "test";
-$set = "test";
-$socket = "/tmp/asld_grpc.sock";
+$client = Client::connect("127.0.0.1:3000");
+$bp  = new BatchPolicy();
+$key = new Key("test", "demo", 1);
 
-$client = Client::connect($socket);
-echo "* Connected to the local daemon: $client->hosts \n";
+// Batch write + read + delete in one call
+$bw = new BatchWrite(new BatchWritePolicy(), $key, [
+    Operation::put(new Bin("x", 42)),
+]);
+$br = new BatchRead(new BatchReadPolicy(), $key, []);
+$bd = new BatchDelete(new BatchDeletePolicy(), $key);
 
-$key = new Key($namespace, $set, 1);
-
-$wp = new WritePolicy();
-$client->put($wp, $key, [new Bin("bini", 1), new Bin("bins", "b"), new Bin("bin1", [1, 2, 3, 4])]);
-
-$bwp = new BatchWritePolicy();
-$exp = Expression::lt(Expression::intBin("bin1"), Expression::intVal(1));
-$batchWritePolicy->setFilterExpression($exp);
-$ops = [Operation::put(new Bin("put_op", "put_val"))];
-$bw = new BatchWrite($bwp, $key, $ops);
-
-$brp = new BatchReadPolicy();
-$br = new BatchRead($brp, $key, []);
-
-$bdp = new BatchDeletePolicy();
-$bd = new BatchDelete($bdp, $key);
-
-$bp = new BatchPolicy();
-$recs = $client->batch($bp, [$bw, $br, $bd]);
-var_dump($recs);
-
+$results = $client->batch($bp, [$bw, $br, $bd]);
+var_dump($results);
 ```
 
-For more detailed examples you can see the examples direcotry [php-client/examples](./examples/)
+### Policy Configuration
+
+```php
+<?php
+namespace Aerospike;
+
+$wp = new WritePolicy();
+$wp->setRecordExistsAction(RecordExistsAction::Update());
+$wp->setGenerationPolicy(GenerationPolicy::ExpectGenEqual());
+$wp->setExpiration(Expiration::Seconds(3600));
+$wp->setMaxRetries(3);
+$wp->setSocketTimeout(5000);
+$wp->setSendKey(true);
+```
+
+### Scan & Query
+
+```php
+<?php
+namespace Aerospike;
+
+$client = Client::connect("127.0.0.1:3000");
+
+// Scan all records
+$sp  = new ScanPolicy();
+$pf  = PartitionFilter::all();
+$rs  = $client->scan($sp, $pf, "test", "demo");
+while ($rec = $rs->next()) {
+    var_dump($rec->getBins());
+}
+
+// Query with secondary index filter
+$qp   = new QueryPolicy();
+$pf   = PartitionFilter::all();
+$stmt = new Statement("test", "demo", Filter::Equal("age", 30));
+$rs   = $client->query($qp, $pf, $stmt);
+while ($rec = $rs->next()) {
+    var_dump($rec->getBins());
+}
+```
+
+## Performance
+
+Latency from a single PHP process to an Aerospike server in the same Docker network
+(5000 ops per measurement, 100-byte string bin, `test` namespace):
+
+| Operation | mean   | p50    | p95    | p99    |
+|-----------|--------|--------|--------|--------|
+| put       | 98 µs  | 93 µs  | 126 µs | 159 µs |
+| get       | 98 µs  | 92 µs  | 126 µs | 172 µs |
+| exists    | 93 µs  | 89 µs  | 116 µs | 145 µs |
+| delete    | 95 µs  | 90 µs  | 123 µs | 171 µs |
+
+Cold connect (cluster discovery + partition map fetch): ~75 ms per worker.
+
+> **PHP-FPM capacity planning:** every FPM worker maintains its own connection pool.
+> Total TCP connections to each Aerospike node = `N_workers × max_conns_per_node`.
+> Tune `ClientPolicy::setMaxConnsPerNode(...)` to match your worker count; the server
+> default `proto-fd-max` is 15000.
+
+Reproduce locally:
+
+```shell
+docker run -d --name aerospike -p 3000:3000 aerospike/aerospike-server
+AEROSPIKE_HOSTS=127.0.0.1:3000 php benchmark/quick_bench.php
+```
+
+A more thorough harness (phpbench) lives in [`benchmark/benchmark.php`](./benchmark/benchmark.php).
+
+## Migration from v1.x
+
+v2 keeps v1 method names where the upstream `aerospike-client-rust` 2.x API allows it.
+The table below covers everything that visibly changes for a v1 caller — anything not
+listed continues to work unchanged.
+
+| v1 / pre-2.0                                              | v2.0.0                                                                                              |
+| ---                                                        | ---                                                                                                  |
+| `Client::connect("/tmp/asld_grpc.sock")`                   | `Client::connect("127.0.0.1:3000", new ClientPolicy())`                                              |
+| `$client->socket`                                          | `$client->getHosts()` (`$client->hosts` also works via `__get`)                                      |
+| `$client->close()`                                         | no-op — managed internally                                                                            |
+| `$record->bins`, `$record->generation`, `$record->ttl`     | `$record->getBins()` / `getGeneration()` / `getTtl()` (property access works via `__get`)            |
+| `$record->getTtl()` (absolute Unix timestamp)              | **unchanged** — still absolute. For remaining seconds: `getRemainingTtl()`                            |
+| `MapOp::getByKeys([$k], MapReturnType::value())` → 1 value | now returns a list per key — index with `$result[0]`                                                  |
+| `BatchPolicy::setConcurrentNodes($n)`                      | **unchanged** (restored as alias). Use `setConcurrency(Concurrency::Parallel())` for typed control. |
+| `Expression::xor([...])` (integer XOR)                     | **unchanged** (alias for `intXor`). New `Expression::boolXor()` for boolean XOR.                     |
+| `UdfMeta::getLanguage()` → `UdfLanguage`                   | **unchanged** — returns `UdfLanguage::Lua()`                                                          |
+| `$policy->setAuthExternal($u, $p)` without TLS             | call `$policy->setTls(...)` before `Client::connect()` (LDAP password used to go in clear)            |
+| `$policy->setTotalTimeout(PHP_INT_MAX)`                    | throws `AerospikeException`; bound the value to ≤ `u32::MAX` ms (~49.7 d)                            |
+| `ReadPolicy::send_key`                                     | gone — only on write-side policies                                                                    |
+| `IndexType::Blob()`                                        | gone — no equivalent in aerospike-rust 2.x                                                            |
+| ACM daemon (`asld`)                                        | gone — extension talks to the cluster directly                                                        |
+
+Search-and-replace tip for `$record->bins`-style code that you'd rather migrate to the
+explicit method API:
+
+```shell
+# Property access still works via __get, but if you prefer method form:
+rg -l '\$record->(bins|generation|ttl|key)' --type=php | \
+    xargs sed -i.bak -E 's/\$record->(bins|generation|ttl|key)/$record->get\u\1()/g'
+```
+
+## Documentation
+
+* Reference Documentation: [aerospike.github.io/php-client](https://aerospike.github.io/php-client/)
+* Aerospike Documentation: [aerospike.com/docs](https://aerospike.com/docs/)
+* IDE Stubs: [`php_stubs/libaerospike-php-stubsv2.0.0.php`](./php_stubs/libaerospike-php-stubsv2.0.0.php)
+
+## Issues
+
+If there are any bugs, feature requests or feedback, please create an issue on
+[GitHub](https://github.com/aerospike/php-client/issues).
+Issues are regularly reviewed by the Aerospike Client Engineering Team.
+
+## Examples
+
+See the [`examples/`](./examples/) directory for more detailed usage examples.

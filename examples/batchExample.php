@@ -13,14 +13,15 @@ use Aerospike\BatchRead;
 use Aerospike\BatchDelete;
 use Aerospike\BatchPolicy;
 use Aerospike\ReadPolicy;
+use Aerospike\InfoPolicy;
 
 $namespace = "test";
 $set = "users";
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
 // Connect to Aerospike server
-$client = Client::connect($socket);
-echo "* Connected to the aerospike-connection-manager: {$client->socket} \n";
+$client = Client::connect($hosts);
+echo "* Connected to Aerospike: {$client->getHosts()} \n";
 
 // Truncate the set (clear any existing data)
 $ip = new InfoPolicy();
@@ -68,5 +69,5 @@ $rp = new ReadPolicy();
 foreach ($users as $userData) {
     $key = new Key($namespace, $set, $userData['username']);
     $recs = $client->get($rp, $key);
-    echo "User: " . $userData['username'] . ", New Age: " . $recs->bins["age"] . "\n";
+    echo "User: " . $userData['username'] . ", New Age: " . $recs->getBins()["age"] . "\n";
 }

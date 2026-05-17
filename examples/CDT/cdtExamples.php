@@ -4,10 +4,10 @@ namespace Aerospike;
 
 $namespace = "test";
 $set = "test";
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
-$client = Client::connect($socket);
-echo "* Connected to the local daemon: $client->socket \n";
+$client = Client::connect($hosts);
+echo "* Connected to Aerospike: $client->getHosts() \n";
 
 $key = new Key($namespace, $set, 1);
 
@@ -34,7 +34,7 @@ $recs = $client->batch($bp, [$bw]);
 $rp = new ReadPolicy();
 $record = $client->get($rp, $key);
 echo "\n Record: ";
-$array = $record->bins['list'];
+$array = $record->getBins()['list'];
 echo "Count: ".count($array);
 
 $lp = new ListPolicy(ListOrderType::unordered());

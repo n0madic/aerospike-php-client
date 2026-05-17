@@ -8,9 +8,9 @@ use Aerospike\Key;
 use Aerospike\PartitionFilter;
 
 
-$socket = "/tmp/asld_grpc.sock";
+$hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 // Establish connection to Aerospike server
-$client = Client::connect($socket);
+$client = Client::connect($hosts);
 
 // Define namespace and set
 $namespace = "test";
@@ -25,7 +25,7 @@ $userBins = [
 
 // Define write policy for adding data
 $writePolicy = new WritePolicy();
-$writePolicy->sendKey = true; // Ensure server returns the key upon write
+$writePolicy->setSendKey(true); // Ensure server returns the key upon write
 
 // Add sample user data to the server
 $userKeys = [];
@@ -48,9 +48,9 @@ $recordSet = $client->scan($scanPolicy, $pf, $namespace, $set, $scanBins);
 // Iterate over scan results
 while ($record = $recordSet->next()) {
     // Access bin values of each record
-    $username = $record->bins["username"];
-    $email = $record->bins["email"];
-    $age = $record->bins["age"];
+    $username = $record->getBins()["username"];
+    $email = $record->getBins()["email"];
+    $age = $record->getBins()["age"];
     
     // Display retrieved data
     echo "Username: $username, Email: $email, Age: $age\n";

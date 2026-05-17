@@ -1,0 +1,54 @@
+# Self-contained test harness — `make test-docker` brings up Aerospike CE next to a
+# PHP 8.3 + Rust container that builds the extension and runs phpunit against the
+# `test` namespace, then tears everything down. Nothing leaks into the host PHP.
+#
+# All paths are relative to this file (docker/), so the build context is `..`.
+services:
+  aerospike:
+    # aerospike-server image is amd64-only; force it explicitly so Docker Desktop
+    # on Apple Silicon transparently runs it under QEMU rather than failing to find
+    # an arm64 manifest entry.
+    platform: linux/amd64
+    image: aerospike/aerospike-server:latest
+    # The image regenerates /etc/aerospike/aerospike.conf from its own template at
+    # every start (envsubst), so a bind-mounted config is overwritten anyway — the
+    # stock template (namespace `test`, storage-engine device, 4 GB file) is what
+    # we want for these tests. Only `nofile` ulimit needs lifting since the default
+    # 1024 is below the server's `proto-fd-max` of 15000.
+    ulimits:
+      nofile:
+        soft: 15000
+        hard: 15000
+    healthcheck:
+      # `asinfo -v build` returns the server version once Aerospike is ready to accept
+      # client traffic — tighter than a plain TCP probe. The Python startup adds a
+      # couple of seconds, so we give the check a generous timeout.
+      test: ["CMD-SHELL", "asinfo -v build >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  tester:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    depends_on:
+      aerospike:
+        condition: service_healthy
+    volumes:
+      - ..:/app
+      # Cache cargo registry + target dir between runs so the second `make test-docker`
+      # only rebuilds the changed crate, not the dependency graph.
+      - cargo-registry:/root/.cargo/registry
+      - cargo-git:/root/.cargo/git
+      - target-cache:/app/target
+    environment:
+      AEROSPIKE_HOSTS: aerospike:3000
+    entrypoint: ["/app/docker/test.sh"]
+    command: ["--testsuite", "non_security_tests"]
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  target-cache:

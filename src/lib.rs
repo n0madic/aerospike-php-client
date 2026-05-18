@@ -24,8 +24,11 @@
 use aerospike::{self as aero};
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::os::raw::c_int;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -69,6 +72,113 @@ static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 static CLIENTS: LazyLock<Mutex<HashMap<String, ClientEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+////////////////////////////////////////////////////////////////////////////////////////////
+//
+//  INI configuration
+//
+//  Four INI directives override the corresponding policy defaults at policy-construction
+//  time. `php.ini`, `php-fpm.conf` pools, `.user.ini`, and runtime `ini_set()` all work.
+//
+//      aerospike.tend_interval     — ClientPolicy::tend_interval (ms)
+//      aerospike.connect_timeout   — ClientPolicy::timeout (ms)
+//      aerospike.read_timeout      — ReadPolicy::total_timeout (ms)
+//      aerospike.write_timeout     — WritePolicy::total_timeout (ms)
+//
+//  Each entry is registered with a string default of "0", which we treat as "no override
+//  — use the upstream `aerospike-client-rust` default". Any positive integer wins over
+//  the upstream default at construction. An explicit `$policy->set*()` call always wins
+//  over the INI value (the INI is only consulted in `__construct`).
+//
+////////////////////////////////////////////////////////////////////////////////////////////
+
+const INI_NAME_TEND_INTERVAL: &str = "aerospike.tend_interval";
+const INI_NAME_CONNECT_TIMEOUT: &str = "aerospike.connect_timeout";
+const INI_NAME_READ_TIMEOUT: &str = "aerospike.read_timeout";
+const INI_NAME_WRITE_TIMEOUT: &str = "aerospike.write_timeout";
+
+/// `"0"` is the registered default; `on_modify_long` parses it into `AtomicI64::new(0)`
+/// and `ini_long_positive` interprets 0 as "no override".
+const INI_DEFAULT: &str = "0";
+
+static INI_TEND_INTERVAL: AtomicI64 = AtomicI64::new(0);
+static INI_CONNECT_TIMEOUT: AtomicI64 = AtomicI64::new(0);
+static INI_READ_TIMEOUT: AtomicI64 = AtomicI64::new(0);
+static INI_WRITE_TIMEOUT: AtomicI64 = AtomicI64::new(0);
+
+/// PHP `OnUpdateLong`-style callback. Parses the new value as a signed integer and stores
+/// it into the `AtomicI64` passed through `mh_arg1`. PHP invokes this on module startup
+/// (with the configured INI value or the registered default) and again on every
+/// `ini_set()` for the directive. Returning `0` is SUCCESS; `-1` is FAILURE.
+unsafe extern "C" fn on_modify_long(
+    _entry: *mut ext_php_rs::ffi::zend_ini_entry,
+    new_value: *mut ext_php_rs::ffi::zend_string,
+    mh_arg1: *mut c_void,
+    _mh_arg2: *mut c_void,
+    _mh_arg3: *mut c_void,
+    _stage: c_int,
+) -> c_int {
+    if new_value.is_null() || mh_arg1.is_null() {
+        return 0;
+    }
+    let parsed: i64 = unsafe {
+        let zs = &*new_value;
+        let bytes = std::slice::from_raw_parts(zs.val.as_ptr().cast::<u8>(), zs.len);
+        match std::str::from_utf8(bytes).map(str::trim) {
+            Ok("") => 0,
+            Ok(s) => match s.parse() {
+                Ok(v) => v,
+                Err(_) => return -1,
+            },
+            Err(_) => return -1,
+        }
+    };
+    unsafe {
+        let cell = &*(mh_arg1 as *const AtomicI64);
+        cell.store(parsed, Ordering::Relaxed);
+    }
+    0
+}
+
+fn ini_entry_for(name: &str, atomic: &'static AtomicI64) -> ext_php_rs::zend::IniEntryDef {
+    let mut entry = ext_php_rs::zend::IniEntryDef::new(
+        name.to_string(),
+        INI_DEFAULT.to_string(),
+        &ext_php_rs::flags::IniEntryPermission::All,
+    );
+    entry.on_modify = Some(on_modify_long);
+    entry.mh_arg1 = atomic as *const AtomicI64 as *mut c_void;
+    entry
+}
+
+/// Module startup hook wired via `#[php(startup = aerospike_php_startup)]`. PHP invokes
+/// this after the extension is loaded; we register our INI entries here so PHP knows about
+/// them (no "PHP Warning: Unknown INI entry" for our directives) and will call back into
+/// `on_modify_long` to populate the atomics from the configured value.
+pub extern "C" fn aerospike_php_startup(_ty: c_int, mod_num: c_int) -> c_int {
+    let entries = vec![
+        ini_entry_for(INI_NAME_TEND_INTERVAL, &INI_TEND_INTERVAL),
+        ini_entry_for(INI_NAME_CONNECT_TIMEOUT, &INI_CONNECT_TIMEOUT),
+        ini_entry_for(INI_NAME_READ_TIMEOUT, &INI_READ_TIMEOUT),
+        ini_entry_for(INI_NAME_WRITE_TIMEOUT, &INI_WRITE_TIMEOUT),
+    ];
+    ext_php_rs::zend::IniEntryDef::register(entries, mod_num);
+    0
+}
+
+/// Returns `Some(v)` only when the INI value is a positive integer that fits in u32.
+/// Zero (the registered default) and negative values both mean "no override — use the
+/// underlying library default". Values that overflow u32 are also treated as no override
+/// rather than silently truncating; the user gets the upstream default and can detect
+/// the mistake via the explicit setter (`setTendInterval(u32::MAX + 1)` throws).
+fn ini_long_positive(atomic: &AtomicI64) -> Option<u32> {
+    let v = atomic.load(Ordering::Relaxed);
+    if v > 0 && v <= u32::MAX as i64 {
+        Some(v as u32)
+    } else {
+        None
+    }
+}
 
 /// Convert an aerospike error to a PHP exception and throw it. Always returns `Ok(default)`
 /// after throwing so the surrounding function returns a sentinel value and PHP sees the
@@ -1627,7 +1737,11 @@ pub struct ReadPolicy {
 #[php_impl]
 impl ReadPolicy {
     pub fn __construct() -> Self {
-        ReadPolicy::default()
+        let mut p = ReadPolicy::default();
+        if let Some(v) = ini_long_positive(&INI_READ_TIMEOUT) {
+            p._as.base_policy.total_timeout = v;
+        }
+        p
     }
 
     /// MaxRetries determines the maximum number of retries before aborting the current transaction.
@@ -1788,7 +1902,11 @@ pub struct WritePolicy {
 #[php_impl]
 impl WritePolicy {
     pub fn __construct() -> Self {
-        WritePolicy::default()
+        let mut p = WritePolicy::default();
+        if let Some(v) = ini_long_positive(&INI_WRITE_TIMEOUT) {
+            p._as.base_policy.total_timeout = v;
+        }
+        p
     }
 
     /// RecordExistsAction qualifies how to handle writes where the record already exists.
@@ -7031,7 +7149,14 @@ fn tls_material_fingerprint(
 #[php_impl]
 impl ClientPolicy {
     pub fn __construct() -> Self {
-        ClientPolicy::default()
+        let mut p = ClientPolicy::default();
+        if let Some(v) = ini_long_positive(&INI_TEND_INTERVAL) {
+            p._as.tend_interval = v;
+        }
+        if let Some(v) = ini_long_positive(&INI_CONNECT_TIMEOUT) {
+            p._as.timeout = v;
+        }
+        p
     }
 
     /// Configure internal authentication. The server stores a hashed password; the client never
@@ -9462,6 +9587,7 @@ pub extern "C" fn php_module_info(_module: *mut ModuleEntry) {
 }
 
 #[php_module]
+#[php(startup = aerospike_php_startup)]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
         .class::<ExpType>()

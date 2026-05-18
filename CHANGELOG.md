@@ -112,6 +112,15 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
   unchanged (1000 ms, matching upstream / Java / Go), but the docstring on `ClientPolicy::setTendInterval()`
   and a new README table recommend 2000–10000 ms for deployments with 50+ workers per pod
   to bound info-protocol fan-out on the cluster.
+- Four INI directives applied at policy construction:
+  - `aerospike.tend_interval`   → `ClientPolicy::tend_interval`
+  - `aerospike.connect_timeout` → `ClientPolicy::timeout`
+  - `aerospike.read_timeout`    → `ReadPolicy::total_timeout`
+  - `aerospike.write_timeout`   → `WritePolicy::total_timeout`
+
+  Leaving a directive at `0` (the registered default) keeps the upstream default; any
+  positive integer wins. Explicit `$policy->set*()` calls always override the INI value.
+  Settable from `php.ini`, php-fpm pools, `.user.ini`, or `ini_set()` at runtime.
 
 ### Known limitations
 

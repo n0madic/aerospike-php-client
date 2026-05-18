@@ -237,6 +237,25 @@ Cold connect (cluster discovery + partition map fetch): ~75 ms per worker.
 > Tune `ClientPolicy::setMaxConnsPerNode(...)` to match your worker count; the server
 > default `proto-fd-max` is 15000.
 
+### INI directives
+
+Four `php.ini` directives override policy defaults at construction time. Standard PHP
+mechanisms apply — set in `php.ini`, a `conf.d/` snippet, php-fpm pools, `.user.ini`, or
+at runtime with `ini_set()`. An explicit `$policy->set*()` call always wins over the INI
+value (the INI is only consulted in the policy constructor).
+
+```ini
+aerospike.tend_interval = 5000        ; ClientPolicy::tend_interval (ms)
+aerospike.connect_timeout = 1000      ; ClientPolicy::timeout (ms, initial cluster connect)
+aerospike.read_timeout = 1000         ; ReadPolicy::total_timeout (ms)
+aerospike.write_timeout = 1000        ; WritePolicy::total_timeout (ms)
+```
+
+Leaving a directive at `0` (or unset) keeps the upstream `aerospike-client-rust` default.
+Any positive integer wins; values that overflow `u32` (~49.7 days in ms) silently fall
+back to the upstream default rather than truncating — use the explicit setter to surface
+nonsensical values as an `AerospikeException`.
+
 ### Production tuning for prefork PHP
 
 Unlike long-running runtimes (RoadRunner, FrankenPHP, Swoole), each php-fpm / mod_php worker

@@ -1422,7 +1422,23 @@ namespace Aerospike {
         public function getMinConnsPerNode(): int {}
 
         /**
-         * Interval (ms) between cluster-tend checks. Minimum is 10 ms.
+         * Interval (ms) between cluster-tend checks. Minimum is 10 ms; default is 1000 ms
+         * (inherited from `aerospike-client-rust`, aligned with the Java and Go clients).
+         *
+         * **Tuning guidance**: every PHP process runs its own tend loop, so the steady-state
+         * info-protocol RPS on each cluster node scales as `processes × nodes × (1 / interval)`.
+         * For prefork deployments (php-fpm, mod_php) with many concurrent workers, raise the
+         * interval to keep that fan-out manageable:
+         *
+         * | Deployment                                          | Recommended `tend_interval` |
+         * | ---                                                 | ---                          |
+         * | CLI tools, daemons, RoadRunner / FrankenPHP / Swoole | 1000 ms (default)            |
+         * | php-fpm with 10–50 workers per pod                  | 2000–5000 ms                 |
+         * | php-fpm with 100+ workers per pod                   | 5000–10000 ms                |
+         *
+         * Tradeoff: longer intervals slow detection of topology changes (node add/remove,
+         * rebalance). Failover on data-path errors is handled separately by retry policies
+         * and is unaffected.
          *
          * @return int
          */

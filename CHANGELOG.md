@@ -106,6 +106,12 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
   the `non_security_tests` suite (only subdirectories). The suite now correctly runs all 86
   tests including `ClientTest`, `BatchOpsTest`, `FilterExpTest`, `KeyTest`, `MemoryTest`,
   `UdfTest`, and the new `ServerInfoTest`.
+- Production-tuning guidance for prefork PHP added to README (`Production tuning for prefork PHP`).
+  Each php-fpm worker runs its own cluster-tend loop — unlike the legacy `aerospike-community/aerospike-client-php`
+  C extension, which consolidated tend through shared memory. The default `tend_interval` is
+  unchanged (1000 ms, matching upstream / Java / Go), but the docstring on `ClientPolicy::setTendInterval()`
+  and a new README table recommend 2000–10000 ms for deployments with 50+ workers per pod
+  to bound info-protocol fan-out on the cluster.
 
 ### Known limitations
 

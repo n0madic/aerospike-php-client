@@ -237,6 +237,34 @@ Cold connect (cluster discovery + partition map fetch): ~75 ms per worker.
 > Tune `ClientPolicy::setMaxConnsPerNode(...)` to match your worker count; the server
 > default `proto-fd-max` is 15000.
 
+### Production tuning for prefork PHP
+
+Unlike long-running runtimes (RoadRunner, FrankenPHP, Swoole), each php-fpm / mod_php worker
+runs its **own** Aerospike client instance with its own cluster-tend loop and connection
+pool. Two knobs scale linearly with worker count and deserve explicit attention.
+
+**Cluster-tend fan-out.** Each worker polls every cluster node on `tend_interval`. Steady-state
+info-protocol RPS per node ≈ `N_workers × N_nodes / tend_interval_seconds`. The legacy
+`aerospike-community/aerospike-client-php` C extension consolidated tend across processes via
+shared memory; this client does not, so the only lever is the interval itself:
+
+| Deployment                                          | Recommended `tend_interval` (`setTendInterval`) |
+| ---                                                 | ---                                              |
+| CLI tools, daemons, RoadRunner / FrankenPHP / Swoole | 1000 ms (default)                                |
+| php-fpm with 10–50 workers per pod                  | 2000–5000 ms                                     |
+| php-fpm with 100+ workers per pod                   | 5000–10000 ms                                    |
+
+Trade-off: higher intervals delay detection of topology changes (node add/remove). Failover
+on data-path errors is handled by retry policies independently and is unaffected.
+
+**Connection pool size.** `max_conns_per_node` defaults to 256 in `aerospike-client-rust`. For
+typical web workloads each worker rarely uses more than a handful of concurrent connections,
+so the default consumes far more file descriptors than necessary at scale. Estimate the
+realistic peak (≈ p99 in-flight ops per worker) and set `ClientPolicy::setMaxConnsPerNode(...)`
+accordingly. Example: 200 fpm workers × 10 nodes × 256 conns = 512 000 sockets per pod at
+the upper bound — well past the default `ulimit -n 1024` and most cluster `proto-fd-max`
+configurations.
+
 Reproduce locally:
 
 ```shell
@@ -268,6 +296,12 @@ listed continues to work unchanged.
 | `ReadPolicy::send_key`                                     | gone — only on write-side policies                                                                    |
 | `IndexType::Blob()`                                        | gone — no equivalent in aerospike-rust 2.x                                                            |
 | ACM daemon (`asld`)                                        | gone — extension talks to the cluster directly                                                        |
+
+> **php-fpm note for v1 callers:** the legacy ACM daemon ran cluster-tend in a single Go
+> process and shared topology state with all PHP workers through gRPC. v2 has no daemon —
+> every worker runs its own tend loop. Under php-fpm with high `max_children` (≥ 50), bump
+> `ClientPolicy::setTendInterval()` to 2000–10000 ms to keep info-protocol fan-out on the
+> cluster bounded. See [Production tuning for prefork PHP](#production-tuning-for-prefork-php).
 
 Search-and-replace tip for `$record->bins`-style code that you'd rather migrate to the
 explicit method API:

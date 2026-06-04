@@ -8862,6 +8862,12 @@ fn from_zval(zval: &Zval) -> Option<PHPValue> {
                         ArrayKey::Long(i) => PHPValue::Int(i),
                         ArrayKey::String(s) => PHPValue::String(s),
                         ArrayKey::Str(s) => PHPValue::String(s.to_string()),
+                        // ext-php-rs 0.15.15+ added the `ZendString` key variant.
+                        // `iter()` never yields it (keys come back as Long/String via
+                        // ArrayKey::from_zval), but the match must stay exhaustive.
+                        ArrayKey::ZendString(s) => {
+                            PHPValue::String(s.as_str().unwrap_or_default().to_string())
+                        }
                     };
                     h.insert(key, from_zval(v)?);
                 }

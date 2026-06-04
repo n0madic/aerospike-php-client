@@ -1,6 +1,5 @@
 aerospike.stubs.php
 /target
-/Cargo.lock
 .phpdoc
 *.todo
 aerospike-rust-client.sublime-project

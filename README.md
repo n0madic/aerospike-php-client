@@ -92,6 +92,45 @@ $policy = new ClientPolicy();
 $client = Client::connect("127.0.0.1:3000", $policy);
 ```
 
+### Connecting through NAT (services-alternate)
+
+When the client and the cluster sit on different sides of a NAT/firewall (Docker, cloud,
+or cross-DC setups), the server advertises an **internal** address to clients during
+cluster tending. After the seed handshake the client re-resolves to that advertised
+address, and if it is unreachable the connect fails with:
+
+```
+Failed to connect to host(s). The network connection(s) to cluster nodes may have
+timed out, or the cluster may be in a state of flux.
+```
+
+Diagnose by asking the seed what it advertises. `asinfo` issues a single info request and
+never re-resolves, so it succeeds even when the full client cannot — that asymmetry is the
+tell:
+
+```shell
+asinfo -h <seed-host> -v 'service-clear-std'   # e.g. 10.0.0.5:3000     (internal, unreachable)
+asinfo -h <seed-host> -v 'service-clear-alt'   # e.g. 203.0.113.10:3000 (external, reachable)
+```
+
+If `service-clear-std` returns an unreachable internal address, enable services-alternate
+so the client uses the server's `alternate-access-address` instead:
+
+```php
+$policy = new ClientPolicy();
+$policy->setUseServicesAlternate(true);
+$client = Client::connect("aerospike.example.com:3000", $policy);
+```
+
+This requires `alternate-access-address` to be configured server-side (it is what
+`service-clear-alt` reports above). If you cannot change the server config, translate the
+advertised internal address to a reachable one client-side instead — mutually exclusive
+with services-alternate:
+
+```php
+$policy->setIpMap(["10.0.0.5" => "aerospike.example.com"]);
+```
+
 ### TLS
 
 ```php
@@ -314,6 +353,7 @@ listed continues to work unchanged.
 | `$policy->setTotalTimeout(PHP_INT_MAX)`                    | throws `AerospikeException`; bound the value to ≤ `u32::MAX` ms (~49.7 d)                            |
 | `ReadPolicy::send_key`                                     | gone — only on write-side policies                                                                    |
 | `IndexType::Blob()`                                        | gone — no equivalent in aerospike-rust 2.x                                                            |
+| `Client::connect(...)` against a cluster behind NAT        | may need `ClientPolicy::setUseServicesAlternate(true)` — the Rust core no longer auto-falls back to the seed (see note below) |
 | ACM daemon (`asld`)                                        | gone — extension talks to the cluster directly                                                        |
 
 > **php-fpm note for v1 callers:** the legacy ACM daemon ran cluster-tend in a single Go
@@ -321,6 +361,14 @@ listed continues to work unchanged.
 > every worker runs its own tend loop. Under php-fpm with high `max_children` (≥ 50), bump
 > `ClientPolicy::setTendInterval()` to 2000–10000 ms to keep info-protocol fan-out on the
 > cluster bounded. See [Production tuning for prefork PHP](#production-tuning-for-prefork-php).
+
+> **NAT / services-alternate for v1 callers:** the legacy ACM (aerospike-client-go) probed
+> each advertised node address and, when it was unreachable (server behind NAT with only an
+> internal `access-address`), logged a warning and **kept using the reachable seed address**.
+> `aerospike-client-rust` 2.x does **not** fall back — it switches to the advertised address
+> unconditionally and fails if it is unreachable. So a connection that "just worked" under v1
+> may now require `ClientPolicy::setUseServicesAlternate(true)`. See
+> [Connecting through NAT (services-alternate)](#connecting-through-nat-services-alternate).
 
 Search-and-replace tip for `$record->bins`-style code that you'd rather migrate to the
 explicit method API:

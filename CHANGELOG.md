@@ -23,6 +23,13 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
 - **`Client::close()` removed** — connection lifecycle is managed internally.
 - **Aerospike Connection Manager (ACM) removed** — the `aerospike-connection-manager/`
   directory and Go daemon are no longer part of this project. Remove ACM from your deployment.
+- **NAT connectivity now requires `setUseServicesAlternate(true)`** — the removed ACM
+  (aerospike-client-go) probed each node's advertised address and fell back to the reachable
+  seed when it was unreachable (server behind NAT with only an internal `access-address`).
+  `aerospike-client-rust` 2.x switches to the advertised address unconditionally and fails if
+  it is unreachable. A connection that "just worked" under v1 may now need
+  `$policy->setUseServicesAlternate(true)` (or `setIpMap([...])`). See the README
+  "Connecting through NAT (services-alternate)" section.
 - **`ClientPolicy` class is now mandatory** for configuring auth, TLS, connection pool, and timeouts.
   Previously these were embedded in the grpc connect call; now they are explicit.
 - **`WritePolicy` / `ReadPolicy`**: removed fields `use_compression`, `sleep_multiplier`,

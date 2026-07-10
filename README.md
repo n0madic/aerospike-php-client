@@ -278,22 +278,37 @@ Cold connect (cluster discovery + partition map fetch): ~75 ms per worker.
 
 ### INI directives
 
-Four `php.ini` directives override policy defaults at construction time. Standard PHP
-mechanisms apply — set in `php.ini`, a `conf.d/` snippet, php-fpm pools, `.user.ini`, or
-at runtime with `ini_set()`. An explicit `$policy->set*()` call always wins over the INI
-value (the INI is only consulted in the policy constructor).
+`php.ini` directives override built-in defaults. Standard PHP mechanisms apply — set in
+`php.ini`, a `conf.d/` snippet, php-fpm pools, `.user.ini`, or at runtime with
+`ini_set()`. For the policy timeouts an explicit `$policy->set*()` call always wins over
+the INI value (the INI is only consulted in the policy constructor).
 
 ```ini
 aerospike.tend_interval = 5000        ; ClientPolicy::tend_interval (ms)
 aerospike.connect_timeout = 1000      ; ClientPolicy::timeout (ms, initial cluster connect)
 aerospike.read_timeout = 1000         ; ReadPolicy::total_timeout (ms)
 aerospike.write_timeout = 1000        ; WritePolicy::total_timeout (ms)
+aerospike.max_cached_clients = 8      ; soft cap on the per-process client cache
+aerospike.worker_threads = 2          ; Tokio runtime worker threads
 ```
 
-Leaving a directive at `0` (or unset) keeps the upstream `aerospike-client-rust` default.
-Any positive integer wins; values that overflow `u32` (~49.7 days in ms) silently fall
-back to the upstream default rather than truncating — use the explicit setter to surface
-nonsensical values as an `AerospikeException`.
+Leaving a directive at `0` (or unset) keeps the built-in default (for the policy timeouts:
+the upstream `aerospike-client-rust` default). Any positive integer wins; values that
+overflow `u32` (~49.7 days in ms) silently fall back to the default rather than
+truncating — use the explicit setter to surface nonsensical values as an
+`AerospikeException`.
+
+`aerospike.max_cached_clients` bounds the per-process client cache: when a `connect()`
+with a new hosts+policy combination would exceed it, idle cached clients (not referenced
+by any PHP object) are closed and evicted in least-recently-used order. Raise it if your
+workers legitimately round-robin more distinct `ClientPolicy` configurations than the cap
+(e.g. per-tenant credentials) — otherwise each request evicts and reconnects. In-use
+clients are never evicted. `Client::cachedClientCount()` reports the current cache size.
+
+`aerospike.worker_threads` sizes the background Tokio runtime (I/O reactor, timers,
+cluster-tend tasks). The default of 2 is sufficient for synchronous PHP usage; it is read
+when the runtime is built (first use in the process), so set it in `php.ini`/pool config,
+not with `ini_set()` at request time.
 
 ### Production tuning for prefork PHP
 
@@ -342,7 +357,7 @@ listed continues to work unchanged.
 | ---                                                        | ---                                                                                                  |
 | `Client::connect("/tmp/asld_grpc.sock")`                   | `Client::connect("127.0.0.1:3000", new ClientPolicy())`                                              |
 | `$client->socket`                                          | `$client->getHosts()` (`$client->hosts` also works via `__get`)                                      |
-| `$client->close()`                                         | no-op — managed internally                                                                            |
+| `$client->close()`                                         | **unchanged** — closes the pooled connection and evicts it from the per-process cache (optional; cached clients are closed at module shutdown) |
 | `$record->bins`, `$record->generation`, `$record->ttl`     | `$record->getBins()` / `getGeneration()` / `getTtl()` (property access works via `__get`)            |
 | `$record->getTtl()` (absolute Unix timestamp)              | **unchanged** — still absolute. For remaining seconds: `getRemainingTtl()`                            |
 | `MapOp::getByKeys([$k], MapReturnType::value())` → 1 value | now returns a list per key — index with `$result[0]`                                                  |

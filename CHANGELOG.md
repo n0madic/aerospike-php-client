@@ -2,6 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`Client::close()` re-introduced**: closes the pooled connection (stopping its connection
+  pool and background cluster-tend task) and evicts it from the per-process client cache.
+  Optional — cached clients are reused across requests by design and closed automatically at
+  module shutdown. Use it when a connection is known to be obsolete (e.g. after credential
+  rotation) to release its pool immediately. Note: the connection is shared, so other
+  `Client` objects obtained with the same hosts + policy become unusable after `close()`.
+- **Client cache eviction**: the per-process client cache is now bounded (soft cap of 8
+  entries, configurable via the `aerospike.max_cached_clients` INI directive). On overflow,
+  idle clients (not referenced by any PHP object) are closed and evicted in LRU order, so
+  credential/certificate rotation or per-tenant policies no longer accumulate live
+  connection pools for the lifetime of the process.
+- **`Client::cachedClientCount()`**: static diagnostic helper returning the current size of
+  the per-process client cache.
+- **Module shutdown cleanup**: all cached clients are closed at module shutdown (MSHUTDOWN),
+  stopping connection pools and tend tasks before the process exits.
+- **`Client::isConnected()`**: returns whether the client is connected to any cluster nodes;
+  false immediately after `close()`.
+- **INI directives `aerospike.max_cached_clients` and `aerospike.worker_threads`**: tune the
+  client-cache cap and the Tokio runtime thread count without recompiling.
+
+### Fixed
+
+- **Fork safety**: the Tokio runtime and the client cache now detect `fork()` (pid change)
+  and rebuild themselves in the child process. Previously a connection opened before fork —
+  e.g. during `opcache.preload` or php-fpm master warmup — left children with a runtime
+  whose worker threads only existed in the parent, hanging any subsequent operation.
+  Clients created pre-fork are still unusable in children (their sockets are shared with
+  the parent): open connections from worker code, not from preload scripts.
+- **`MapReturnType::inverted()` is now usable**: it is a combinator on a base return type
+  (`MapReturnType::key()->inverted()`), mirroring `ListReturnType`. Previously it was a
+  standalone value carrying no base type, so inverted map selections always returned no
+  data, and combinations like KEY|INVERTED were inexpressible. BREAKING for the old (broken)
+  usage: `MapReturnType::inverted()` is an instance method now, not a static constructor.
+- **`ListOp::append` / `ListOp::insert` with an empty values array and `ListOp::set` with a
+  null value now throw `AerospikeException`** instead of panicking inside the native library
+  (a panic across the FFI boundary aborts the PHP worker).
+
+### Changed
+
+- **Tokio runtime is capped at 2 worker threads** (was: one per logical CPU; override via
+  `aerospike.worker_threads`). PHP drives the client synchronously, so the runtime threads
+  only service I/O, timers and tend tasks; the previous default multiplied into hundreds of
+  idle threads across prefork php-fpm workers.
+- **`FilterExpTest` rewritten**: the suite previously built filter expressions but never
+  applied them to the batch write policy, so filter expressions had no real test coverage.
+
 ## [2.0.0] - 2026-05-15
 
 This is a major release that replaces the gRPC/connection-manager transport with a direct

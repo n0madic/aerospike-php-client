@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -sS https://getcomposer.org/installer \
         | php -- --install-dir=/usr/local/bin --filename=composer
 
+# pcntl is required by the fork-safety regression test (ClientTest::testForkedChildCanConnect).
+RUN docker-php-ext-install pcntl
+
 # Pinned via rust-toolchain.toml in the project root — only install stable here.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain stable

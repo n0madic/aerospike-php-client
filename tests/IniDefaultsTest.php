@@ -5,12 +5,14 @@ namespace Aerospike;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Exercises the four INI directives that override policy defaults at construction:
+ * Exercises the INI directives registered by the extension:
  *
- *   aerospike.tend_interval    -> ClientPolicy::tend_interval
- *   aerospike.connect_timeout  -> ClientPolicy::timeout
- *   aerospike.read_timeout     -> ReadPolicy::total_timeout
- *   aerospike.write_timeout    -> WritePolicy::total_timeout
+ *   aerospike.tend_interval       -> ClientPolicy::tend_interval
+ *   aerospike.connect_timeout     -> ClientPolicy::timeout
+ *   aerospike.read_timeout        -> ReadPolicy::total_timeout
+ *   aerospike.write_timeout       -> WritePolicy::total_timeout
+ *   aerospike.max_cached_clients  -> soft cap on the per-process client cache
+ *   aerospike.worker_threads      -> Tokio runtime worker threads
  *
  * Each test brackets its assertions with ini_set/ini_restore so global state
  * does not leak into the other suites.
@@ -25,6 +27,8 @@ final class IniDefaultsTest extends TestCase
         'aerospike.connect_timeout',
         'aerospike.read_timeout',
         'aerospike.write_timeout',
+        'aerospike.max_cached_clients',
+        'aerospike.worker_threads',
     ];
 
     protected function setUp(): void

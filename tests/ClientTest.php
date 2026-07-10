@@ -388,4 +388,120 @@ final class ClientTest extends TestCase
         $this->assertEquals($record->getRemainingTtl(), null);
         $this->assertTrue($record->getExpiration()->willNeverExpire());
     }
+
+    // Regression test for close(): closing a client must stop its cached connection and
+    // evict it from the per-process cache, and a subsequent connect() must establish a
+    // fresh working connection. A distinct applicationId gives this test its own cache
+    // entry, so closing it does not affect the shared client used by the other tests.
+    public function testClose()
+    {
+        $cp = new ClientPolicy();
+        $cp->setApplicationId("close-test");
+
+        $client = Client::connect(self::$hosts, $cp);
+        $this->assertTrue($client->isConnected());
+        $key = new Key(self::$namespace, self::$set, "close_test");
+        $wp = new WritePolicy();
+        $client->put($wp, $key, [new Bin("bin1", 1)]);
+
+        $client->close();
+
+        // close() marks the cluster closed immediately; the node pool is drained
+        // asynchronously by the tend thread, so operations may succeed for up to one
+        // tend interval — isConnected() is the deterministic signal.
+        $this->assertFalse($client->isConnected());
+
+        // A new connect() with the same hosts and policy must create a fresh connection
+        // (the closed client was evicted from the cache, not handed back out).
+        $client = Client::connect(self::$hosts, $cp);
+        $this->assertTrue($client->isConnected());
+        $rp = new ReadPolicy();
+        $record = $client->get($rp, $key);
+        $this->assertEquals(1, $record->getBins()["bin1"]);
+        $client->close();
+    }
+
+    // Regression test: close() used to evict the cache entry by key without checking it
+    // still held this client, so a second close() on an old object silently orphaned the
+    // fresh client created in between (its pool and tend task leaked, unreachable from
+    // the cache).
+    public function testDoubleCloseDoesNotEvictNewerClient()
+    {
+        $cp = new ClientPolicy();
+        $cp->setApplicationId("double-close-test");
+
+        $old = Client::connect(self::$hosts, $cp);
+        $old->close();
+
+        // Same hosts + policy: takes over the cache key with a fresh connection.
+        $fresh = Client::connect(self::$hosts, $cp);
+        $this->assertTrue($fresh->isConnected());
+        $countBefore = Client::cachedClientCount();
+
+        // Second close() of the old object must not touch the fresh entry.
+        $old->close();
+        $this->assertEquals($countBefore, Client::cachedClientCount());
+        $this->assertTrue($fresh->isConnected());
+
+        $fresh->close();
+        $this->assertEquals($countBefore - 1, Client::cachedClientCount());
+    }
+
+    // Regression test: the client cache used to grow without bound — one live connection
+    // pool per distinct hosts+policy for the lifetime of the process. Idle clients (not
+    // referenced by any PHP object) must now be evicted in LRU order once the cache
+    // exceeds aerospike.max_cached_clients (default 8).
+    public function testClientCacheIsBounded()
+    {
+        // INI value "0" means "no override" — the built-in default cap of 8 applies.
+        $iniCap = (int) ini_get('aerospike.max_cached_clients');
+        $cap = $iniCap > 0 ? $iniCap : 8;
+        for ($i = 0; $i < $cap + 4; $i++) {
+            $cp = new ClientPolicy();
+            $cp->setApplicationId("cache-bound-test-$i");
+            $client = Client::connect(self::$hosts, $cp);
+            $this->assertTrue($client->isConnected());
+            // Drop the only PHP reference so the entry becomes idle and evictable.
+            unset($client);
+        }
+        $this->assertLessThanOrEqual($cap, Client::cachedClientCount());
+    }
+
+    // Regression test: the Tokio runtime and the client cache are process-global; without
+    // pid detection a fork() child inherited a runtime whose worker threads only existed
+    // in the parent and hung on the first operation. The child must connect and operate
+    // normally (with its own fresh runtime and cache).
+    public function testForkedChildCanConnect()
+    {
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('pcntl extension not available');
+        }
+
+        // Make sure the parent's runtime and cache are initialized before forking.
+        $key = new Key(self::$namespace, self::$set, "fork_test");
+        $wp = new WritePolicy();
+        self::$client->put($wp, $key, [new Bin("bin1", 41)]);
+
+        $pid = pcntl_fork();
+        if ($pid === 0) {
+            // Child: must not hang; exit code communicates the outcome.
+            try {
+                $client = Client::connect(self::$hosts);
+                $rp = new ReadPolicy();
+                $record = $client->get($rp, $key);
+                exit($record->getBins()["bin1"] === 41 ? 0 : 2);
+            } catch (\Throwable $e) {
+                exit(1);
+            }
+        }
+
+        $this->assertNotEquals(-1, $pid, "fork failed");
+        pcntl_waitpid($pid, $status);
+        $this->assertTrue(pcntl_wifexited($status), "child did not exit normally");
+        $this->assertEquals(0, pcntl_wexitstatus($status), "child failed to connect/get after fork");
+
+        // The parent's own client must be unaffected by the fork.
+        $rp = new ReadPolicy();
+        $this->assertEquals(41, self::$client->get($rp, $key)->getBins()["bin1"]);
+    }
 }

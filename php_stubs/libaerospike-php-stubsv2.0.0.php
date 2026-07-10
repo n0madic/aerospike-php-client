@@ -1163,11 +1163,43 @@ namespace Aerospike {
         public function getHeader(\Aerospike\ReadPolicy $policy, \Aerospike\Key $key): ?\Aerospike\Record {}
 
         /**
+         * Close the connection to the Aerospike cluster and remove this client from the
+         * per-process client cache, stopping its connection pool and background cluster-tend
+         * task. The underlying connection is shared: any other PHP `Client` object obtained
+         * from `connect()` with the same hosts and policy uses the same pool and becomes
+         * unusable after `close()`. A subsequent `connect()` establishes a fresh connection.
+         *
+         * Calling `close()` is optional — cached clients are reused across requests by design
+         * and are closed automatically at module shutdown. Use it when a connection is known
+         * to be obsolete (e.g. after credential rotation) to release its pool immediately.
+         *
+         * @return void
+         * @throws \Aerospike\AerospikeException
+         */
+        public function close(): void {}
+
+        /**
+         * Number of clients currently held by the per-process client cache. Diagnostic
+         * helper: lets deployments (and tests) observe cache growth and eviction behavior.
+         *
+         * @return int
+         */
+        public static function cachedClientCount(): int {}
+
+        /**
          * Returns the hosts string this client was connected to.
          *
          * @return string
          */
         public function getHosts(): string {}
+
+        /**
+         * Returns true if the client is connected to any cluster nodes and has not been
+         * closed. Returns false immediately after `close()`.
+         *
+         * @return bool
+         */
+        public function isConnected(): bool {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -3146,13 +3178,14 @@ namespace Aerospike {
          * ListAppendOp creates a list append operation.
          * Server appends values to end of list bin.
          * Server returns list size on bin name.
-         * Panics if `values` is empty.
+         * Throws an AerospikeException if `values` is empty.
          *
          * @param \Aerospike\ListPolicy $policy
          * @param string $bin_name
          * @param array $values
          * @param array|null $ctx
          * @return \Aerospike\Operation
+         * @throws \Aerospike\AerospikeException
          */
         public static function append(\Aerospike\ListPolicy $policy, string $bin_name, array $values, ?array $ctx = null): \Aerospike\Operation {}
 
@@ -3357,7 +3390,7 @@ namespace Aerospike {
          * ListInsertOp creates a list insert operation.
          * Server inserts values starting at specified index of list bin.
          * Server returns list size on bin name.
-         * Panics if `values` is empty.
+         * Throws an AerospikeException if `values` is empty.
          *
          * @param \Aerospike\ListPolicy $policy
          * @param string $bin_name
@@ -3365,6 +3398,7 @@ namespace Aerospike {
          * @param array $values
          * @param array|null $ctx
          * @return \Aerospike\Operation
+         * @throws \Aerospike\AerospikeException
          */
         public static function insert(\Aerospike\ListPolicy $policy, string $bin_name, int $index, array $values, ?array $ctx = null): \Aerospike\Operation {}
 
@@ -3583,12 +3617,14 @@ namespace Aerospike {
          * ListSetOp creates a list set operation.
          * Server sets item value at specified index in list bin.
          * Server does not return a result by default.
+         * Throws an AerospikeException if `value` is null.
          *
          * @param string $bin_name
          * @param int $index
          * @param mixed $value
          * @param array|null $ctx
          * @return \Aerospike\Operation
+         * @throws \Aerospike\AerospikeException
          */
         public static function set(string $bin_name, int $index, mixed $value, ?array $ctx = null): \Aerospike\Operation {}
 
@@ -4452,13 +4488,15 @@ namespace Aerospike {
         public static function index(): \Aerospike\MapReturnType {}
 
         /**
-         * INVERTED will invert meaning of map command and return values. For example:
-         * MapRemoveByKeyRange(binName, keyBegin, keyEnd, MapReturnType.KEY | MapReturnType.INVERTED)
-         * With the INVERTED flag enabled, the keys outside of the specified key range will be removed and returned.
+         * INVERTED will invert meaning of map command and return values. Combinator on a base
+         * return type, mirroring ListReturnType. For example:
+         * MapOp::removeByKeyRange($policy, $bin, $begin, $end, MapReturnType::key()->inverted())
+         * With the INVERTED flag enabled, the keys outside of the specified key range will be
+         * removed and returned.
          *
          * @return \Aerospike\MapReturnType
          */
-        public static function inverted(): \Aerospike\MapReturnType {}
+        public function inverted(): \Aerospike\MapReturnType {}
 
         /**
          * KEY will return key for single key read and key list for range read.

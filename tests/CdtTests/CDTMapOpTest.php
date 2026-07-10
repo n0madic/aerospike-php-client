@@ -78,4 +78,26 @@ class CDTMapOpTest extends TestCase{
         $this->assertEquals($recs[0]->getRecord()->getBins()[self::$cdtBinName][0][1], "v1.1");
     }
 
+    // Regression test: MapReturnType INVERTED used to be a bare value with no base type
+    // (always None|Inverted), so inverted selections returned no data. It is now a
+    // combinator on a base return type, mirroring ListReturnType.
+    public function testInvertedReturnType(){
+        $bwp = new BatchWritePolicy();
+        $bp = new BatchPolicy();
+        $mp = new MapPolicy(MapOrderType::Unordered());
+
+        $ops = [MapOp::put($mp, self::$cdtBinName, ["a" => 1, "b" => 2, "c" => 3, "d" => 4, "e" => 5, "f" => 6])];
+        $bw = new BatchWrite($bwp, self::$key, $ops);
+        self::$client->batch($bp, [$bw]);
+
+        $brp = new BatchReadPolicy();
+        // Keys within ["b", "e") are b, c, d; inverted returns the keys outside the range.
+        $ops = [MapOp::getByKeyRange($mp, self::$cdtBinName, "b", "e", MapReturnType::key()->inverted())];
+        $br = BatchRead::ops($brp, self::$key, $ops);
+        $recs = self::$client->batch($bp, [$br]);
+        $keys = $recs[0]->getRecord()->getBins()[self::$cdtBinName];
+        sort($keys);
+        $this->assertEquals(["a", "e", "f"], $keys);
+    }
+
 }

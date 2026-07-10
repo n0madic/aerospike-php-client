@@ -296,4 +296,25 @@ class CDTListOpTest extends TestCase{
         $this->assertEquals(self::getSizeOfList($record, self::$cdtBinName), 0);
     }
 
-}   
+    // Regression tests: the underlying Rust client asserts on empty/null input for these
+    // operations; the wrapper must throw a catchable exception instead of panicking
+    // (a panic across the FFI boundary aborts the PHP process).
+
+    public function testAppendEmptyValuesThrows(){
+        $lp = new ListPolicy(ListOrderType::Unordered());
+        $this->expectException(AerospikeException::class);
+        ListOp::append($lp, self::$cdtBinName, []);
+    }
+
+    public function testInsertEmptyValuesThrows(){
+        $lp = new ListPolicy(ListOrderType::Unordered());
+        $this->expectException(AerospikeException::class);
+        ListOp::insert($lp, self::$cdtBinName, 0, []);
+    }
+
+    public function testSetNullValueThrows(){
+        $this->expectException(AerospikeException::class);
+        ListOp::set(self::$cdtBinName, 0, null);
+    }
+
+}

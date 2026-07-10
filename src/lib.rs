@@ -28,10 +28,13 @@ use std::ffi::c_void;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
+use std::time::Instant;
 
 use aero::Task as AeroTask;
 
@@ -58,37 +61,189 @@ use log::trace;
 struct ClientEntry {
     client: Arc<aero::Client>,
     hosts: String,
-    /// Retained for diagnostics; cache eviction already happens via the cache key.
-    #[allow(dead_code)]
     policy_fingerprint: String,
+    /// Updated on every cache hit; drives least-recently-used eviction when the cache
+    /// exceeds `MAX_CACHED_CLIENTS`.
+    last_used: Instant,
 }
 
-static TOKIO_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create Tokio runtime")
+/// Default number of Tokio worker threads (override via `aerospike.worker_threads` INI).
+/// PHP drives the client synchronously (one in-flight request per PHP worker), so the
+/// runtime threads only service the I/O reactor, timers and background tend tasks — a
+/// small fixed pool suffices. The Tokio default (`num_cpus`) would multiply into hundreds
+/// of mostly-idle threads across prefork php-fpm workers.
+const TOKIO_WORKER_THREADS_DEFAULT: usize = 2;
+
+/// Default soft cap on cached clients (override via `aerospike.max_cached_clients` INI).
+const MAX_CACHED_CLIENTS_DEFAULT: usize = 8;
+
+// Fast-path storage for the process-wide Tokio runtime. `tokio_rt()` is called on every
+// client operation (including once per record in `Recordset::next()`), so the hot path
+// must not take a lock: it is two atomic loads. Invariant: `TOKIO_RT_PID` is stored
+// (Release) only *after* `TOKIO_RT_PTR` (Release), so a reader that observes the current
+// pid (Acquire) is guaranteed to observe the matching runtime pointer.
+static TOKIO_RT_PTR: AtomicPtr<tokio::runtime::Runtime> = AtomicPtr::new(std::ptr::null_mut());
+static TOKIO_RT_PID: AtomicU32 = AtomicU32::new(0);
+/// Serializes the slow path (first use / post-fork rebuild) only.
+static TOKIO_RT_INIT: Mutex<()> = Mutex::new(());
+
+/// Returns the process-wide Tokio runtime, creating it on first use and re-creating it
+/// after fork(). Tokio worker threads do not survive fork(): a child that inherits the
+/// parent's runtime (e.g. a connection was opened during `opcache.preload` or php-fpm
+/// master warmup) would hang forever in `block_on`. We detect this by comparing the pid
+/// the runtime was built in with the current pid. The stale runtime is intentionally
+/// *leaked*, not dropped — dropping it would try to join worker threads that only exist
+/// in the parent process. At most one runtime leaks per fork generation.
+fn tokio_rt() -> &'static tokio::runtime::Runtime {
+    let pid = std::process::id();
+    if TOKIO_RT_PID.load(Ordering::Acquire) == pid {
+        // SAFETY: a matching pid is stored only after a valid, never-freed (leaked)
+        // runtime pointer — see the invariant on TOKIO_RT_PTR/TOKIO_RT_PID above.
+        return unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) };
+    }
+
+    let _init = TOKIO_RT_INIT.lock().unwrap_or_else(PoisonError::into_inner);
+    // Another thread may have built the runtime while we waited for the lock.
+    if TOKIO_RT_PID.load(Ordering::Acquire) == pid {
+        return unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) };
+    }
+    if !TOKIO_RT_PTR.load(Ordering::Acquire).is_null() {
+        trace!("pid changed (fork detected): rebuilding Tokio runtime");
+    }
+    let worker_threads = ini_long_positive(&INI_WORKER_THREADS)
+        .map_or(TOKIO_WORKER_THREADS_DEFAULT, |v| v as usize);
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+            .expect("failed to create Tokio runtime"),
+    ));
+    TOKIO_RT_PTR.store(rt as *const _ as *mut _, Ordering::Release);
+    TOKIO_RT_PID.store(pid, Ordering::Release);
+    rt
+}
+
+struct ClientCache {
+    /// Process id the cache contents belong to; a mismatch means we are in a fork() child.
+    pid: u32,
+    map: HashMap<String, ClientEntry>,
+}
+
+static CLIENTS: LazyLock<Mutex<ClientCache>> = LazyLock::new(|| {
+    Mutex::new(ClientCache {
+        pid: std::process::id(),
+        map: HashMap::new(),
+    })
 });
 
-static CLIENTS: LazyLock<Mutex<HashMap<String, ClientEntry>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Locks the client cache, discarding stale contents after fork(). Clients created before
+/// fork() reference tend tasks and sockets owned by the parent process; closing them from
+/// the child could block on the parent's (dead here) runtime, so they are leaked instead
+/// and the child starts with an empty cache. PHP `Client` objects inherited across fork()
+/// keep their own `Arc` and are equally unusable — opening connections pre-fork (e.g. in
+/// `opcache.preload`) is unsupported; connect from worker code instead.
+///
+/// A poisoned mutex is recovered, not propagated: `ClientCache` has no invariant a panic
+/// can tear (worst case a cache entry is missing or extra), and failing closed would make
+/// every subsequent `connect()` unusable for the life of the process.
+fn clients_lock() -> MutexGuard<'static, ClientCache> {
+    let mut cache = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+    let pid = std::process::id();
+    if cache.pid != pid {
+        trace!("pid changed (fork detected): discarding inherited client cache");
+        let stale = std::mem::take(&mut cache.map);
+        std::mem::forget(stale);
+        cache.pid = pid;
+    }
+    cache
+}
+
+/// The configured soft cap on cached clients. When an insert would exceed it, idle
+/// entries (no live PHP `Client` object referencing them) are evicted in LRU order.
+/// Entries still referenced by PHP objects are never evicted, so the cache can
+/// temporarily exceed the cap when more clients than this are in use simultaneously.
+fn max_cached_clients() -> usize {
+    ini_long_positive(&INI_MAX_CACHED_CLIENTS).map_or(MAX_CACHED_CLIENTS_DEFAULT, |v| v as usize)
+}
+
+/// Remove idle cache entries in LRU order until the map is below `max_cached_clients()`,
+/// returning them so the caller can close them *after* releasing the cache lock —
+/// `close()` blocks on the tend channel, and holding the process-wide mutex across it
+/// would stall unrelated `connect()` calls (and poison the lock if it panicked).
+/// An entry is idle when the cache holds the only `Arc` to its client (no PHP object
+/// references it), so closing it cannot break an in-use `$client`.
+fn evict_idle_clients(map: &mut HashMap<String, ClientEntry>) -> Vec<ClientEntry> {
+    let cap = max_cached_clients();
+    let mut evicted = Vec::new();
+    if map.len() < cap {
+        return evicted;
+    }
+    let mut idle: Vec<(String, Instant)> = map
+        .iter()
+        .filter(|(_, e)| Arc::strong_count(&e.client) == 1)
+        .map(|(k, e)| (k.clone(), e.last_used))
+        .collect();
+    idle.sort_by_key(|(_, t)| *t);
+    for (key, _) in idle {
+        if map.len() < cap {
+            break;
+        }
+        if let Some(entry) = map.remove(&key) {
+            trace!("evicting idle cached client for {}", entry.hosts);
+            evicted.push(entry);
+        }
+    }
+    evicted
+}
+
+/// Close evicted/drained cache entries. Each client is closed explicitly: the cluster
+/// tend task holds its own `Arc` to the cluster and only stops when `close()` signals
+/// it — merely dropping the entry would leak the tend task and its sockets. Must be
+/// called *without* the cache lock held.
+fn close_client_entries(entries: impl IntoIterator<Item = ClientEntry>) {
+    let mut entries = entries.into_iter().peekable();
+    if entries.peek().is_none() {
+        return;
+    }
+    let _guard = tokio_rt().enter();
+    for entry in entries {
+        trace!("closing cached client for {}", entry.hosts);
+        if let Err(e) = entry.client.close() {
+            trace!("error closing client for {}: {e}", entry.hosts);
+        }
+    }
+}
+
+/// Module shutdown hook (MSHUTDOWN). Closes every cached client so connection pools and
+/// background tend tasks stop before the process exits. `clients_lock()` discards (leaks)
+/// entries inherited from a parent process, which cannot be closed safely from here.
+/// When nothing was ever connected the map is empty and no Tokio runtime is built.
+pub extern "C" fn aerospike_php_shutdown(_ty: c_int, _mod_num: c_int) -> c_int {
+    let entries = std::mem::take(&mut clients_lock().map);
+    close_client_entries(entries.into_values());
+    0
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
 //  INI configuration
 //
-//  Four INI directives override the corresponding policy defaults at policy-construction
-//  time. `php.ini`, `php-fpm.conf` pools, `.user.ini`, and runtime `ini_set()` all work.
+//  INI directives overriding built-in defaults. `php.ini`, `php-fpm.conf` pools,
+//  `.user.ini`, and runtime `ini_set()` all work.
 //
-//      aerospike.tend_interval     — ClientPolicy::tend_interval (ms)
-//      aerospike.connect_timeout   — ClientPolicy::timeout (ms)
-//      aerospike.read_timeout      — ReadPolicy::total_timeout (ms)
-//      aerospike.write_timeout     — WritePolicy::total_timeout (ms)
+//      aerospike.tend_interval       — ClientPolicy::tend_interval (ms)
+//      aerospike.connect_timeout     — ClientPolicy::timeout (ms)
+//      aerospike.read_timeout        — ReadPolicy::total_timeout (ms)
+//      aerospike.write_timeout       — WritePolicy::total_timeout (ms)
+//      aerospike.max_cached_clients  — soft cap on the per-process client cache (default 8)
+//      aerospike.worker_threads      — Tokio runtime worker threads (default 2; read when
+//                                      the runtime is built: first use / after fork)
 //
 //  Each entry is registered with a string default of "0", which we treat as "no override
-//  — use the upstream `aerospike-client-rust` default". Any positive integer wins over
-//  the upstream default at construction. An explicit `$policy->set*()` call always wins
-//  over the INI value (the INI is only consulted in `__construct`).
+//  — use the built-in default". Any positive integer wins over it. For the policy
+//  timeouts an explicit `$policy->set*()` call always wins over the INI value (the INI
+//  is only consulted in `__construct`).
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -96,6 +251,8 @@ const INI_NAME_TEND_INTERVAL: &str = "aerospike.tend_interval";
 const INI_NAME_CONNECT_TIMEOUT: &str = "aerospike.connect_timeout";
 const INI_NAME_READ_TIMEOUT: &str = "aerospike.read_timeout";
 const INI_NAME_WRITE_TIMEOUT: &str = "aerospike.write_timeout";
+const INI_NAME_MAX_CACHED_CLIENTS: &str = "aerospike.max_cached_clients";
+const INI_NAME_WORKER_THREADS: &str = "aerospike.worker_threads";
 
 /// `"0"` is the registered default; `on_modify_long` parses it into `AtomicI64::new(0)`
 /// and `ini_long_positive` interprets 0 as "no override".
@@ -105,6 +262,8 @@ static INI_TEND_INTERVAL: AtomicI64 = AtomicI64::new(0);
 static INI_CONNECT_TIMEOUT: AtomicI64 = AtomicI64::new(0);
 static INI_READ_TIMEOUT: AtomicI64 = AtomicI64::new(0);
 static INI_WRITE_TIMEOUT: AtomicI64 = AtomicI64::new(0);
+static INI_MAX_CACHED_CLIENTS: AtomicI64 = AtomicI64::new(0);
+static INI_WORKER_THREADS: AtomicI64 = AtomicI64::new(0);
 
 /// PHP `OnUpdateLong`-style callback. Parses the new value as a signed integer and stores
 /// it into the `AtomicI64` passed through `mh_arg1`. PHP invokes this on module startup
@@ -161,6 +320,8 @@ pub extern "C" fn aerospike_php_startup(_ty: c_int, mod_num: c_int) -> c_int {
         ini_entry_for(INI_NAME_CONNECT_TIMEOUT, &INI_CONNECT_TIMEOUT),
         ini_entry_for(INI_NAME_READ_TIMEOUT, &INI_READ_TIMEOUT),
         ini_entry_for(INI_NAME_WRITE_TIMEOUT, &INI_WRITE_TIMEOUT),
+        ini_entry_for(INI_NAME_MAX_CACHED_CLIENTS, &INI_MAX_CACHED_CLIENTS),
+        ini_entry_for(INI_NAME_WORKER_THREADS, &INI_WORKER_THREADS),
     ];
     ext_php_rs::zend::IniEntryDef::register(entries, mod_num);
     0
@@ -2833,7 +2994,7 @@ impl Recordset {
         let Some(rs) = self._as.clone() else {
             return Ok(None);
         };
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         // `Iterator for &Recordset` requires a mutable reference to the `&Recordset` itself.
         let recordset: &aero::Recordset = &rs;
         let mut iter: &aero::Recordset = recordset;
@@ -2862,9 +3023,9 @@ impl Recordset {
         let Some(rs) = self._as.as_ref() else {
             return;
         };
-        // `aero::Recordset::partition_filter` is async; we're already inside `TOKIO_RT.enter()`
+        // `aero::Recordset::partition_filter` is async; we're already inside `tokio_rt().enter()`
         // when called from `next()`, but `block_on` requires an explicit handle.
-        let updated = TOKIO_RT.block_on(rs.partition_filter());
+        let updated = tokio_rt().block_on(rs.partition_filter());
         if let Some(new_pf) = updated {
             if let Ok(mut guard) = pf_arc.lock() {
                 *guard = new_pf;
@@ -4417,43 +4578,58 @@ impl CdtListOperation {
     /// ListAppendOp creates a list append operation.
     /// Server appends values to end of list bin.
     /// Server returns list size on bin name.
-    /// Panics if `values` is empty.
+    /// Throws an AerospikeException if `values` is empty.
     pub fn append(
         policy: &CdtListPolicy,
         bin_name: String,
         values: Vec<PHPValue>,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+    ) -> PhpResult<Operation> {
+        // The underlying aero builder asserts on empty input; validate here so PHP gets
+        // a catchable exception instead of a panic across the FFI boundary.
+        if values.is_empty() {
+            return throw_msg(
+                "ListOp::append requires a non-empty values array",
+                Operation::get(None),
+            );
+        }
         let op = aero::operations::lists::append_items(
             &policy._as,
             &bin_name,
             php_values_to_aero(values),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListInsertOp creates a list insert operation.
     /// Server inserts values starting at specified index of list bin.
     /// Server returns list size on bin name.
-    /// Panics if `values` is empty.
+    /// Throws an AerospikeException if `values` is empty.
     pub fn insert(
         policy: &CdtListPolicy,
         bin_name: String,
         index: i64,
         values: Vec<PHPValue>,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+    ) -> PhpResult<Operation> {
+        // See `append`: guard the upstream assert to avoid panicking across FFI.
+        if values.is_empty() {
+            return throw_msg(
+                "ListOp::insert requires a non-empty values array",
+                Operation::get(None),
+            );
+        }
         let op = aero::operations::lists::insert_items(
             &policy._as,
             &bin_name,
             index,
             php_values_to_aero(values),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListPopOp creates list pop operation.
@@ -4635,18 +4811,25 @@ impl CdtListOperation {
     /// ListSetOp creates a list set operation.
     /// Server sets item value at specified index in list bin.
     /// Server does not return a result by default.
+    /// Throws an AerospikeException if `value` is null.
     pub fn set(
         bin_name: String,
         index: i64,
         value: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
-            _as: with_ctx(
-                aero::operations::lists::set(&bin_name, index, value.into()),
-                ctx,
-            ),
+    ) -> PhpResult<Operation> {
+        let value: aero::Value = value.into();
+        // The underlying aero builder asserts on nil; validate here so PHP gets a
+        // catchable exception instead of a panic across the FFI boundary.
+        if value.is_nil() {
+            return throw_msg(
+                "ListOp::set requires a non-null value",
+                Operation::get(None),
+            );
         }
+        Ok(Operation {
+            _as: with_ctx(aero::operations::lists::set(&bin_name, index, value), ctx),
+        })
     }
 
     /// ListTrimOp creates a list trim operation.
@@ -5044,7 +5227,9 @@ impl CdtListOperation {
 #[php(name = "Aerospike\\MapReturnType")]
 #[derive(Clone, Copy)]
 pub struct CdtMapReturnType {
-    _as: aero::MapReturnType,
+    // Stored as i64 bitmask to support the Inverted() combinator (bitwise OR with 0x10000),
+    // mirroring CdtListReturnType. Values are taken from aero::MapReturnType discriminants.
+    _as: i64,
 }
 
 #[php_impl]
@@ -5052,7 +5237,7 @@ impl CdtMapReturnType {
     /// NONE will not return a result.
     pub fn None() -> Self {
         Self {
-            _as: aero::MapReturnType::None,
+            _as: aero::MapReturnType::None as i64,
         }
     }
 
@@ -5063,7 +5248,7 @@ impl CdtMapReturnType {
     /// -1 = last key
     pub fn Index() -> Self {
         Self {
-            _as: aero::MapReturnType::Index,
+            _as: aero::MapReturnType::Index as i64,
         }
     }
 
@@ -5073,7 +5258,7 @@ impl CdtMapReturnType {
     /// -1 = first key
     pub fn Reverse_Index() -> Self {
         Self {
-            _as: aero::MapReturnType::ReverseIndex,
+            _as: aero::MapReturnType::ReverseIndex as i64,
         }
     }
 
@@ -5084,7 +5269,7 @@ impl CdtMapReturnType {
     /// -1 = largest value
     pub fn Rank() -> Self {
         Self {
-            _as: aero::MapReturnType::Rank,
+            _as: aero::MapReturnType::Rank as i64,
         }
     }
 
@@ -5095,28 +5280,28 @@ impl CdtMapReturnType {
     /// -1 = smallest value
     pub fn Reverse_Rank() -> Self {
         Self {
-            _as: aero::MapReturnType::ReverseRank,
+            _as: aero::MapReturnType::ReverseRank as i64,
         }
     }
 
     /// COUNT will return count of items selected.
     pub fn Count() -> Self {
         Self {
-            _as: aero::MapReturnType::Count,
+            _as: aero::MapReturnType::Count as i64,
         }
     }
 
     /// KEY will return key for single key read and key list for range read.
     pub fn Key() -> Self {
         Self {
-            _as: aero::MapReturnType::Key,
+            _as: aero::MapReturnType::Key as i64,
         }
     }
 
     /// VALUE will return value for single key read and value list for range read.
     pub fn Value() -> Self {
         Self {
-            _as: aero::MapReturnType::Value,
+            _as: aero::MapReturnType::Value as i64,
         }
     }
 
@@ -5126,37 +5311,39 @@ impl CdtMapReturnType {
     /// Value::KeyValueList : Returned for range results where range order needs to be preserved.
     pub fn Key_Value() -> Self {
         Self {
-            _as: aero::MapReturnType::KeyValue,
+            _as: aero::MapReturnType::KeyValue as i64,
         }
     }
 
     /// EXISTS returns true if count > 0.
     pub fn Exists() -> Self {
         Self {
-            _as: aero::MapReturnType::Exists,
+            _as: aero::MapReturnType::Exists as i64,
         }
     }
 
     /// UNORDERED_MAP returns an unordered map.
     pub fn Unordered_Map() -> Self {
         Self {
-            _as: aero::MapReturnType::UnorderedMap,
+            _as: aero::MapReturnType::UnorderedMap as i64,
         }
     }
 
     /// ORDERED_MAP returns an ordered map.
     pub fn Ordered_Map() -> Self {
         Self {
-            _as: aero::MapReturnType::OrderedMap,
+            _as: aero::MapReturnType::OrderedMap as i64,
         }
     }
 
-    /// INVERTED will invert meaning of map command and return values. For example:
-    /// MapRemoveByKeyRange(binName, keyBegin, keyEnd, MapReturnType.KEY | MapReturnType.INVERTED)
-    /// With the INVERTED flag enabled, the keys outside of the specified key range will be removed and returned.
-    pub fn Inverted() -> Self {
+    /// INVERTED will invert meaning of map command and return values. Combinator on a base
+    /// return type, mirroring `ListReturnType`. For example:
+    /// MapOp::removeByKeyRange($policy, $bin, $begin, $end, MapReturnType::Key()->inverted())
+    /// With the INVERTED flag enabled, the keys outside of the specified key range will be
+    /// removed and returned.
+    pub fn Inverted(&self) -> Self {
         Self {
-            _as: aero::MapReturnType::Inverted,
+            _as: self._as | aero::MapReturnType::Inverted as i64,
         }
     }
 }
@@ -5416,10 +5603,24 @@ impl FromZval<'_> for CdtMapOperation {
 }
 
 /// Default map return type used when the PHP caller passes `null`.
-fn map_return(return_type: Option<CdtMapReturnType>) -> aero::MapReturnType {
-    return_type
-        .map(|rt| rt._as)
-        .unwrap_or(aero::MapReturnType::KeyValue)
+/// Local newtype wrapping a raw `i64` return-type bitmask so it can be passed to
+/// `aero::operations::maps::*` builders which require `ToMapReturnTypeBitmask`.
+/// PHP `MapReturnType` stores an `i64` because it supports the `Inverted()` flag
+/// (bitwise OR with `0x10000`), mirroring `ListReturn`.
+struct MapReturn(i64);
+
+impl aero::operations::maps::ToMapReturnTypeBitmask for MapReturn {
+    fn to_bitmask(self) -> i64 {
+        self.0
+    }
+}
+
+fn map_return(return_type: Option<CdtMapReturnType>) -> MapReturn {
+    MapReturn(
+        return_type
+            .map(|rt| rt._as)
+            .unwrap_or(aero::MapReturnType::KeyValue as i64),
+    )
 }
 
 /// Convert a `Vec<&CDTContext>` to the owned `Vec<aero::CdtContext>` form
@@ -7455,8 +7656,8 @@ fn php_bins_to_aero(bins: Option<Vec<String>>) -> aero::Bins {
 pub struct Client {
     client: Arc<aero::Client>,
     hosts: String,
-    /// Retained for diagnostics; cache eviction is keyed off the cache map itself.
-    #[allow(dead_code)]
+    /// Together with `hosts` reconstructs the cache key; used by `close()` to evict
+    /// this client from the per-process cache.
     policy_fingerprint: String,
 }
 
@@ -7482,37 +7683,39 @@ impl Client {
         let fp = policy.map(|p| p.fingerprint()).unwrap_or_default();
         let cache_key = format!("{hosts}|{fp}");
 
+        trace!("Creating a new Aerospike Client object for {hosts}");
+        let aero_policy = policy.map(|p| p._as.clone()).unwrap_or_default();
+
+        // External (LDAP) auth sends the password in clear at login — refuse to connect
+        // if TLS is not configured. We enforce this here (rather than in
+        // `set_auth_external`) so the user can set TLS and auth in either order.
+        if matches!(aero_policy.auth_mode, aero::AuthMode::External(_, _))
+            && aero_policy.tls_config.is_none()
+        {
+            return throw_msg(
+                "AuthMode::External requires TLS — call ClientPolicy::setTls() before connect()",
+                Zval::new(),
+            );
+        }
+
         // Single critical section: lookup + insert under the same lock guards against the
         // ZTS race where two threads simultaneously miss the cache and each build a fresh
         // client (with its own connection pool). The first writer wins; subsequent waiters
-        // observe the cached entry and skip the expensive `aero::Client::new`.
-        {
-            let mut clients = CLIENTS
-                .lock()
-                .map_err(|_| PhpException::default("client cache mutex poisoned".into()))?;
+        // observe the cached entry and skip the expensive `aero::Client::new`. Evicted
+        // idle entries are only *removed* under the lock; closing them (which blocks on
+        // the tend channel) happens after the guard is dropped.
+        let (result, evicted) = {
+            let mut cache = clients_lock();
+            let clients = &mut cache.map;
 
-            if let Some(entry) = clients.get(&cache_key) {
+            if let Some(entry) = clients.get_mut(&cache_key) {
                 trace!("Found Aerospike Client object for {hosts}");
+                entry.last_used = Instant::now();
                 return zval_from_entry(entry);
             }
 
-            trace!("Creating a new Aerospike Client object for {hosts}");
-            let aero_policy = policy.map(|p| p._as.clone()).unwrap_or_default();
-
-            // External (LDAP) auth sends the password in clear at login — refuse to connect
-            // if TLS is not configured. We enforce this here (rather than in
-            // `set_auth_external`) so the user can set TLS and auth in either order.
-            if matches!(aero_policy.auth_mode, aero::AuthMode::External(_, _))
-                && aero_policy.tls_config.is_none()
-            {
-                return throw_msg(
-                    "AuthMode::External requires TLS — call ClientPolicy::setTls() before connect()",
-                    Zval::new(),
-                );
-            }
-
             let c = {
-                let _guard = TOKIO_RT.enter();
+                let _guard = tokio_rt().enter();
                 match aero::Client::new(&aero_policy, &hosts) {
                     Ok(c) => Arc::new(c),
                     // Preserve the structured AerospikeException (code + in_doubt) instead
@@ -7521,19 +7724,70 @@ impl Client {
                 }
             };
 
+            // Make room before inserting: drop idle cached clients (LRU) so credential/cert
+            // rotation or per-tenant policies don't accumulate live connection pools for
+            // the lifetime of the process.
+            let evicted = evict_idle_clients(clients);
+
             let entry = ClientEntry {
                 client: c,
                 hosts: hosts.to_string(),
                 policy_fingerprint: fp,
+                last_used: Instant::now(),
             };
-            let inserted = clients.entry(cache_key.clone()).or_insert(entry);
-            zval_from_entry(inserted)
-        }
+            let inserted = clients.entry(cache_key).or_insert(entry);
+            (zval_from_entry(inserted), evicted)
+        };
+
+        close_client_entries(evicted);
+        result
     }
 
     /// Returns the hosts string this client was connected to.
     pub fn get_hosts(&self) -> String {
         self.hosts.clone()
+    }
+
+    /// Returns true if the client is connected to any cluster nodes and has not been
+    /// closed. Returns false immediately after `close()`.
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
+    /// Close the connection to the Aerospike cluster and remove this client from the
+    /// per-process client cache, stopping its connection pool and background cluster-tend
+    /// task. The underlying connection is shared: any other PHP `Client` object obtained
+    /// from `connect()` with the same hosts and policy uses the same pool and becomes
+    /// unusable after `close()`. A subsequent `connect()` establishes a fresh connection.
+    ///
+    /// Calling `close()` is optional — cached clients are reused across requests by design
+    /// and are closed automatically at module shutdown. Use it when a connection is known
+    /// to be obsolete (e.g. after credential rotation) to release its pool immediately.
+    pub fn close(&self) -> PhpResult<()> {
+        {
+            let mut cache = clients_lock();
+            let cache_key = format!("{}|{}", self.hosts, self.policy_fingerprint);
+            // Only evict the entry if it still holds *this* client. After close() +
+            // connect() with the same hosts/policy, the key maps to a fresh live client;
+            // a second close() on the old object must not orphan it (an entry removed
+            // without being closed leaks its pool and tend task).
+            if let Some(entry) = cache.map.get(&cache_key) {
+                if Arc::ptr_eq(&entry.client, &self.client) {
+                    cache.map.remove(&cache_key);
+                }
+            }
+        }
+        let _guard = tokio_rt().enter();
+        if let Err(e) = self.client.close() {
+            return throw_aero_error(&e, ());
+        }
+        Ok(())
+    }
+
+    /// Number of clients currently held by the per-process client cache. Diagnostic
+    /// helper: lets deployments (and tests) observe cache growth and eviction behavior.
+    pub fn cached_client_count() -> u64 {
+        clients_lock().map.len() as u64
     }
 
     /// v1 compatibility shim: forwards `$client->hosts` to `getHosts()`.
@@ -7550,7 +7804,7 @@ impl Client {
     /// how the transaction is handled when the record already exists.
     pub fn put(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.put(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7566,7 +7820,7 @@ impl Client {
         bins: Option<Vec<String>>,
     ) -> PhpResult<Option<Record>> {
         let aero_bins = php_bins_to_aero(bins);
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.get(&policy._as, &key._as, aero_bins) {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
@@ -7576,7 +7830,7 @@ impl Client {
 
     /// Read record header (generation, expiration) only. No bins are returned.
     pub fn get_header(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<Option<Record>> {
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.get(&policy._as, &key._as, aero::Bins::None) {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
@@ -7587,7 +7841,7 @@ impl Client {
     /// Add integer bin values to existing record bin values.
     pub fn add(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.add(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7597,7 +7851,7 @@ impl Client {
     /// Append bin string values to existing record bin values.
     pub fn append(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.append(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7607,7 +7861,7 @@ impl Client {
     /// Prepend bin string values to existing record bin values.
     pub fn prepend(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.prepend(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7616,7 +7870,7 @@ impl Client {
 
     /// Delete record for specified key. Returns `true` if the record existed before deletion.
     pub fn delete(&self, policy: &WritePolicy, key: &Key) -> PhpResult<bool> {
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.delete(&policy._as, &key._as) {
             Ok(existed) => Ok(existed),
             Err(e) => throw_aero_error(&e, false),
@@ -7625,7 +7879,7 @@ impl Client {
 
     /// Reset record's time to expiration using the policy's expiration.
     pub fn touch(&self, policy: &WritePolicy, key: &Key) -> PhpResult<()> {
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.touch(&policy._as, &key._as) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7634,7 +7888,7 @@ impl Client {
 
     /// Determine if a record key exists.
     pub fn exists(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<bool> {
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.exists(&policy._as, &key._as) {
             Ok(exists) => Ok(exists),
             Err(e) => throw_aero_error(&e, false),
@@ -7657,7 +7911,7 @@ impl Client {
     ) -> PhpResult<Option<Record>> {
         let aero_ops: Vec<aero::operations::Operation> =
             ops.iter().map(|o| o._as.clone()).collect();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.operate(&policy._as, &key._as, &aero_ops) {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
@@ -7683,7 +7937,7 @@ impl Client {
                 return throw_msg("Invalid Batch command", vec![]);
             }
         }
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.batch(&policy._as, &batch_ops) {
             Ok(results) => Ok(results
                 .into_iter()
@@ -7702,7 +7956,7 @@ impl Client {
         before_nanos: Option<i64>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy.timeout);
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self
             .client
             .truncate(&admin, namespace, set_name, before_nanos.unwrap_or(0))
@@ -7734,7 +7988,7 @@ impl Client {
             .lock()
             .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
             .clone();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.query(&policy._as, pf, stmt) {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
@@ -7759,7 +8013,7 @@ impl Client {
             .lock()
             .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
             .clone();
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.query(&policy._as, pf, stmt) {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
@@ -7789,7 +8043,7 @@ impl Client {
         let cit_val = cit
             .map(|c| c._as.clone())
             .unwrap_or(aero::CollectionIndexType::Default);
-        let task = match TOKIO_RT.block_on(self.client.create_index_on_bin(
+        let task = match tokio_rt().block_on(self.client.create_index_on_bin(
             &admin,
             namespace,
             set_name,
@@ -7802,7 +8056,7 @@ impl Client {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7818,7 +8072,7 @@ impl Client {
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let task = {
-            let _guard = TOKIO_RT.enter();
+            let _guard = tokio_rt().enter();
             match self
                 .client
                 .drop_index(&admin, namespace, set_name, index_name)
@@ -7827,7 +8081,7 @@ impl Client {
                 Err(e) => return throw_aero_error(&e, ()),
             }
         };
-        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7844,7 +8098,7 @@ impl Client {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let lang = language.map(|l| l._as).unwrap_or(aero::UDFLang::Lua);
         let task = {
-            let _guard = TOKIO_RT.enter();
+            let _guard = tokio_rt().enter();
             match self
                 .client
                 .register_udf(&admin, udf_body.as_bytes(), package_name, lang)
@@ -7853,7 +8107,7 @@ impl Client {
                 Err(e) => return throw_aero_error(&e, ()),
             }
         };
-        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7862,13 +8116,13 @@ impl Client {
     pub fn drop_udf(&self, policy: &WritePolicy, package_name: &str) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let task = {
-            let _guard = TOKIO_RT.enter();
+            let _guard = tokio_rt().enter();
             match self.client.remove_udf(&admin, package_name) {
                 Ok(t) => t,
                 Err(e) => return throw_aero_error(&e, ()),
             }
         };
-        if let Err(e) = TOKIO_RT.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7881,7 +8135,7 @@ impl Client {
             Some(n) => n.clone(),
             None => return Ok(vec![]),
         };
-        let result = match TOKIO_RT.block_on(node.info(&admin, &["udf-list"])) {
+        let result = match tokio_rt().block_on(node.info(&admin, &["udf-list"])) {
             Ok(r) => r,
             Err(e) => return throw_aero_error(&e, vec![]),
         };
@@ -7926,7 +8180,7 @@ impl Client {
         let nodes = self.client.nodes();
         let mut versions = std::collections::HashMap::new();
         for node in &nodes {
-            match TOKIO_RT.block_on(node.info(&aero::AdminPolicy::default(), &["build"])) {
+            match tokio_rt().block_on(node.info(&aero::AdminPolicy::default(), &["build"])) {
                 Ok(result) => {
                     let ver = result.get("build").cloned().unwrap_or_default();
                     versions.insert(node.name().to_string(), ver);
@@ -7953,7 +8207,7 @@ impl Client {
         } else {
             Some(&aero_args)
         };
-        let _guard = TOKIO_RT.enter();
+        let _guard = tokio_rt().enter();
         match self.client.execute_udf(
             &policy._as,
             &key._as,
@@ -7980,7 +8234,7 @@ impl Client {
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
         if let Err(e) =
-            TOKIO_RT.block_on(
+            tokio_rt().block_on(
                 self.client
                     .create_user(&policy._as, &user, &password, &roles_ref),
             )
@@ -7991,7 +8245,7 @@ impl Client {
     }
 
     pub fn drop_user(&self, policy: &AdminPolicy, user: String) -> PhpResult<()> {
-        if let Err(e) = TOKIO_RT.block_on(self.client.drop_user(&policy._as, &user)) {
+        if let Err(e) = tokio_rt().block_on(self.client.drop_user(&policy._as, &user)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8004,7 +8258,7 @@ impl Client {
         password: String,
     ) -> PhpResult<()> {
         if let Err(e) =
-            TOKIO_RT.block_on(self.client.change_password(&policy._as, &user, &password))
+            tokio_rt().block_on(self.client.change_password(&policy._as, &user, &password))
         {
             return throw_aero_error(&e, ());
         }
@@ -8018,7 +8272,7 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) = TOKIO_RT.block_on(self.client.grant_roles(&policy._as, &user, &roles_ref)) {
+        if let Err(e) = tokio_rt().block_on(self.client.grant_roles(&policy._as, &user, &roles_ref)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8031,7 +8285,7 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) = TOKIO_RT.block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))
+        if let Err(e) = tokio_rt().block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))
         {
             return throw_aero_error(&e, ());
         }
@@ -8043,7 +8297,7 @@ impl Client {
         policy: &AdminPolicy,
         user: Option<String>,
     ) -> PhpResult<Vec<UserRole>> {
-        match TOKIO_RT.block_on(self.client.query_users(&policy._as, user.as_deref())) {
+        match tokio_rt().block_on(self.client.query_users(&policy._as, user.as_deref())) {
             Ok(users) => Ok(users.into_iter().map(UserRole::from).collect()),
             Err(e) => throw_aero_error(&e, vec![]),
         }
@@ -8054,7 +8308,7 @@ impl Client {
         policy: &AdminPolicy,
         role_name: Option<String>,
     ) -> PhpResult<Vec<Role>> {
-        match TOKIO_RT.block_on(self.client.query_roles(&policy._as, role_name.as_deref())) {
+        match tokio_rt().block_on(self.client.query_roles(&policy._as, role_name.as_deref())) {
             Ok(roles) => Ok(roles.into_iter().map(Role::from).collect()),
             Err(e) => throw_aero_error(&e, vec![]),
         }
@@ -8071,7 +8325,7 @@ impl Client {
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
         let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-        if let Err(e) = TOKIO_RT.block_on(self.client.create_role(
+        if let Err(e) = tokio_rt().block_on(self.client.create_role(
             &policy._as,
             &role_name,
             &privs,
@@ -8085,7 +8339,7 @@ impl Client {
     }
 
     pub fn drop_role(&self, policy: &AdminPolicy, role_name: String) -> PhpResult<()> {
-        if let Err(e) = TOKIO_RT.block_on(self.client.drop_role(&policy._as, &role_name)) {
+        if let Err(e) = tokio_rt().block_on(self.client.drop_role(&policy._as, &role_name)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8098,7 +8352,7 @@ impl Client {
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
-        if let Err(e) = TOKIO_RT.block_on(self.client.grant_privileges(
+        if let Err(e) = tokio_rt().block_on(self.client.grant_privileges(
             &policy._as,
             &role_name,
             &privs,
@@ -8115,7 +8369,7 @@ impl Client {
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
-        if let Err(e) = TOKIO_RT.block_on(self.client.revoke_privileges(
+        if let Err(e) = tokio_rt().block_on(self.client.revoke_privileges(
             &policy._as,
             &role_name,
             &privs,
@@ -8132,7 +8386,7 @@ impl Client {
         allowlist: Vec<String>,
     ) -> PhpResult<()> {
         let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-        if let Err(e) = TOKIO_RT.block_on(self.client.set_allowlist(
+        if let Err(e) = tokio_rt().block_on(self.client.set_allowlist(
             &policy._as,
             &role_name,
             &allowlist_ref,
@@ -8149,7 +8403,7 @@ impl Client {
         read_quota: u32,
         write_quota: u32,
     ) -> PhpResult<()> {
-        if let Err(e) = TOKIO_RT.block_on(self.client.set_quotas(
+        if let Err(e) = tokio_rt().block_on(self.client.set_quotas(
             &policy._as,
             &role_name,
             read_quota,
@@ -9596,6 +9850,7 @@ pub extern "C" fn php_module_info(_module: *mut ModuleEntry) {
 #[php(startup = aerospike_php_startup)]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
+        .shutdown_function(aerospike_php_shutdown)
         .class::<ExpType>()
         .class::<Expression>()
         .class::<ReadModeAP>()

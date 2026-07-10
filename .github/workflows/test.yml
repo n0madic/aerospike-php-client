@@ -74,12 +74,15 @@ jobs:
     - uses: shivammathur/setup-php@v2
       with:
         php-version: ${{ matrix.php-version }}
+        # phpize pulls in php$version-dev, which provides the headers and php-config
+        # that ext-php-rs needs. Do not apt-install php$version-{dev,mbstring,xml}
+        # below: setup-php now installs PHP from its own package cache and that
+        # installer deletes the ondrej PPA apt lists, so those packages are both
+        # unavailable to apt and already present.
+        tools: phpize
     - name: Install prerequisites
       run: |
         sudo apt -y install \
-          php${{ matrix.php-version }}-mbstring \
-          php${{ matrix.php-version }}-xml \
-          php${{ matrix.php-version }}-dev \
           phpunit \
           build-essential \
           rustup

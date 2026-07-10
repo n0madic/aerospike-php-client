@@ -1,7 +1,6 @@
 {
     "name": "aerospike/aerospike-php",
     "type": "library",
-    "version": "2.0.0",
     "description": "Aerospike PHP 8 client — native Rust extension built on aerospike-client-rust",
     "keywords": ["php", "extension", "aerospike", "nosql"],
     "license": "Apache-2.0",

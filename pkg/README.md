@@ -10,14 +10,33 @@ pkg/
 ├── deb/
 │   ├── control            # debian package metadata; @VERSION@ is substituted in CI
 │   └── scripts/postinst   # install hook: copy .so into PHP ext dir + add extension= line
-└── rpm/
-    ├── aerospike-php-client.spec
-    └── scripts/postinst
+├── rpm/
+│   ├── aerospike-php-client.spec
+│   └── scripts/postinst
+└── scripts/
+    ├── postinst-common.sh      # shared template for both postinst hooks
+    └── generate-postinst.sh    # regenerates the deb/rpm postinst files from the template
 ```
 
 Starting with v2.0.0 the package no longer ships the Go-based
 `aerospike-connection-manager` daemon — there is just one file in the payload:
 `libaerospike_php.so`, the native Rust extension.
+
+### Regenerating the postinst scripts
+
+`pkg/deb/scripts/postinst` and `pkg/rpm/scripts/postinst` are generated files —
+they carry identical extension-enabling logic and differ only in the PHP
+install command (apt vs dnf/yum) and the `.so` search path (`/usr/lib` vs
+`/usr/lib64`). Edit the shared logic in `pkg/scripts/postinst-common.sh` and
+the per-distro bits in `pkg/scripts/generate-postinst.sh`, then regenerate and
+commit the output:
+
+```shell
+bash pkg/scripts/generate-postinst.sh
+```
+
+Do not hand-edit the two `postinst` files directly — the next regeneration
+would silently discard the change.
 
 ## Prerequisites for installation
 

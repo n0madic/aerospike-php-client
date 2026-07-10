@@ -3,8 +3,7 @@
 # GENERATED FROM pkg/scripts/postinst-common.sh via pkg/scripts/generate-postinst.sh
 # — do not edit pkg/deb/scripts/postinst or pkg/rpm/scripts/postinst directly.
 #
-# Post-install for RPM: place the Aerospike PHP extension into PHP's extension
-# directory and enable it. No daemon to launch in v2.
+@HEADER@
 
 set -e
 
@@ -16,11 +15,7 @@ log_error_and_exit() {
 # Ensure PHP 8 is installed
 if ! command -v php > /dev/null; then
     echo "PHP not found. Installing default PHP 8..."
-    if command -v dnf > /dev/null; then
-        dnf install -y php php-fpm || log_error_and_exit "Failed to install PHP."
-    else
-        yum install -y php php-fpm || log_error_and_exit "Failed to install PHP."
-    fi
+@PHP_INSTALL@
 fi
 
 EXT_DIR=$(php -r 'echo ini_get("extension_dir");') \
@@ -29,8 +24,7 @@ EXT_DIR=$(php -r 'echo ini_get("extension_dir");') \
 PHP_INI_PATH=$(php -r 'echo php_ini_loaded_file();') \
     || log_error_and_exit "Failed to determine PHP INI file."
 
-SO_FILE_PATH="/usr/lib64/libaerospike_php.so"
-[ -f "$SO_FILE_PATH" ] || SO_FILE_PATH="/usr/lib/libaerospike_php.so"
+@SO_FILE_PATH@
 
 if [[ ! -f "$SO_FILE_PATH" ]]; then
     log_error_and_exit "Aerospike PHP extension not found at $SO_FILE_PATH."

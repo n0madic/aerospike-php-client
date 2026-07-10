@@ -108,4 +108,23 @@ class CDTMapOpTest extends TestCase{
         MapOp::put($mp, self::$cdtBinName, "not a map");
     }
 
+    // Regression test: a KEY_ORDERED map bin stores entries sorted by key server-side
+    // (decoded as an ordered map rather than a plain hash map), regardless of insertion
+    // order. Entries are put in non-sorted key order ("c", "a", "b") and must be read
+    // back with keys in sorted order.
+    public function testKeyOrderedMapPreservesKeyOrder(){
+        $bwp = new BatchWritePolicy();
+        $bp = new BatchPolicy();
+        $mp = new MapPolicy(MapOrderType::KeyOrdered());
+
+        $ops = [MapOp::put($mp, self::$cdtBinName, ["c" => 3, "a" => 1, "b" => 2])];
+        $bw = new BatchWrite($bwp, self::$key, $ops);
+        self::$client->batch($bp, [$bw]);
+
+        $rp = new ReadPolicy();
+        $record = self::$client->get($rp, self::$key);
+        $map = $record->getBins()[self::$cdtBinName];
+        $this->assertSame(["a", "b", "c"], array_keys($map));
+    }
+
 }

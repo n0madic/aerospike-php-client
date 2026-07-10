@@ -1,0 +1,6 @@
+# PHP extensions resolve Zend symbols from the host PHP binary at load time; on macOS
+# the linker must be told to leave them undefined (Linux allows this by default).
+# Single source for this flag — do not duplicate it via RUSTFLAGS in CI or scripts
+# (an environment RUSTFLAGS would silently override this file).
+[target.'cfg(target_vendor = "apple")']
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]

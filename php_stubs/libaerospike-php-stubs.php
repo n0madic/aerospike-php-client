@@ -1001,7 +1001,10 @@ namespace Aerospike {
     }
 
     class Client {
-        public function __construct() {}
+        /**
+         * Not directly instantiable; use Client::connect().
+         */
+        private function __construct() {}
 
         /**
          * v1 compatibility shim: forwards `$client->hosts` to `getHosts()`.
@@ -1229,6 +1232,18 @@ namespace Aerospike {
          * @return array
          */
         public function listUdf(\Aerospike\ReadPolicy $policy): array {}
+
+        /**
+         * Execute multiple operations on a single record atomically. Combines reads, writes,
+         * CDT (list/map/bitwise/HLL) operations, and touch semantics in one round trip.
+         *
+         * @param \Aerospike\WritePolicy $policy
+         * @param \Aerospike\Key $key
+         * @param Operation[] $ops
+         * @return \Aerospike\Record|null The resulting record, or null if the operations
+         *                                produced no readable output and the record was not present.
+         */
+        public function operate(\Aerospike\WritePolicy $policy, \Aerospike\Key $key, array $ops): ?\Aerospike\Record {}
 
         /**
          * Prepend bin string values to existing record bin values.
@@ -2822,7 +2837,7 @@ namespace Aerospike {
          * @param int $index_bit_count
          * @return \Aerospike\Operation|null
          */
-        public static function fold(string $bin_name, int $index_bit_count): ?\Aerospike\Operation {}
+        public static function fold(string $bin_name, int $index_bit_count): \Aerospike\Operation {}
 
         /**
          * HLLGetCountOp creates HLL getCount operation.
@@ -2831,7 +2846,7 @@ namespace Aerospike {
          * @param string $bin_name
          * @return \Aerospike\Operation|null
          */
-        public static function getCount(string $bin_name): ?\Aerospike\Operation {}
+        public static function getCount(string $bin_name): \Aerospike\Operation {}
 
         /**
          * HLLGetIntersectCountOp creates HLL getIntersectCount operation.
@@ -2842,7 +2857,7 @@ namespace Aerospike {
          * @param array $list
          * @return \Aerospike\Operation|null
          */
-        public static function getIntersectCount(string $bin_name, array $list): ?\Aerospike\Operation {}
+        public static function getIntersectCount(string $bin_name, array $list): \Aerospike\Operation {}
 
         /**
          * HLLGetSimilarityOp creates HLL getSimilarity operation.
@@ -2852,18 +2867,18 @@ namespace Aerospike {
          * @param array $list
          * @return \Aerospike\Operation|null
          */
-        public static function getSimilarity(string $bin_name, array $list): ?\Aerospike\Operation {}
+        public static function getSimilarity(string $bin_name, array $list): \Aerospike\Operation {}
 
         /**
          * HLLGetUnionOp creates HLL getUnion operation.
          * Server returns an HLL object that is the union of all specified HLL objects in the list
-         * with the HLL bin. Returns `None` if any element of `list` is not an HLL value.
+         * with the HLL bin. Throws an AerospikeException if any element of `list` is not an HLL value.
          *
          * @param string $bin_name
          * @param array $list
          * @return \Aerospike\Operation|null
          */
-        public static function getUnion(string $bin_name, array $list): ?\Aerospike\Operation {}
+        public static function getUnion(string $bin_name, array $list): \Aerospike\Operation {}
 
         /**
          * HLLGetUnionCountOp creates HLL getUnionCount operation.
@@ -2874,7 +2889,7 @@ namespace Aerospike {
          * @param array $list
          * @return \Aerospike\Operation|null
          */
-        public static function getUnionCount(string $bin_name, array $list): ?\Aerospike\Operation {}
+        public static function getUnionCount(string $bin_name, array $list): \Aerospike\Operation {}
 
         /**
          * HLLInitOp creates HLL init operation with minhash bits.
@@ -2902,19 +2917,19 @@ namespace Aerospike {
          * @param string $bin_name
          * @return \Aerospike\Operation|null
          */
-        public static function refreshCount(string $bin_name): ?\Aerospike\Operation {}
+        public static function refreshCount(string $bin_name): \Aerospike\Operation {}
 
         /**
          * HLLSetUnionOp creates HLL set union operation.
          * Server sets union of specified HLL objects with HLL bin.
-         * Returns `None` if any element of `list` is not an HLL value.
+         * Throws an AerospikeException if any element of `list` is not an HLL value.
          *
          * @param \Aerospike\HllPolicy $policy
          * @param string $bin_name
          * @param array $list
          * @return \Aerospike\Operation|null
          */
-        public static function setUnion(\Aerospike\HllPolicy $policy, string $bin_name, array $list): ?\Aerospike\Operation {}
+        public static function setUnion(\Aerospike\HllPolicy $policy, string $bin_name, array $list): \Aerospike\Operation {}
     }
 
     /**
@@ -5289,7 +5304,7 @@ namespace Aerospike {
 
         /**
          * v1 compatibility shim: forwards `$record->bins`, `->generation`, `->ttl`,
-         * `->key` to the corresponding getters.
+         * `->key`, `->expiration` to the corresponding getters.
          *
          * @param string $name
          * @return mixed
@@ -5335,10 +5350,13 @@ namespace Aerospike {
         public function getKey(): ?\Aerospike\Key {}
 
         /**
-         * Absolute Unix timestamp (in seconds since epoch) when this record will expire.
-         * Returns null if the record never expires. v1-compatible.
+         * Remaining time-to-live in seconds (positive integer), or null if the record
+         * never expires, or if the TTL is unknown. v1-compatible: matches the semantics
+         * of `aerospike-client-php` 1.x, which also returned the remaining TTL rather
+         * than an absolute timestamp.
          *
-         * For the remaining TTL in seconds, use getRemainingTtl().
+         * Equivalent to `getRemainingTtl()`. For the full expiration state (including
+         * "never expires" and "use namespace default"), use `getExpiration()`.
          *
          * @return int|null
          */
@@ -5346,7 +5364,7 @@ namespace Aerospike {
 
         /**
          * Remaining TTL in seconds (positive integer), or null if the record never expires.
-         * Equivalent to `$this->getExpiration()->getTtl()`.
+         * Equivalent to `$this->getExpiration()->getTtl()`, and to `getTtl()`.
          *
          * @return int|null
          */
@@ -5577,11 +5595,6 @@ namespace Aerospike {
          * GEO_INVALID_GEOJSON defines invalid GeoJSON on insert/update
          */
         const GEO_INVALID_GEOJSON = 160;
-
-        /**
-         * GRPC_ERROR is wrapped and directly returned from the grpc library
-         */
-        const GRPC_ERROR = -21;
 
         /**
          * ILLEGAL_STATE defines security protocol not followed.

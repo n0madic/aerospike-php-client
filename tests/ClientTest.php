@@ -399,6 +399,78 @@ final class ClientTest extends TestCase
         $this->assertTrue($record->getExpiration()->willNeverExpire());
     }
 
+    // Regression test: getTtl()/getRemainingTtl()/->ttl must report the remaining seconds
+    // to live, not an absolute expiration epoch (~1.7e9 seconds since 2010). A 3600 s
+    // expiration must round-trip to a small positive remaining value.
+    public function testGetTtlReturnsRemainingSecondsNotAbsoluteEpoch()
+    {
+        $newKey = new Key(self::$namespace, self::$set, "ttl_remaining_key");
+        $wp = new WritePolicy();
+        $wp->setExpiration(Expiration::Seconds(3600));
+        self::$client->put($wp, $newKey, [new Bin("record", "expires_in_3600")]);
+
+        $rp = new ReadPolicy();
+        $record = self::$client->get($rp, $newKey);
+
+        $ttl = $record->getTtl();
+        $this->assertGreaterThan(0, $ttl);
+        $this->assertLessThanOrEqual(3600, $ttl);
+        // Guards against the historical bug of returning an absolute epoch (~1.7e9).
+        $this->assertLessThan(100000, $ttl);
+
+        $this->assertEqualsWithDelta($ttl, $record->getRemainingTtl(), 2);
+
+        // v1 compatibility shim: the magic property must match the getter.
+        $this->assertEqualsWithDelta($ttl, $record->ttl, 2);
+    }
+
+    // Regression test: Record::__get('expiration') must forward to getExpiration(),
+    // returning an Aerospike\Expiration instance rather than null.
+    public function testRecordExpirationMagicPropertyIsExpirationInstance()
+    {
+        $newKey = new Key(self::$namespace, self::$set, "expiration_prop_key");
+        $wp = new WritePolicy();
+        $wp->setExpiration(Expiration::Seconds(60));
+        self::$client->put($wp, $newKey, [new Bin("record", "expires_in_60")]);
+
+        $rp = new ReadPolicy();
+        $record = self::$client->get($rp, $newKey);
+
+        $this->assertInstanceOf(Expiration::class, $record->expiration);
+    }
+
+    // Regression test: Value::uint() bit-casts a negative PHP int to u64 (e.g. -1 becomes
+    // u64::MAX), which does not fit Aerospike's signed 64-bit integer range. Writing such a
+    // value used to silently wrap to -1; it must now throw instead of corrupting data.
+    public function testUintOverflowThrows()
+    {
+        $newKey = new Key(self::$namespace, self::$set, "uint_overflow_key");
+        $wp = new WritePolicy();
+        $this->expectException(\Throwable::class);
+        self::$client->put($wp, $newKey, [new Bin("record", Value::uint(-1))]);
+    }
+
+    // Regression test: PHP arrays with non-sequential integer keys must round-trip through
+    // a map bin as integer keys, not be coerced to strings.
+    public function testMapWithIntegerKeysPreservesKeyType()
+    {
+        $map = [5 => "x", 1 => "y"];
+        $newKey = new Key(self::$namespace, self::$set, "int_key_map");
+        $wp = new WritePolicy();
+        self::$client->put($wp, $newKey, [new Bin("intKeyMap", $map)]);
+
+        $rp = new ReadPolicy();
+        $record = self::$client->get($rp, $newKey, ["intKeyMap"]);
+        $result = $record->getBins()["intKeyMap"];
+
+        $keys = array_keys($result);
+        sort($keys);
+        $this->assertSame([1, 5], $keys);
+        foreach ($keys as $k) {
+            $this->assertIsInt($k);
+        }
+    }
+
     // Regression test for close(): closing a client must stop its cached connection and
     // evict it from the per-process cache, and a subsequent connect() must establish a
     // fresh working connection. A distinct applicationId gives this test its own cache

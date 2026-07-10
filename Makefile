@@ -23,7 +23,7 @@ ifeq ($(shell awk 'BEGIN{ print ("$(PHP_VERSION)" >= "8.0") }'), 0)
     $(error PHP version must be greater than or equal to 8.0)
 endif
 
-.PHONY: build install test test-docker clean
+.PHONY: build install install-only test test-docker clean
 all: lint build install
 
 lint:
@@ -41,12 +41,16 @@ ifeq (,$(findstring libaerospike_php,$(PHP_INI_CONTENT)))
 	echo "extension=libaerospike_php$(EXTENSION)" | tee -a $(PHP_INI_PATH)
 endif
 
-
-install: build
+# Copy-only: installs the already-built .so without touching cargo. Split out
+# so CI can compile unprivileged (`make build`) and then only escalate for the
+# file copy (`sudo make install-only`), instead of recompiling as root.
+install-only:
 	cp -f target/release/libaerospike_php$(EXTENSION) $(EXT_DIR_PATH)
 ifeq (,$(findstring libaerospike_php,$(PHP_INI_CONTENT)))
 	echo "extension=libaerospike_php$(EXTENSION)" | tee -a $(PHP_INI_PATH)
 endif
+
+install: build install-only
 
 restart: install
 	$(RESTART_COMMAND)

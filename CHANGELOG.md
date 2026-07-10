@@ -158,7 +158,9 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
 ### New methods (additions to existing classes)
 
 - **`Record::getRemainingTtl(): ?int`** — remaining TTL in seconds, or `null` if the record
-  never expires. (`Record::getTtl()` still returns the v1-compatible absolute Unix timestamp.)
+  never expires. Equivalent to `Record::getTtl()`, which is kept for v1 compatibility and
+  also returns the remaining TTL in seconds (not an absolute timestamp). For the record's
+  expiration state, use `Record::getExpiration(): Expiration`.
 - **`Expression::boolXor(array $exps): Expression`** — boolean XOR over a list of expressions.
   (`Expression::xor()` remains a v1-compatible alias for `intXor`.)
 - **`BatchPolicy::setConcurrency(Concurrency $c): void`** / **`getConcurrency(): Concurrency`** —
@@ -218,7 +220,7 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
 - `Client::close()` method.
 - `Client::$socket` property.
 - Build scripts' Go/protoc installation steps.
-- `php_stubs/libaerospike-php-stubsv1.0.0.php` — v1 IDE stub. v2 stubs live at `php_stubs/libaerospike-php-stubsv2.0.0.php`.
+- `php_stubs/libaerospike-php-stubsv1.0.0.php` — v1 IDE stub. v2 stubs live at `php_stubs/libaerospike-php-stubs.php`.
 
 ## [1.4.0] - 2025-10-01
 

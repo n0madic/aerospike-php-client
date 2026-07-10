@@ -51,6 +51,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build Aerospike PHP client library
         run: cargo build --release
 

@@ -170,6 +170,41 @@ final class BatchOpsTest extends TestCase
         $this->assertEquals(21, $bins["ibin"]);
     }
 
+    // Regression test: new BatchRead($policy, $key) with no bins argument (null) must
+    // read the record header only (generation, no bins). This is the opposite contract
+    // of Statement, where null bin_names means "all bins" - see testBatchReadEmptyArrayBinsReadsAllBins
+    // and QueryTest for the Statement side.
+    public function testBatchReadNullBinsIsHeaderOnly(){
+        $batchKey = new Key(self::$namespace, self::$set, "batch_key");
+        $wp = new WritePolicy();
+        self::$client->put($wp, $batchKey, [new Bin("ibin", 1)]);
+
+        $brp = new BatchReadPolicy();
+        $batchRead = new BatchRead($brp, $batchKey);
+
+        $bp = new BatchPolicy();
+        $recs = self::$client->batch($bp, [$batchRead]);
+        $record = $recs[0]->getRecord();
+        $this->assertEmpty($record->getBins());
+        $this->assertNotNull($record->getGeneration());
+    }
+
+    // Regression test: new BatchRead($policy, $key, []) with an explicit empty array must
+    // read all bins, not header-only.
+    public function testBatchReadEmptyArrayBinsReadsAllBins(){
+        $batchKey = new Key(self::$namespace, self::$set, "batch_key");
+        $wp = new WritePolicy();
+        self::$client->put($wp, $batchKey, [new Bin("ibin", 1)]);
+
+        $brp = new BatchReadPolicy();
+        $batchRead = new BatchRead($brp, $batchKey, []);
+
+        $bp = new BatchPolicy();
+        $recs = self::$client->batch($bp, [$batchRead]);
+        $record = $recs[0]->getRecord();
+        $this->assertArrayHasKey("ibin", $record->getBins());
+    }
+
     public function testBatchRecordGetKey(){
         $batchKey = new Key(self::$namespace, self::$set, "batch_key");
         $wp = new WritePolicy();

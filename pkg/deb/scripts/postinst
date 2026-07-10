@@ -1,5 +1,8 @@
 #!/bin/bash
-
+#
+# GENERATED FROM pkg/scripts/postinst-common.sh via pkg/scripts/generate-postinst.sh
+# — do not edit pkg/deb/scripts/postinst or pkg/rpm/scripts/postinst directly.
+#
 # Post-install: drop the Aerospike PHP extension into the system PHP extension
 # directory and enable it. No daemon to launch — the v2 extension talks to the
 # Aerospike cluster directly.

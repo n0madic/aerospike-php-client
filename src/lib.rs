@@ -42,7 +42,7 @@ use ext_php_rs::binary::Binary;
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::convert::IntoZendObject;
 use ext_php_rs::convert::{FromZval, IntoZval};
-use ext_php_rs::error::Result;
+use ext_php_rs::error::{Error, Result};
 use ext_php_rs::exception::throw_object;
 use ext_php_rs::flags::DataType;
 use ext_php_rs::info_table_end;
@@ -130,6 +130,21 @@ fn tokio_rt() -> PhpResult<&'static tokio::runtime::Runtime> {
     Ok(rt)
 }
 
+/// Central fork-detection primitive: compares `stored_pid` with the current pid and
+/// updates it, returning `true` when the process has forked since the pid was recorded.
+/// Every process-local cache holding state that cannot survive fork() (runtime handles,
+/// sockets, lock guards) must call this before using inherited contents and discard them
+/// when it returns `true`. Callers: `clients_lock`, `connect_guard`; `tokio_rt` keeps its
+/// own lock-free equivalent (atomic pid + pointer) for the hot path, documented there.
+fn process_forked(stored_pid: &mut u32) -> bool {
+    let pid = std::process::id();
+    if *stored_pid == pid {
+        return false;
+    }
+    *stored_pid = pid;
+    true
+}
+
 struct ClientCache {
     /// Process id the cache contents belong to; a mismatch means we are in a fork() child.
     pid: u32,
@@ -155,12 +170,10 @@ static CLIENTS: LazyLock<Mutex<ClientCache>> = LazyLock::new(|| {
 /// every subsequent `connect()` unusable for the life of the process.
 fn clients_lock() -> MutexGuard<'static, ClientCache> {
     let mut cache = CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
-    let pid = std::process::id();
-    if cache.pid != pid {
+    if process_forked(&mut cache.pid) {
         trace!("pid changed (fork detected): discarding inherited client cache");
         let stale = std::mem::take(&mut cache.map);
         std::mem::forget(stale);
-        cache.pid = pid;
     }
     cache
 }
@@ -187,10 +200,8 @@ static CONNECT_GUARDS: LazyLock<Mutex<ConnectGuards>> = LazyLock::new(|| {
 /// inherited guards after fork() (same rationale as `clients_lock`).
 fn connect_guard(cache_key: &str) -> Arc<Mutex<()>> {
     let mut guards = CONNECT_GUARDS.lock().unwrap_or_else(PoisonError::into_inner);
-    let pid = std::process::id();
-    if guards.pid != pid {
+    if process_forked(&mut guards.pid) {
         guards.map.clear();
-        guards.pid = pid;
     }
     guards.map.entry(cache_key.to_string()).or_default().clone()
 }
@@ -431,6 +442,71 @@ fn throw_msg<T>(msg: &str, default: T) -> PhpResult<T> {
     Ok(default)
 }
 
+/// Runs `f`, converting a Rust panic into a catchable `AerospikeException` instead of
+/// letting it unwind across the C FFI boundary — unwinding out of an `extern "C"` frame
+/// aborts the whole PHP worker process. This is the single panic boundary for calls into
+/// the aerospike crate, whose value-encoding and operation-builder paths contain
+/// `assert!`/`panic!` sites (e.g. unsupported map-key types).
+///
+/// `AssertUnwindSafe` is sound here: process-wide state is already panic-tolerant — the
+/// client/guard caches recover poisoned mutexes via `PoisonError::into_inner` and hold no
+/// invariant a panic can tear.
+fn catch_panic<T>(f: impl FnOnce() -> T) -> PhpResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        PhpException::from_class::<AerospikeException>(format!(
+            "internal error in aerospike client: {msg}"
+        ))
+    })
+}
+
+/// Runs a synchronous aerospike client call inside the Tokio runtime context with the
+/// process-wide panic boundary (see `catch_panic`). All `self.client.*` sync calls must
+/// go through this helper.
+fn rt_call<T>(f: impl FnOnce() -> T) -> PhpResult<T> {
+    let _guard = tokio_rt()?.enter();
+    catch_panic(f)
+}
+
+/// Drives a future to completion on the process-wide Tokio runtime with the panic
+/// boundary applied (see `catch_panic`). All `block_on` calls must go through this helper.
+fn rt_block_on<F: std::future::Future>(fut: F) -> PhpResult<F::Output> {
+    let rt = tokio_rt()?;
+    catch_panic(move || rt.block_on(fut))
+}
+
+/// Implements `FromZval` for a `#[php_class]` wrapper struct whose only field is `_as`:
+/// extracts the PHP object and copies the inner value (`$ty`) or clones it
+/// (`clone $ty`). Single source for a pattern otherwise hand-rolled per wrapper type.
+macro_rules! impl_from_zval_wrapper {
+    ($ty:ident) => {
+        impl FromZval<'_> for $ty {
+            const TYPE: DataType = DataType::Mixed;
+
+            fn from_zval(zval: &Zval) -> Option<Self> {
+                let f: &$ty = zval.extract()?;
+                Some($ty { _as: f._as })
+            }
+        }
+    };
+    (clone $ty:ident) => {
+        impl FromZval<'_> for $ty {
+            const TYPE: DataType = DataType::Mixed;
+
+            fn from_zval(zval: &Zval) -> Option<Self> {
+                let f: &$ty = zval.extract()?;
+                Some($ty {
+                    _as: f._as.clone(),
+                })
+            }
+        }
+    };
+}
+
 /// Parse a `readTouchTtlPercent` value: 0 = server default, -1 = don't reset,
 /// 1..=100 = percentage. Any other value throws an `AerospikeException` instead of
 /// silently falling back to the server default (which the getter reports as 0,
@@ -465,15 +541,7 @@ pub struct ExpType {
     _as: aero::expressions::ExpType,
 }
 
-impl FromZval<'_> for ExpType {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &ExpType = zval.extract()?;
-
-        Some(ExpType { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(ExpType);
 
 #[php_impl]
 impl ExpType {
@@ -569,15 +637,7 @@ pub struct Expression {
     _as: aero::expressions::Expression,
 }
 
-impl FromZval<'_> for Expression {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &Expression = zval.extract()?;
-
-        Some(Expression { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone Expression);
 
 /// Clone a `Vec<&Expression>` into an owned `Vec<aero::expressions::Expression>` for the
 /// variadic aero builders (`and`, `or`, `cond`, `num_add`, ...).
@@ -1196,15 +1256,7 @@ impl From<aero::ConsistencyLevel> for ReadModeAP {
     }
 }
 
-impl FromZval<'_> for ReadModeAP {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &ReadModeAP = zval.extract()?;
-
-        Some(ReadModeAP { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone ReadModeAP);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1289,15 +1341,7 @@ pub struct RecordExistsAction {
     _as: aero::RecordExistsAction,
 }
 
-impl FromZval<'_> for RecordExistsAction {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &RecordExistsAction = zval.extract()?;
-
-        Some(RecordExistsAction { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone RecordExistsAction);
 
 #[php_impl]
 impl RecordExistsAction {
@@ -1352,15 +1396,7 @@ pub struct QueryDuration {
     _as: aero::QueryDuration,
 }
 
-impl FromZval<'_> for QueryDuration {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &QueryDuration = zval.extract()?;
-
-        Some(QueryDuration { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone QueryDuration);
 
 #[php_impl]
 impl QueryDuration {
@@ -1405,15 +1441,7 @@ pub struct CommitLevel {
     _as: aero::CommitLevel,
 }
 
-impl FromZval<'_> for CommitLevel {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CommitLevel = zval.extract()?;
-
-        Some(CommitLevel { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CommitLevel);
 
 #[php_impl]
 impl CommitLevel {
@@ -1503,15 +1531,7 @@ pub struct GenerationPolicy {
     _as: aero::GenerationPolicy,
 }
 
-impl FromZval<'_> for GenerationPolicy {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &GenerationPolicy = zval.extract()?;
-
-        Some(GenerationPolicy { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone GenerationPolicy);
 
 #[php_impl]
 impl GenerationPolicy {
@@ -1553,15 +1573,7 @@ pub struct Expiration {
     _as: aero::Expiration,
 }
 
-impl FromZval<'_> for Expiration {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &Expiration = zval.extract()?;
-
-        Some(Expiration { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(Expiration);
 
 #[php_impl]
 impl Expiration {
@@ -1729,15 +1741,7 @@ pub struct ListOrderType {
     _as: aero::ListOrderType,
 }
 
-impl FromZval<'_> for ListOrderType {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &ListOrderType = zval.extract()?;
-
-        Some(ListOrderType { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(ListOrderType);
 
 #[php_impl]
 impl ListOrderType {
@@ -1779,15 +1783,7 @@ pub struct MapOrderType {
     _as: aero::operations::maps::MapOrder,
 }
 
-impl FromZval<'_> for MapOrderType {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &MapOrderType = zval.extract()?;
-
-        Some(MapOrderType { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(MapOrderType);
 
 #[php_impl]
 impl MapOrderType {
@@ -1966,40 +1962,78 @@ pub struct ReadPolicy {
     _as: aero::ReadPolicy,
 }
 
-#[php_impl]
-impl ReadPolicy {
+/// Generates the `#[php_impl]` block for a policy wrapper class: the passthrough methods
+/// given in braces, followed by the accessors every policy shares through its embedded
+/// `aero::policy::BasePolicy`. The shared accessors live here — and only here — because
+/// ext-php-rs allows a single `#[php_impl]` per class, so they cannot be provided by a
+/// second impl block. `filter_in` names the struct holding `filter_expression`, which
+/// `aero::BatchPolicy` keeps directly on itself rather than on the base policy.
+macro_rules! php_policy_impl {
+    ($ty:ident, filter_in: $($filter_holder:ident).+, { $($methods:tt)* }) => {
+        #[php_impl]
+        impl $ty {
+            $($methods)*
+
+            // ----- base policy attributes (shared across policy classes) -----
+
+            /// MaxRetries determines the maximum number of retries before aborting the current transaction.
+            pub fn get_max_retries(&self) -> u32 {
+                self._as.base_policy.max_retries as u32
+            }
+            pub fn set_max_retries(&mut self, max_retries: u32) {
+                self._as.base_policy.max_retries = max_retries as usize;
+            }
+
+            /// TotalTimeout specifies total transaction timeout in milliseconds.
+            pub fn get_total_timeout(&self) -> u64 {
+                u64::from(self._as.base_policy.total_timeout)
+            }
+            pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+                self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+                Ok(())
+            }
+
+            /// SocketTimeout determines network timeout for each attempt in milliseconds.
+            pub fn get_socket_timeout(&self) -> u64 {
+                u64::from(self._as.base_policy.socket_timeout)
+            }
+            pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
+                self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+                Ok(())
+            }
+
+            /// ReadModeAP indicates read policy for AP (availability) namespaces.
+            /// Maps to the underlying consistency_level (ConsistencyOne/ConsistencyAll).
+            pub fn get_read_mode_ap(&self) -> ReadModeAP {
+                ReadModeAP {
+                    _as: self._as.base_policy.consistency_level.clone(),
+                }
+            }
+            pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
+                self._as.base_policy.consistency_level = read_mode_ap._as;
+            }
+
+            /// FilterExpression is the optional Filter Expression. Supported on Server v5.2+
+            pub fn get_filter_expression(&self) -> Option<Expression> {
+                self.$($filter_holder).+
+                    .filter_expression
+                    .clone()
+                    .map(|fe| Expression { _as: fe })
+            }
+            pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+                self.$($filter_holder).+.filter_expression = filter_expression.map(|fe| fe._as);
+            }
+        }
+    };
+}
+
+php_policy_impl!(ReadPolicy, filter_in: _as.base_policy, {
     pub fn __construct() -> Self {
         let mut p = ReadPolicy::default();
         if let Some(v) = ini_long_positive(&INI_READ_TIMEOUT) {
             p._as.base_policy.total_timeout = v;
         }
         p
-    }
-
-    /// MaxRetries determines the maximum number of retries before aborting the current transaction.
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.base_policy.max_retries as u32
-    }
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as.base_policy.max_retries = max_retries as usize;
-    }
-
-    /// TotalTimeout specifies total transaction timeout in milliseconds.
-    pub fn get_total_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.total_timeout)
-    }
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-
-    /// SocketTimeout determines network timeout for each attempt in milliseconds.
-    pub fn get_socket_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.socket_timeout)
-    }
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
     }
 
     /// ReadTouchTTLPercent determines how record TTL is affected on reads.
@@ -2015,30 +2049,7 @@ impl ReadPolicy {
         self._as.base_policy.read_touch_ttl = read_touch_ttl_from_percent(percent)?;
         Ok(())
     }
-
-    /// ReadModeAP indicates read policy for AP (availability) namespaces.
-    /// Maps to the underlying consistency_level (ConsistencyOne/ConsistencyAll).
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: self._as.base_policy.consistency_level.clone(),
-        }
-    }
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.base_policy.consistency_level = read_mode_ap._as;
-    }
-
-    /// FilterExpression is the optional Filter Expression. Supported on Server v5.2+
-    pub fn get_filter_expression(&self) -> Option<Expression> {
-        self._as
-            .base_policy
-            .filter_expression
-            .clone()
-            .map(|fe| Expression { _as: fe })
-    }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
-    }
-}
+});
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -2127,8 +2138,7 @@ pub struct WritePolicy {
     _as: aero::WritePolicy,
 }
 
-#[php_impl]
-impl WritePolicy {
+php_policy_impl!(WritePolicy, filter_in: _as.base_policy, {
     pub fn __construct() -> Self {
         let mut p = WritePolicy::default();
         if let Some(v) = ini_long_positive(&INI_WRITE_TIMEOUT) {
@@ -2208,47 +2218,7 @@ impl WritePolicy {
     pub fn set_send_key(&mut self, send_key: bool) {
         self._as.send_key = send_key;
     }
-
-    // ----- base policy attributes -----
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.base_policy.max_retries as u32
-    }
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as.base_policy.max_retries = max_retries as usize;
-    }
-    pub fn get_total_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.total_timeout)
-    }
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_socket_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.socket_timeout)
-    }
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: self._as.base_policy.consistency_level.clone(),
-        }
-    }
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.base_policy.consistency_level = read_mode_ap._as;
-    }
-    pub fn get_filter_expression(&self) -> Option<Expression> {
-        self._as
-            .base_policy
-            .filter_expression
-            .clone()
-            .map(|fe| Expression { _as: fe })
-    }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
-    }
-}
+});
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -2267,8 +2237,7 @@ pub struct QueryPolicy {
     _as: aero::QueryPolicy,
 }
 
-#[php_impl]
-impl QueryPolicy {
+php_policy_impl!(QueryPolicy, filter_in: _as.base_policy, {
     pub fn __construct() -> Self {
         QueryPolicy::default()
     }
@@ -2298,47 +2267,7 @@ impl QueryPolicy {
     pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
         self._as.record_queue_size = record_queue_size as usize;
     }
-
-    // ----- base policy attributes -----
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.base_policy.max_retries as u32
-    }
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as.base_policy.max_retries = max_retries as usize;
-    }
-    pub fn get_total_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.total_timeout)
-    }
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_socket_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.socket_timeout)
-    }
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: self._as.base_policy.consistency_level.clone(),
-        }
-    }
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.base_policy.consistency_level = read_mode_ap._as;
-    }
-    pub fn get_filter_expression(&self) -> Option<Expression> {
-        self._as
-            .base_policy
-            .filter_expression
-            .clone()
-            .map(|fe| Expression { _as: fe })
-    }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
-    }
-}
+});
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -2358,8 +2287,7 @@ pub struct ScanPolicy {
     _as: aero::QueryPolicy,
 }
 
-#[php_impl]
-impl ScanPolicy {
+php_policy_impl!(ScanPolicy, filter_in: _as.base_policy, {
     pub fn __construct() -> Self {
         ScanPolicy::default()
     }
@@ -2387,47 +2315,7 @@ impl ScanPolicy {
     pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
         self._as.record_queue_size = record_queue_size as usize;
     }
-
-    // ----- base policy attributes -----
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.base_policy.max_retries as u32
-    }
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as.base_policy.max_retries = max_retries as usize;
-    }
-    pub fn get_total_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.total_timeout)
-    }
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_socket_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.socket_timeout)
-    }
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: self._as.base_policy.consistency_level.clone(),
-        }
-    }
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.base_policy.consistency_level = read_mode_ap._as;
-    }
-    pub fn get_filter_expression(&self) -> Option<Expression> {
-        self._as
-            .base_policy
-            .filter_expression
-            .clone()
-            .map(|fe| Expression { _as: fe })
-    }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        self._as.base_policy.filter_expression = filter_expression.map(|fe| fe._as);
-    }
-}
+});
 
 impl Default for ScanPolicy {
     fn default() -> Self {
@@ -2771,15 +2659,7 @@ impl Filter {
     }
 }
 
-impl FromZval<'_> for Filter {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &Filter = zval.extract()?;
-
-        Some(Filter { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone Filter);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -2814,11 +2694,8 @@ impl Statement {
         filter: Option<Filter>,
         bin_names: Option<Vec<String>>,
     ) -> Self {
-        let bins = match bin_names {
-            None => aero::Bins::All,
-            Some(names) if names.is_empty() => aero::Bins::None,
-            Some(names) => aero::Bins::Some(names),
-        };
+        // Documented v2 contract (see the class doc): None → all bins, [] → header only.
+        let bins = php_bins_to_aero_with(bin_names, aero::Bins::All, aero::Bins::None);
         let mut stmt = aero::query::Statement::new(namespace, set_name, bins);
         if let Some(f) = filter {
             stmt.add_filter(f._as);
@@ -2993,15 +2870,7 @@ impl PartitionFilter {
     }
 }
 
-impl FromZval<'_> for PartitionFilter {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &PartitionFilter = zval.extract()?;
-
-        Some(PartitionFilter { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone PartitionFilter);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -3078,11 +2947,10 @@ impl Recordset {
         let Some(rs) = self._as.clone() else {
             return Ok(None);
         };
-        let _guard = tokio_rt()?.enter();
         // `Iterator for &Recordset` requires a mutable reference to the `&Recordset` itself.
         let recordset: &aero::Recordset = &rs;
         let mut iter: &aero::Recordset = recordset;
-        match Iterator::next(&mut iter) {
+        match rt_call(|| Iterator::next(&mut iter))? {
             Some(Ok(r)) => Ok(Some(Record { _as: r })),
             Some(Err(e)) => throw_aero_error(&e, None),
             None => {
@@ -3109,10 +2977,9 @@ impl Recordset {
         };
         // A recordset exists only if a client was built in this process, so the runtime
         // is already cached and this cannot hit the fallible build path.
-        let Ok(rt) = tokio_rt() else { return };
-        // `aero::Recordset::partition_filter` is async; we're already inside the runtime
-        // context when called from `next()`, but `block_on` requires an explicit handle.
-        let updated = rt.block_on(rs.partition_filter());
+        let Ok(updated) = rt_block_on(rs.partition_filter()) else {
+            return;
+        };
         if let Some(new_pf) = updated {
             if let Ok(mut guard) = pf_arc.lock() {
                 *guard = new_pf;
@@ -3212,6 +3079,10 @@ impl Record {
                 }
                 None => zv.set_null(),
             },
+            "expiration" => {
+                let zo: ZBox<ZendObject> = self.get_expiration().into_zend_object()?;
+                zo.set_zval(&mut zv, false)?;
+            }
             _ => zv.set_null(),
         }
         Ok(zv)
@@ -3224,7 +3095,7 @@ impl Record {
 
     /// Bins is the map of requested name/value bins.
     pub fn get_bins(&self) -> Option<PHPValue> {
-        Some(self._as.bins.clone().into())
+        Some((&self._as.bins).into())
     }
 
     /// Generation shows record modification count.
@@ -3241,18 +3112,12 @@ impl Record {
         }
     }
 
-    /// Absolute Unix timestamp (in seconds since epoch) when this record will expire.
-    /// Returns `null` if the record never expires. v1-compatible.
-    ///
-    /// For the remaining TTL in seconds, use `getRemainingTtl()`.
+    /// Remaining time-to-live in seconds, or `null` if the record never expires.
+    /// v1-compatible: v1 `getTtl()` returned the remaining seconds, not an absolute
+    /// timestamp. Equivalent to `getRemainingTtl()`; for the expiration wrapper object
+    /// use `getExpiration()`.
     pub fn get_ttl(&self) -> Option<u32> {
-        self._as.time_to_live().map(|d| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|n| n.as_secs() as u32)
-                .unwrap_or(0);
-            now.saturating_add(d.as_secs() as u32)
-        })
+        self.get_remaining_ttl()
     }
 
     /// Remaining TTL in seconds (positive integer), or `null` if the record never expires.
@@ -3268,15 +3133,7 @@ impl Record {
     }
 }
 
-impl FromZval<'_> for Record {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &Record = zval.extract()?;
-
-        Some(Record { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone Record);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -3297,8 +3154,7 @@ pub struct BatchPolicy {
     _as: aero::BatchPolicy,
 }
 
-#[php_impl]
-impl BatchPolicy {
+php_policy_impl!(BatchPolicy, filter_in: _as, {
     pub fn __construct() -> Self {
         BatchPolicy::default()
     }
@@ -3360,46 +3216,7 @@ impl BatchPolicy {
             aero::Concurrency::Parallel => Concurrency::Parallel(),
         }
     }
-
-    // ----- base policy attributes -----
-    pub fn get_max_retries(&self) -> u32 {
-        self._as.base_policy.max_retries as u32
-    }
-    pub fn set_max_retries(&mut self, max_retries: u32) {
-        self._as.base_policy.max_retries = max_retries as usize;
-    }
-    pub fn get_total_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.total_timeout)
-    }
-    pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_socket_timeout(&self) -> u64 {
-        u64::from(self._as.base_policy.socket_timeout)
-    }
-    pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-        self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
-        Ok(())
-    }
-    pub fn get_read_mode_ap(&self) -> ReadModeAP {
-        ReadModeAP {
-            _as: self._as.base_policy.consistency_level.clone(),
-        }
-    }
-    pub fn set_read_mode_ap(&mut self, read_mode_ap: ReadModeAP) {
-        self._as.base_policy.consistency_level = read_mode_ap._as;
-    }
-    pub fn get_filter_expression(&self) -> Option<Expression> {
-        self._as
-            .filter_expression
-            .clone()
-            .map(|fe| Expression { _as: fe })
-    }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
-        self._as.filter_expression = filter_expression.map(|fe| fe._as);
-    }
-}
+});
 
 impl Default for BatchPolicy {
     fn default() -> Self {
@@ -3796,11 +3613,8 @@ pub struct BatchRead {
 #[php_impl]
 impl BatchRead {
     pub fn __construct(policy: &BatchReadPolicy, key: &Key, bins: Option<Vec<String>>) -> Self {
-        let bins = match bins {
-            None => aero::Bins::None,
-            Some(names) if names.is_empty() => aero::Bins::All,
-            Some(names) => aero::Bins::Some(names),
-        };
+        // v1-compatible contract (see the class doc): None → header only, [] → all bins.
+        let bins = php_bins_to_aero_with(bins, aero::Bins::None, aero::Bins::All);
         BatchRead {
             _as: aero::BatchOperation::read(&policy._as, key._as.clone(), bins),
         }
@@ -4383,15 +4197,7 @@ impl CdtListReturnType {
     }
 }
 
-impl FromZval<'_> for CdtListReturnType {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtListReturnType = zval.extract()?;
-
-        Some(CdtListReturnType { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtListReturnType);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -4447,15 +4253,7 @@ impl CdtListWriteFlags {
     }
 }
 
-impl FromZval<'_> for CdtListWriteFlags {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtListWriteFlags = zval.extract()?;
-
-        Some(CdtListWriteFlags { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtListWriteFlags);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -4495,15 +4293,7 @@ impl CdtListSortFlags {
     }
 }
 
-impl FromZval<'_> for CdtListSortFlags {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtListSortFlags = zval.extract()?;
-
-        Some(CdtListSortFlags { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtListSortFlags);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -4538,15 +4328,7 @@ impl CdtListPolicy {
     }
 }
 
-impl FromZval<'_> for CdtListPolicy {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtListPolicy = zval.extract()?;
-
-        Some(CdtListPolicy { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtListPolicy);
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -4613,15 +4395,7 @@ pub struct CdtListOperation {
     _as: aero::operations::Operation,
 }
 
-impl FromZval<'_> for CdtListOperation {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtListOperation = zval.extract()?;
-
-        Some(CdtListOperation { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtListOperation);
 
 #[php_impl]
 impl CdtListOperation {
@@ -5435,15 +5209,7 @@ impl CdtMapReturnType {
     }
 }
 
-impl FromZval<'_> for CdtMapReturnType {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtMapReturnType = zval.extract()?;
-
-        Some(CdtMapReturnType { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtMapReturnType);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -5487,15 +5253,7 @@ impl CdtMapWriteMode {
     }
 }
 
-impl FromZval<'_> for CdtMapWriteMode {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtMapWriteMode = zval.extract()?;
-
-        Some(CdtMapWriteMode { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtMapWriteMode);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -5556,15 +5314,7 @@ impl CdtMapWriteFlags {
     }
 }
 
-impl FromZval<'_> for CdtMapWriteFlags {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtMapWriteFlags = zval.extract()?;
-
-        Some(CdtMapWriteFlags { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtMapWriteFlags);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -5605,15 +5355,7 @@ impl CdtMapPolicy {
     }
 }
 
-impl FromZval<'_> for CdtMapPolicy {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtMapPolicy = zval.extract()?;
-
-        Some(CdtMapPolicy { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtMapPolicy);
 
 impl Default for CdtMapPolicy {
     fn default() -> Self {
@@ -5679,15 +5421,7 @@ pub struct CdtMapOperation {
     _as: aero::operations::Operation,
 }
 
-impl FromZval<'_> for CdtMapOperation {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtMapOperation = zval.extract()?;
-
-        Some(CdtMapOperation { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtMapOperation);
 
 /// Default map return type used when the PHP caller passes `null`.
 /// Local newtype wrapping a raw `i64` return-type bitmask so it can be passed to
@@ -6459,15 +6193,7 @@ impl CdtHllWriteFlags {
     }
 }
 
-impl FromZval<'_> for CdtHllWriteFlags {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtHllWriteFlags = zval.extract()?;
-
-        Some(CdtHllWriteFlags { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtHllWriteFlags);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -6498,15 +6224,7 @@ impl CdtHllPolicy {
     }
 }
 
-impl FromZval<'_> for CdtHllPolicy {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtHllPolicy = zval.extract()?;
-
-        Some(CdtHllPolicy { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtHllPolicy);
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -6526,15 +6244,7 @@ pub struct CdtHllOperation {
     _as: aero::operations::Operation,
 }
 
-impl FromZval<'_> for CdtHllOperation {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtHllOperation = zval.extract()?;
-
-        Some(CdtHllOperation { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtHllOperation);
 
 #[php_impl]
 impl CdtHllOperation {
@@ -6586,87 +6296,88 @@ impl CdtHllOperation {
 
     /// HLLSetUnionOp creates HLL set union operation.
     /// Server sets union of specified HLL objects with HLL bin.
-    /// Returns `None` if any element of `list` is not an HLL value.
+    /// Throws an AerospikeException if any element of `list` is not an HLL value.
     pub fn set_union(
         policy: &CdtHllPolicy,
         bin_name: String,
         list: Vec<PHPValue>,
-    ) -> Option<Operation> {
-        if !assert_hll_list(&list) {
-            return None;
+    ) -> PhpResult<Operation> {
+        if !hll_list_valid(&list) {
+            return throw_msg(HLL_LIST_CONTRACT, Operation::get(None));
         }
-        Some(Operation {
+        Ok(Operation {
             _as: aero::operations::hll::set_union(&policy._as, &bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLRefreshCountOp creates HLL refresh operation.
     /// Server updates the cached count (if stale) and returns the count.
-    pub fn refresh_count(bin_name: String) -> Option<Operation> {
-        Some(Operation {
+    pub fn refresh_count(bin_name: String) -> Operation {
+        Operation {
             _as: aero::operations::hll::refresh_count(&bin_name),
-        })
+        }
     }
 
     /// HLLFoldOp creates HLL fold operation. Server folds indexBitCount to the specified value.
     /// This can only be applied when minHashBitCount on the HLL bin is 0.
-    pub fn fold(bin_name: String, index_bit_count: i64) -> Option<Operation> {
-        Some(Operation {
+    pub fn fold(bin_name: String, index_bit_count: i64) -> Operation {
+        Operation {
             _as: aero::operations::hll::fold(&bin_name, index_bit_count),
-        })
+        }
     }
 
     /// HLLGetCountOp creates HLL getCount operation.
     /// Server returns estimated number of elements in the HLL bin.
-    pub fn get_count(bin_name: String) -> Option<Operation> {
-        Some(Operation {
+    pub fn get_count(bin_name: String) -> Operation {
+        Operation {
             _as: aero::operations::hll::get_count(&bin_name),
-        })
+        }
     }
 
     /// HLLGetUnionOp creates HLL getUnion operation.
     /// Server returns an HLL object that is the union of all specified HLL objects in the list
-    /// with the HLL bin. Returns `None` if any element of `list` is not an HLL value.
-    pub fn get_union(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
-        if !assert_hll_list(&list) {
-            return None;
+    /// with the HLL bin. Throws an AerospikeException if any element of `list` is not an HLL value.
+    pub fn get_union(bin_name: String, list: Vec<PHPValue>) -> PhpResult<Operation> {
+        if !hll_list_valid(&list) {
+            return throw_msg(HLL_LIST_CONTRACT, Operation::get(None));
         }
-        Some(Operation {
+        Ok(Operation {
             _as: aero::operations::hll::get_union(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLGetUnionCountOp creates HLL getUnionCount operation.
     /// Server returns estimated number of elements that would be contained by the union of these
-    /// HLL objects.
-    pub fn get_union_count(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
-        if !assert_hll_list(&list) {
-            return None;
+    /// HLL objects. Throws an AerospikeException if any element of `list` is not an HLL value.
+    pub fn get_union_count(bin_name: String, list: Vec<PHPValue>) -> PhpResult<Operation> {
+        if !hll_list_valid(&list) {
+            return throw_msg(HLL_LIST_CONTRACT, Operation::get(None));
         }
-        Some(Operation {
+        Ok(Operation {
             _as: aero::operations::hll::get_union_count(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLGetIntersectCountOp creates HLL getIntersectCount operation.
     /// Server returns estimated number of elements that would be contained by the intersection of
-    /// these HLL objects.
-    pub fn get_intersect_count(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
-        if !assert_hll_list(&list) {
-            return None;
+    /// these HLL objects. Throws an AerospikeException if any element of `list` is not an HLL value.
+    pub fn get_intersect_count(bin_name: String, list: Vec<PHPValue>) -> PhpResult<Operation> {
+        if !hll_list_valid(&list) {
+            return throw_msg(HLL_LIST_CONTRACT, Operation::get(None));
         }
-        Some(Operation {
+        Ok(Operation {
             _as: aero::operations::hll::get_intersect_count(&bin_name, php_values_to_aero(list)),
         })
     }
 
     /// HLLGetSimilarityOp creates HLL getSimilarity operation.
     /// Server returns estimated similarity of these HLL objects. Return type is a double.
-    pub fn get_similarity(bin_name: String, list: Vec<PHPValue>) -> Option<Operation> {
-        if !assert_hll_list(&list) {
-            return None;
+    /// Throws an AerospikeException if any element of `list` is not an HLL value.
+    pub fn get_similarity(bin_name: String, list: Vec<PHPValue>) -> PhpResult<Operation> {
+        if !hll_list_valid(&list) {
+            return throw_msg(HLL_LIST_CONTRACT, Operation::get(None));
         }
-        Some(Operation {
+        Ok(Operation {
             _as: aero::operations::hll::get_similarity(&bin_name, php_values_to_aero(list)),
         })
     }
@@ -6738,15 +6449,7 @@ impl CdtBitwiseWriteFlags {
     }
 }
 
-impl FromZval<'_> for CdtBitwiseWriteFlags {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtBitwiseWriteFlags = zval.extract()?;
-
-        Some(CdtBitwiseWriteFlags { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtBitwiseWriteFlags);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -6793,15 +6496,7 @@ impl CdtBitwiseResizeFlags {
     }
 }
 
-impl FromZval<'_> for CdtBitwiseResizeFlags {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtBitwiseResizeFlags = zval.extract()?;
-
-        Some(CdtBitwiseResizeFlags { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtBitwiseResizeFlags);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -6844,15 +6539,7 @@ impl CdtBitwiseOverflowAction {
     }
 }
 
-impl FromZval<'_> for CdtBitwiseOverflowAction {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtBitwiseOverflowAction = zval.extract()?;
-
-        Some(CdtBitwiseOverflowAction { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtBitwiseOverflowAction);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -6883,15 +6570,7 @@ impl CdtBitwisePolicy {
     }
 }
 
-impl FromZval<'_> for CdtBitwisePolicy {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtBitwisePolicy = zval.extract()?;
-
-        Some(CdtBitwisePolicy { _as: f._as })
-    }
-}
+impl_from_zval_wrapper!(CdtBitwisePolicy);
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -6916,15 +6595,7 @@ pub struct CdtBitwiseOperation {
     _as: aero::operations::Operation,
 }
 
-impl FromZval<'_> for CdtBitwiseOperation {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &CdtBitwiseOperation = zval.extract()?;
-
-        Some(CdtBitwiseOperation { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone CdtBitwiseOperation);
 
 #[php_impl]
 impl CdtBitwiseOperation {
@@ -7735,14 +7406,28 @@ fn admin_policy_with_timeout(timeout_ms: u32) -> aero::AdminPolicy {
     ap
 }
 
-/// Helper: convert PHP bin-name list to aero::Bins selector.
-/// `None` or empty list → `Bins::All` (all bins), non-empty list → `Bins::Some(names)`.
-fn php_bins_to_aero(bins: Option<Vec<String>>) -> aero::Bins {
+/// Single conversion point from a PHP bin-name list to an `aero::Bins` selector.
+/// A non-empty list always maps to `Bins::Some(names)`; `on_none` / `on_empty` make each
+/// call site's documented default explicit — they intentionally differ (`Client::get`
+/// treats a missing list as "all bins", `BatchRead` preserves the v1 header-only default,
+/// `Statement` maps an empty list to header-only). Every PHP-facing bin-list parameter
+/// must go through this helper so the conversion logic cannot drift between call sites.
+fn php_bins_to_aero_with(
+    bins: Option<Vec<String>>,
+    on_none: aero::Bins,
+    on_empty: aero::Bins,
+) -> aero::Bins {
     match bins {
-        None => aero::Bins::All,
-        Some(ref v) if v.is_empty() => aero::Bins::All,
+        None => on_none,
+        Some(names) if names.is_empty() => on_empty,
         Some(names) => aero::Bins::Some(names),
     }
+}
+
+/// Convert a PHP bin-name list to `aero::Bins` with the `Client::get`/`scan`/UDF default:
+/// `None` or empty list → `Bins::All` (all bins).
+fn php_bins_to_aero(bins: Option<Vec<String>>) -> aero::Bins {
+    php_bins_to_aero_with(bins, aero::Bins::All, aero::Bins::All)
 }
 
 #[php_class]
@@ -7876,8 +7561,7 @@ impl Client {
                 }
             }
         }
-        let _guard = tokio_rt()?.enter();
-        if let Err(e) = self.client.close() {
+        if let Err(e) = rt_call(|| self.client.close())? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7902,9 +7586,12 @@ impl Client {
     /// Write record bin(s). The policy specifies the transaction timeout, record expiration and
     /// how the transaction is handled when the record already exists.
     pub fn put(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
+        // Per-bin deep clone forced by the aerospike crate API: `put` (and add/append/
+        // prepend) take `&[aero::Bin]`, so the borrowed PHP wrappers must be collected
+        // into an owned Vec. Removing the copy requires a by-reference signature in the
+        // upstream crate.
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt()?.enter();
-        match self.client.put(&policy._as, &key._as, &aero_bins) {
+        match rt_call(|| self.client.put(&policy._as, &key._as, &aero_bins))? {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
         }
@@ -7919,8 +7606,7 @@ impl Client {
         bins: Option<Vec<String>>,
     ) -> PhpResult<Option<Record>> {
         let aero_bins = php_bins_to_aero(bins);
-        let _guard = tokio_rt()?.enter();
-        match self.client.get(&policy._as, &key._as, aero_bins) {
+        match rt_call(|| self.client.get(&policy._as, &key._as, aero_bins))? {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
             Err(e) => throw_aero_error(&e, None),
@@ -7929,8 +7615,7 @@ impl Client {
 
     /// Read record header (generation, expiration) only. No bins are returned.
     pub fn get_header(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<Option<Record>> {
-        let _guard = tokio_rt()?.enter();
-        match self.client.get(&policy._as, &key._as, aero::Bins::None) {
+        match rt_call(|| self.client.get(&policy._as, &key._as, aero::Bins::None))? {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
             Err(e) => throw_aero_error(&e, None),
@@ -7940,8 +7625,7 @@ impl Client {
     /// Add integer bin values to existing record bin values.
     pub fn add(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt()?.enter();
-        match self.client.add(&policy._as, &key._as, &aero_bins) {
+        match rt_call(|| self.client.add(&policy._as, &key._as, &aero_bins))? {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
         }
@@ -7950,8 +7634,7 @@ impl Client {
     /// Append bin string values to existing record bin values.
     pub fn append(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt()?.enter();
-        match self.client.append(&policy._as, &key._as, &aero_bins) {
+        match rt_call(|| self.client.append(&policy._as, &key._as, &aero_bins))? {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
         }
@@ -7960,8 +7643,7 @@ impl Client {
     /// Prepend bin string values to existing record bin values.
     pub fn prepend(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt()?.enter();
-        match self.client.prepend(&policy._as, &key._as, &aero_bins) {
+        match rt_call(|| self.client.prepend(&policy._as, &key._as, &aero_bins))? {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
         }
@@ -7969,8 +7651,7 @@ impl Client {
 
     /// Delete record for specified key. Returns `true` if the record existed before deletion.
     pub fn delete(&self, policy: &WritePolicy, key: &Key) -> PhpResult<bool> {
-        let _guard = tokio_rt()?.enter();
-        match self.client.delete(&policy._as, &key._as) {
+        match rt_call(|| self.client.delete(&policy._as, &key._as))? {
             Ok(existed) => Ok(existed),
             Err(e) => throw_aero_error(&e, false),
         }
@@ -7978,8 +7659,7 @@ impl Client {
 
     /// Reset record's time to expiration using the policy's expiration.
     pub fn touch(&self, policy: &WritePolicy, key: &Key) -> PhpResult<()> {
-        let _guard = tokio_rt()?.enter();
-        match self.client.touch(&policy._as, &key._as) {
+        match rt_call(|| self.client.touch(&policy._as, &key._as))? {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
         }
@@ -7987,8 +7667,7 @@ impl Client {
 
     /// Determine if a record key exists.
     pub fn exists(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<bool> {
-        let _guard = tokio_rt()?.enter();
-        match self.client.exists(&policy._as, &key._as) {
+        match rt_call(|| self.client.exists(&policy._as, &key._as))? {
             Ok(exists) => Ok(exists),
             Err(e) => throw_aero_error(&e, false),
         }
@@ -8008,10 +7687,12 @@ impl Client {
         key: &Key,
         ops: Vec<&Operation>,
     ) -> PhpResult<Option<Record>> {
+        // Per-operation deep clone forced by the aerospike crate API: `operate` takes
+        // `&[aero::operations::Operation]`, so the borrowed PHP wrappers must be
+        // collected into an owned Vec (see the same constraint on `put`).
         let aero_ops: Vec<aero::operations::Operation> =
             ops.iter().map(|o| o._as.clone()).collect();
-        let _guard = tokio_rt()?.enter();
-        match self.client.operate(&policy._as, &key._as, &aero_ops) {
+        match rt_call(|| self.client.operate(&policy._as, &key._as, &aero_ops))? {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
             Err(e) => throw_aero_error(&e, None),
@@ -8036,8 +7717,7 @@ impl Client {
                 return throw_msg("Invalid Batch command", vec![]);
             }
         }
-        let _guard = tokio_rt()?.enter();
-        match self.client.batch(&policy._as, &batch_ops) {
+        match rt_call(|| self.client.batch(&policy._as, &batch_ops))? {
             Ok(results) => Ok(results
                 .into_iter()
                 .map(|br| BatchRecord { _as: br })
@@ -8055,11 +7735,10 @@ impl Client {
         before_nanos: Option<i64>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy.timeout);
-        let _guard = tokio_rt()?.enter();
-        match self
-            .client
-            .truncate(&admin, namespace, set_name, before_nanos.unwrap_or(0))
-        {
+        match rt_call(|| {
+            self.client
+                .truncate(&admin, namespace, set_name, before_nanos.unwrap_or(0))
+        })? {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
         }
@@ -8087,8 +7766,7 @@ impl Client {
             .lock()
             .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
             .clone();
-        let _guard = tokio_rt()?.enter();
-        match self.client.query(&policy._as, pf, stmt) {
+        match rt_call(|| self.client.query(&policy._as, pf, stmt))? {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
                 partition_filter: Some(pf_arc),
@@ -8112,8 +7790,7 @@ impl Client {
             .lock()
             .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
             .clone();
-        let _guard = tokio_rt()?.enter();
-        match self.client.query(&policy._as, pf, stmt) {
+        match rt_call(|| self.client.query(&policy._as, pf, stmt))? {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
                 partition_filter: Some(pf_arc),
@@ -8142,7 +7819,7 @@ impl Client {
         let cit_val = cit
             .map(|c| c._as.clone())
             .unwrap_or(aero::CollectionIndexType::Default);
-        let task = match tokio_rt()?.block_on(self.client.create_index_on_bin(
+        let task = match rt_block_on(self.client.create_index_on_bin(
             &admin,
             namespace,
             set_name,
@@ -8151,11 +7828,11 @@ impl Client {
             index_type._as.clone(),
             cit_val,
             None,
-        )) {
+        ))? {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8170,17 +7847,14 @@ impl Client {
         index_name: &str,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
-        let task = {
-            let _guard = tokio_rt()?.enter();
-            match self
-                .client
+        let task = match rt_call(|| {
+            self.client
                 .drop_index(&admin, namespace, set_name, index_name)
-            {
-                Ok(t) => t,
-                Err(e) => return throw_aero_error(&e, ()),
-            }
+        })? {
+            Ok(t) => t,
+            Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8196,17 +7870,14 @@ impl Client {
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let lang = language.map(|l| l._as).unwrap_or(aero::UDFLang::Lua);
-        let task = {
-            let _guard = tokio_rt()?.enter();
-            match self
-                .client
+        let task = match rt_call(|| {
+            self.client
                 .register_udf(&admin, udf_body.as_bytes(), package_name, lang)
-            {
-                Ok(t) => t,
-                Err(e) => return throw_aero_error(&e, ()),
-            }
+        })? {
+            Ok(t) => t,
+            Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8214,14 +7885,11 @@ impl Client {
 
     pub fn drop_udf(&self, policy: &WritePolicy, package_name: &str) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
-        let task = {
-            let _guard = tokio_rt()?.enter();
-            match self.client.remove_udf(&admin, package_name) {
-                Ok(t) => t,
-                Err(e) => return throw_aero_error(&e, ()),
-            }
+        let task = match rt_call(|| self.client.remove_udf(&admin, package_name))? {
+            Ok(t) => t,
+            Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8241,7 +7909,7 @@ impl Client {
                 )
             }
         };
-        let result = match tokio_rt()?.block_on(node.info(&admin, &["udf-list"])) {
+        let result = match rt_block_on(node.info(&admin, &["udf-list"]))? {
             Ok(r) => r,
             Err(e) => return throw_aero_error(&e, vec![]),
         };
@@ -8286,7 +7954,7 @@ impl Client {
         let nodes = self.client.nodes();
         let mut versions = std::collections::HashMap::new();
         for node in &nodes {
-            match tokio_rt()?.block_on(node.info(&aero::AdminPolicy::default(), &["build"])) {
+            match rt_block_on(node.info(&aero::AdminPolicy::default(), &["build"]))? {
                 Ok(result) => {
                     let ver = result.get("build").cloned().unwrap_or_default();
                     versions.insert(node.name().to_string(), ver);
@@ -8313,14 +7981,15 @@ impl Client {
         } else {
             Some(&aero_args)
         };
-        let _guard = tokio_rt()?.enter();
-        match self.client.execute_udf(
-            &policy._as,
-            &key._as,
-            &package_name,
-            &function_name,
-            args_ref,
-        ) {
+        match rt_call(|| {
+            self.client.execute_udf(
+                &policy._as,
+                &key._as,
+                &package_name,
+                &function_name,
+                args_ref,
+            )
+        })? {
             Ok(Some(v)) => Ok(PHPValue::from(v)),
             Ok(None) => Ok(PHPValue::Nil),
             Err(e) => throw_aero_error(&e, PHPValue::Nil),
@@ -8339,19 +8008,17 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) =
-            tokio_rt()?.block_on(
-                self.client
-                    .create_user(&policy._as, &user, &password, &roles_ref),
-            )
-        {
+        if let Err(e) = rt_block_on(
+            self.client
+                .create_user(&policy._as, &user, &password, &roles_ref),
+        )? {
             return throw_aero_error(&e, ());
         }
         Ok(())
     }
 
     pub fn drop_user(&self, policy: &AdminPolicy, user: String) -> PhpResult<()> {
-        if let Err(e) = tokio_rt()?.block_on(self.client.drop_user(&policy._as, &user)) {
+        if let Err(e) = rt_block_on(self.client.drop_user(&policy._as, &user))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8364,7 +8031,7 @@ impl Client {
         password: String,
     ) -> PhpResult<()> {
         if let Err(e) =
-            tokio_rt()?.block_on(self.client.change_password(&policy._as, &user, &password))
+            rt_block_on(self.client.change_password(&policy._as, &user, &password))?
         {
             return throw_aero_error(&e, ());
         }
@@ -8378,7 +8045,7 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt()?.block_on(self.client.grant_roles(&policy._as, &user, &roles_ref)) {
+        if let Err(e) = rt_block_on(self.client.grant_roles(&policy._as, &user, &roles_ref))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8391,8 +8058,7 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt()?.block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))
-        {
+        if let Err(e) = rt_block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8403,7 +8069,7 @@ impl Client {
         policy: &AdminPolicy,
         user: Option<String>,
     ) -> PhpResult<Vec<UserRole>> {
-        match tokio_rt()?.block_on(self.client.query_users(&policy._as, user.as_deref())) {
+        match rt_block_on(self.client.query_users(&policy._as, user.as_deref()))? {
             Ok(users) => Ok(users.into_iter().map(UserRole::from).collect()),
             Err(e) => throw_aero_error(&e, vec![]),
         }
@@ -8414,7 +8080,7 @@ impl Client {
         policy: &AdminPolicy,
         role_name: Option<String>,
     ) -> PhpResult<Vec<Role>> {
-        match tokio_rt()?.block_on(self.client.query_roles(&policy._as, role_name.as_deref())) {
+        match rt_block_on(self.client.query_roles(&policy._as, role_name.as_deref()))? {
             Ok(roles) => Ok(roles.into_iter().map(Role::from).collect()),
             Err(e) => throw_aero_error(&e, vec![]),
         }
@@ -8431,21 +8097,21 @@ impl Client {
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
         let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt()?.block_on(self.client.create_role(
+        if let Err(e) = rt_block_on(self.client.create_role(
             &policy._as,
             &role_name,
             &privs,
             &allowlist_ref,
             read_quota,
             write_quota,
-        )) {
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
     }
 
     pub fn drop_role(&self, policy: &AdminPolicy, role_name: String) -> PhpResult<()> {
-        if let Err(e) = tokio_rt()?.block_on(self.client.drop_role(&policy._as, &role_name)) {
+        if let Err(e) = rt_block_on(self.client.drop_role(&policy._as, &role_name))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8458,11 +8124,11 @@ impl Client {
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
-        if let Err(e) = tokio_rt()?.block_on(self.client.grant_privileges(
+        if let Err(e) = rt_block_on(self.client.grant_privileges(
             &policy._as,
             &role_name,
             &privs,
-        )) {
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8475,11 +8141,11 @@ impl Client {
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
-        if let Err(e) = tokio_rt()?.block_on(self.client.revoke_privileges(
+        if let Err(e) = rt_block_on(self.client.revoke_privileges(
             &policy._as,
             &role_name,
             &privs,
-        )) {
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8492,11 +8158,11 @@ impl Client {
         allowlist: Vec<String>,
     ) -> PhpResult<()> {
         let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt()?.block_on(self.client.set_allowlist(
+        if let Err(e) = rt_block_on(self.client.set_allowlist(
             &policy._as,
             &role_name,
             &allowlist_ref,
-        )) {
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8509,12 +8175,12 @@ impl Client {
         read_quota: u32,
         write_quota: u32,
     ) -> PhpResult<()> {
-        if let Err(e) = tokio_rt()?.block_on(self.client.set_quotas(
+        if let Err(e) = rt_block_on(self.client.set_quotas(
             &policy._as,
             &role_name,
             read_quota,
             write_quota,
-        )) {
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8742,15 +8408,7 @@ impl Key {
     }
 }
 
-impl FromZval<'_> for Key {
-    const TYPE: DataType = DataType::Mixed;
-
-    fn from_zval(zval: &Zval) -> Option<Self> {
-        let f: &Key = zval.extract()?;
-
-        Some(Key { _as: f._as.clone() })
-    }
-}
+impl_from_zval_wrapper!(clone Key);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -9018,8 +8676,11 @@ pub enum PHPValue {
     /// Map data type is a collection of key-value pairs. Each key can only appear once in a
     /// collection and is associated with a value. Map keys and values can be any supported data
     /// type.
-    /// TODO: Implement the ordered map and remove hashmap completely
     HashMap(HashMap<PHPValue, PHPValue>),
+    /// Ordered map result (K-ordered maps, CDT operations with `keyValue`/rank-ordered
+    /// return types). Entries preserve the order produced by the server; conversion to a
+    /// PHP array keeps that order because PHP arrays are insertion-ordered.
+    OrderedMap(Vec<(PHPValue, PHPValue)>),
     /// Map data type is a collection of key-value pairs. Each key can only appear once in a
     /// collection and is associated with a value. Map keys and values can be any supported data
     /// type.
@@ -9076,6 +8737,8 @@ impl Hash for PHPValue {
                 }
                 acc.hash(state);
             }
+            // Entry order is part of an ordered map's identity, so hash pairs in order.
+            PHPValue::OrderedMap(pairs) => pairs.hash(state),
             PHPValue::Infinity | PHPValue::Wildcard => {
                 // Discriminant already mixed in above; sentinel variants carry no extra state.
             }
@@ -9098,10 +8761,10 @@ impl PHPValue {
             PHPValue::HLL(ref val) => format!("HLL('{val:?}')"),
             PHPValue::List(ref val) => format!("{val:?}"),
             PHPValue::HashMap(ref val) => format!("{val:?}"),
+            PHPValue::OrderedMap(ref val) => format!("{val:?}"),
             PHPValue::Json(ref val) => format!("{val:?}"),
             PHPValue::Infinity => "<infinity>".to_string(),
             PHPValue::Wildcard => "<wildcard>".to_string(),
-            // PHPValue::OrderedMap(ref val) => format!("{:?}", val),
         }
     }
 }
@@ -9109,6 +8772,24 @@ impl PHPValue {
 impl fmt::Display for PHPValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::result::Result<(), fmt::Error> {
         write!(f, "{}", self.as_string())
+    }
+}
+
+/// Insert a map entry into a PHP array under a properly typed key: integer keys stay
+/// integer keys, string keys stay string keys. Key types PHP arrays cannot represent
+/// (blob, list, map, ...) fall back to their string form.
+///
+/// PHP-level limitation: Zend normalizes numeric-string keys ("1") to integer keys, so an
+/// Aerospike map holding both `1` and `"1"` still collapses to a single PHP entry.
+fn insert_map_entry(arr: &mut ZendHashTable, key: &PHPValue, val: PHPValue) -> Result<()> {
+    match key {
+        PHPValue::Int(i) => arr.insert_at_index(*i, val),
+        PHPValue::UInt(ui) => match i64::try_from(*ui) {
+            Ok(i) => arr.insert_at_index(i, val),
+            Err(_) => Err(Error::IntegerOverflow),
+        },
+        PHPValue::String(s) => arr.insert(s.as_str(), val),
+        other => arr.insert(other.as_string().as_str(), val),
     }
 }
 
@@ -9121,23 +8802,34 @@ impl IntoZval for PHPValue {
             PHPValue::Nil => zv.set_null(),
             PHPValue::Bool(b) => zv.set_bool(b),
             PHPValue::Int(i) => zv.set_long(i),
-            PHPValue::UInt(ui) => zv.set_long(ui as i64),
+            // The write path (`From<PHPValue> for aero::Value`) rejects values above
+            // i64::MAX; mirror that here instead of silently wrapping to a negative int.
+            PHPValue::UInt(ui) => zv.set_long(i64::try_from(ui).map_err(|_| Error::IntegerOverflow)?),
             PHPValue::Float(f) => zv.set_double(f),
             PHPValue::String(s) => zv.set_string(&s, persistent)?,
-            // PHPValue::Blob(b) => zv.set_binary(b),
             PHPValue::List(l) => zv.set_array(l)?,
             PHPValue::Json(h) => {
                 let mut arr = ZendHashTable::with_capacity(h.len() as u32);
-                for (k, v) in h.iter() {
-                    arr.insert(k.to_string(), v.clone())?;
+                for (k, v) in h {
+                    arr.insert(k.as_str(), v)?;
                 }
 
                 zv.set_hashtable(arr)
             }
             PHPValue::HashMap(h) => {
                 let mut arr = ZendHashTable::with_capacity(h.len() as u32);
-                for (k, v) in h.iter() {
-                    arr.insert(k.to_string(), v.clone())?;
+                for (k, v) in h {
+                    insert_map_entry(&mut arr, &k, v)?;
+                }
+
+                zv.set_hashtable(arr)
+            }
+            PHPValue::OrderedMap(pairs) => {
+                // PHP arrays are insertion-ordered; inserting in pair order preserves the
+                // server-produced key/rank order.
+                let mut arr = ZendHashTable::with_capacity(pairs.len() as u32);
+                for (k, v) in pairs {
+                    insert_map_entry(&mut arr, &k, v)?;
                 }
 
                 zv.set_hashtable(arr)
@@ -9251,12 +8943,15 @@ impl FromZval<'_> for PHPValue {
     }
 }
 
-impl From<HashMap<String, aero::Value>> for PHPValue {
-    fn from(h: HashMap<String, aero::Value>) -> Self {
-        let mut hash = HashMap::<PHPValue, PHPValue>::with_capacity(h.len());
-        h.iter().for_each(|(k, v)| {
-            hash.insert(PHPValue::String(k.into()), (*v).clone().into());
-        });
+/// By-reference conversion for record bins: keys and values are cloned exactly once into
+/// the resulting map (an owned `From` would clone the whole `HashMap` first and again
+/// during conversion).
+impl From<&HashMap<String, aero::Value>> for PHPValue {
+    fn from(h: &HashMap<String, aero::Value>) -> Self {
+        let hash = h
+            .iter()
+            .map(|(k, v)| (PHPValue::String(k.clone()), v.clone().into()))
+            .collect();
         PHPValue::HashMap(hash)
     }
 }
@@ -9291,20 +8986,18 @@ impl From<PHPValue> for aero::Value {
             PHPValue::Blob(b) => aero::Value::Blob(b),
             PHPValue::List(l) => aero::Value::List(l.into_iter().map(Into::into).collect()),
             PHPValue::HashMap(h) => {
-                let mut m = HashMap::<aero::Value, aero::Value>::with_capacity(h.len());
-                for (k, v) in h {
-                    m.insert(k.into(), v.into());
-                }
-                aero::Value::HashMap(m)
+                aero::Value::HashMap(h.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
             }
+            // Entry order survives the round-trip as an ordered key/value pair list.
+            PHPValue::OrderedMap(pairs) => aero::Value::KeyValueList(
+                pairs.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            ),
             // Aerospike has no separate Json type; collapse to a string-keyed HashMap.
-            PHPValue::Json(h) => {
-                let mut m = HashMap::<aero::Value, aero::Value>::with_capacity(h.len());
-                for (k, v) in h {
-                    m.insert(aero::Value::String(k), v.into());
-                }
-                aero::Value::HashMap(m)
-            }
+            PHPValue::Json(h) => aero::Value::HashMap(
+                h.into_iter()
+                    .map(|(k, v)| (aero::Value::String(k), v.into()))
+                    .collect(),
+            ),
             PHPValue::GeoJSON(gj) => aero::Value::GeoJSON(gj),
             PHPValue::HLL(b) => aero::Value::HLL(b),
             PHPValue::Infinity => aero::Value::Infinity,
@@ -9326,25 +9019,16 @@ impl From<aero::Value> for PHPValue {
                 PHPValue::List(l.into_iter().map(Into::into).collect())
             }
             aero::Value::HashMap(h) => {
-                let mut m = HashMap::<PHPValue, PHPValue>::with_capacity(h.len());
-                for (k, v) in h {
-                    m.insert(k.into(), v.into());
-                }
-                PHPValue::HashMap(m)
+                PHPValue::HashMap(h.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
             }
+            // Ordered server results (BTreeMap iterates in key order, KeyValueList is
+            // already in server-produced order) must stay ordered on the way to PHP —
+            // an unordered HashMap would scramble rank/key-ordered CDT results.
             aero::Value::OrderedMap(h) => {
-                let mut m = HashMap::<PHPValue, PHPValue>::with_capacity(h.len());
-                for (k, v) in h {
-                    m.insert(k.into(), v.into());
-                }
-                PHPValue::HashMap(m)
+                PHPValue::OrderedMap(h.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
             }
             aero::Value::KeyValueList(kv) => {
-                let mut m = HashMap::<PHPValue, PHPValue>::with_capacity(kv.len());
-                for (k, v) in kv {
-                    m.insert(k.into(), v.into());
-                }
-                PHPValue::HashMap(m)
+                PHPValue::OrderedMap(kv.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
             }
             aero::Value::GeoJSON(gj) => PHPValue::GeoJSON(gj),
             aero::Value::HLL(b) => PHPValue::HLL(b),
@@ -9406,6 +9090,9 @@ impl Value {
     }
 
     pub fn blob(zval: &Zval) -> PhpResult<PHPValue> {
+        /// Single source for the `Value::blob` input contract; per-site prefixes below
+        /// only add the offending detail.
+        const BLOB_CONTRACT: &str = "Value::blob expects a string or an array of integers in [0, 255]";
         match zval.get_type() {
             DataType::String => {
                 if let Some(bin) = zval.binary::<u8>() {
@@ -9414,7 +9101,7 @@ impl Value {
                     Ok(PHPValue::Blob(s.into_bytes()))
                 } else {
                     throw_msg(
-                        "Value::blob: failed to read string contents",
+                        &format!("{BLOB_CONTRACT}: failed to read string contents"),
                         PHPValue::Blob(Vec::new()),
                     )
                 }
@@ -9424,7 +9111,7 @@ impl Value {
                     Some(a) if a.has_sequential_keys() => a,
                     _ => {
                         return throw_msg(
-                            "Invalid Array type for Value::blob. Must be an array of integers [0, 255]",
+                            &format!("{BLOB_CONTRACT}: got a non-sequential array"),
                             PHPValue::Blob(Vec::new()),
                         );
                     }
@@ -9435,15 +9122,13 @@ impl Value {
                         Some(PHPValue::Int(b)) if (0..=255).contains(&b) => bytes.push(b as u8),
                         Some(PHPValue::Int(b)) => {
                             return throw_msg(
-                                &format!(
-                                    "Invalid value {b} in array for Value::blob. Must be an array of integers [0, 255]"
-                                ),
+                                &format!("{BLOB_CONTRACT}: got out-of-range integer {b}"),
                                 PHPValue::Blob(Vec::new()),
                             );
                         }
                         _ => {
                             return throw_msg(
-                                "Invalid array for Value::blob. Must be an array of integers [0, 255]",
+                                &format!("{BLOB_CONTRACT}: got a non-integer array element"),
                                 PHPValue::Blob(Vec::new()),
                             );
                         }
@@ -9451,10 +9136,7 @@ impl Value {
                 }
                 Ok(PHPValue::Blob(bytes))
             }
-            _ => throw_msg(
-                "Invalid Array type for Value::blob. Must be an array of integers [0, 255]",
-                PHPValue::Blob(Vec::new()),
-            ),
+            _ => throw_msg(BLOB_CONTRACT, PHPValue::Blob(Vec::new())),
         }
     }
 
@@ -9528,9 +9210,6 @@ pub struct ResultCode {}
 #[php_impl]
 #[allow(non_camel_case_types)]
 impl ResultCode {
-    /// GRPC_ERROR is wrapped and directly returned from the grpc library
-    const GRPC_ERROR: i32 = -21;
-
     /// BATCH_FAILED means one or more keys failed in a batch.
     const BATCH_FAILED: i32 = -20;
 
@@ -9809,7 +9488,6 @@ impl ResultCode {
 
     pub fn to_string(code: i32) -> String {
         match code {
-             ResultCode::GRPC_ERROR => "wrapped and directly returned from the grpc library".into(),
              ResultCode::BATCH_FAILED => "one or more keys failed in a batch".into(),
              ResultCode::NO_RESPONSE => "no response was received from the server".into(),
              ResultCode::NETWORK_ERROR => "a network error. Checked the wrapped error for detail".into(),
@@ -9913,16 +9591,13 @@ impl ResultCode {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Returns true iff every element is `PHPValue::HLL`. Throws an Aerospike exception
-/// (no panic) on the first non-HLL value encountered.
-fn assert_hll_list(val: &[PHPValue]) -> bool {
-    for v in val {
-        if !matches!(v, PHPValue::HLL(_)) {
-            let _ = throw_msg::<()>("Invalid type", ());
-            return false;
-        }
-    }
-    true
+/// Error message shared by all `HllOp` builders that take a list of HLL values.
+const HLL_LIST_CONTRACT: &str = "HllOp expects a list of HLL values (see Value::hll)";
+
+/// Returns true iff every element is `PHPValue::HLL`. Pure predicate — callers throw
+/// `HLL_LIST_CONTRACT` and return a sentinel, matching the list/map op builders.
+fn hll_list_valid(val: &[PHPValue]) -> bool {
+    val.iter().all(|v| matches!(v, PHPValue::HLL(_)))
 }
 
 /// Build a PHP `Zval` wrapping a fresh `Client` PHP object that shares the `Arc<aero::Client>`

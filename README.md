@@ -359,7 +359,7 @@ listed continues to work unchanged.
 | `$client->socket`                                          | `$client->getHosts()` (`$client->hosts` also works via `__get`)                                      |
 | `$client->close()`                                         | **unchanged** — closes the pooled connection and evicts it from the per-process cache (optional; cached clients are closed at module shutdown) |
 | `$record->bins`, `$record->generation`, `$record->ttl`     | `$record->getBins()` / `getGeneration()` / `getTtl()` (property access works via `__get`)            |
-| `$record->getTtl()` (absolute Unix timestamp)              | **unchanged** — still absolute. For remaining seconds: `getRemainingTtl()`                            |
+| `$record->getTtl()` (remaining TTL in seconds)              | **unchanged** — still returns remaining seconds, same as v1. `getRemainingTtl()` is an equivalent accessor. For the record's expiration state (including "never expires"), use `getExpiration()`. |
 | `MapOp::getByKeys([$k], MapReturnType::value())` → 1 value | now returns a list per key — index with `$result[0]`                                                  |
 | `BatchPolicy::setConcurrentNodes($n)`                      | **unchanged** (restored as alias). Use `setConcurrency(Concurrency::Parallel())` for typed control. |
 | `Expression::xor([...])` (integer XOR)                     | **unchanged** (alias for `intXor`). New `Expression::boolXor()` for boolean XOR.                     |
@@ -398,7 +398,7 @@ rg -l '\$record->(bins|generation|ttl|key)' --type=php | \
 
 * Reference Documentation: [aerospike.github.io/php-client](https://aerospike.github.io/php-client/)
 * Aerospike Documentation: [aerospike.com/docs](https://aerospike.com/docs/)
-* IDE Stubs: [`php_stubs/libaerospike-php-stubsv2.0.0.php`](./php_stubs/libaerospike-php-stubsv2.0.0.php)
+* IDE Stubs: [`php_stubs/libaerospike-php-stubs.php`](./php_stubs/libaerospike-php-stubs.php)
 
 ## Issues
 

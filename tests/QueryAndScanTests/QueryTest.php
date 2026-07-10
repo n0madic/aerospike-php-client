@@ -217,6 +217,43 @@ class QueryTest extends TestCase
         $this->assertGreaterThan(0, $counter);
     }
 
+    // Regression test: Statement's bin_names contract is the opposite of BatchRead's -
+    // an explicit empty array means header-only (no bins, but generation is present).
+    public function testStatementEmptyArrayBinNamesIsHeaderOnly()
+    {
+        $pf = PartitionFilter::all();
+        $qp = new QueryPolicy();
+        $eqFilter = Filter::Equal('AerospikeBin3', 987);
+        $statement = new Statement(self::$namespace, self::$set, $eqFilter, []);
+
+        $recordSet = self::$client->query($qp, $pf, $statement);
+        $counter = 0;
+        while ($rec = $recordSet->next()) {
+            $this->assertEmpty($rec->getBins());
+            $this->assertNotNull($rec->getGeneration());
+            $counter++;
+        }
+        $this->assertGreaterThan(0, $counter);
+    }
+
+    // Regression test: Statement's bin_names contract is the opposite of BatchRead's -
+    // null bin_names (the default, when omitted) means all bins are returned.
+    public function testStatementNullBinNamesReturnsAllBins()
+    {
+        $pf = PartitionFilter::all();
+        $qp = new QueryPolicy();
+        $eqFilter = Filter::Equal('AerospikeBin3', 987);
+        $statement = new Statement(self::$namespace, self::$set, $eqFilter, null);
+
+        $recordSet = self::$client->query($qp, $pf, $statement);
+        $counter = 0;
+        while ($rec = $recordSet->next()) {
+            $this->assertArrayHasKey('AerospikeBin1', $rec->getBins());
+            $counter++;
+        }
+        $this->assertGreaterThan(0, $counter);
+    }
+
     public function testQueryWithExpectedDurationSet()
     {
         $counter = 0;

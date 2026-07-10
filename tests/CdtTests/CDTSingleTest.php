@@ -61,6 +61,7 @@ class CDTSingleTest extends TestCase
         $bwp = new BatchWritePolicy();
         $bp = new BatchPolicy();
 
+        $full_ops = [];
         foreach ($ops as $op) {
             $full_ops[] = $op;
         }

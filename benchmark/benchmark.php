@@ -50,7 +50,7 @@ class AerospikeBenchmark {
         $this->doGet($set);
     }
     public function makeDataForGetBenchString10() {
-        $set = "Benchmark_Get_String1";
+        $set = "Benchmark_Get_String10";
         $value = str_repeat("s", 10);
         $wp = new WritePolicy();
         for ($k = 0; $k < 1000; $k++) {
@@ -70,7 +70,7 @@ class AerospikeBenchmark {
         $this->doGet($set);
     }
     public function makeDataForGetBenchString100() {
-        $set = "Benchmark_Get_String1";
+        $set = "Benchmark_Get_String100";
         $value = str_repeat("s", 100);
         $wp = new WritePolicy();
         for ($k = 0; $k < 1000; $k++) {
@@ -90,7 +90,7 @@ class AerospikeBenchmark {
         $this->doGet($set);
     }
     public function makeDataForGetBenchString1000() {
-        $set = "Benchmark_Get_String1";
+        $set = "Benchmark_Get_String1000";
         $value = str_repeat("s", 1000);
         $wp = new WritePolicy();
         for ($k = 0; $k < 1000; $k++) {
@@ -110,7 +110,7 @@ class AerospikeBenchmark {
         $this->doGet($set);
     }
     public function makeDataForGetBenchString10000() {
-        $set = "Benchmark_Get_String1";
+        $set = "Benchmark_Get_String10000";
         $value = str_repeat("s", 10000);
         $wp = new WritePolicy();
         for ($k = 0; $k < 1000; $k++) {

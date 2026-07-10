@@ -25,13 +25,16 @@ namespace Aerospike {
 
     /**
      * Represents an exception specific to the Aerospike database operations.
+     *
+     * `$code` and `$message` are inherited from \Exception and must not be redeclared
+     * with types (fatal "must be omitted to match the parent definition" otherwise);
+     * the extension exposes them as public properties at runtime.
+     *
+     * @property int $code Aerospike result code (see ResultCode)
+     * @property string $message Error message
      */
     class AerospikeException extends \Exception {
-        public int $code;
-
         public bool $inDoubt;
-
-        public string $message;
 
         public function __construct() {}
     }
@@ -360,8 +363,12 @@ namespace Aerospike {
         public function setFilterExpression(mixed $filter_expression = null): void {}
 
         /**
+         * 0 = server default, -1 = don't reset, 1..=100 = percentage. Any other value
+         * throws an AerospikeException.
+         *
          * @param int $percent
          * @return void
+         * @throws \Aerospike\AerospikeException
          */
         public function setReadTouchTtlPercent(int $percent): void {}
     }
@@ -4173,15 +4180,16 @@ namespace Aerospike {
         /**
          * MapPutOp creates map put-items operation.
          * Server writes each key/value item to the map bin and returns the map size.
-         * Returns `None` if `map` is not a PHP associative array (HashMap).
+         * Throws an AerospikeException if `map` is not a PHP associative array (map).
          *
          * @param \Aerospike\MapPolicy $policy
          * @param string $bin_name
          * @param mixed $map
          * @param array|null $ctx
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
+         * @throws \Aerospike\AerospikeException
          */
-        public static function put(\Aerospike\MapPolicy $policy, string $bin_name, mixed $map, ?array $ctx = null): ?\Aerospike\Operation {}
+        public static function put(\Aerospike\MapPolicy $policy, string $bin_name, mixed $map, ?array $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByIndexOp creates map remove operation.
@@ -5248,8 +5256,12 @@ namespace Aerospike {
         public function setReadModeAp(mixed $read_mode_ap): void {}
 
         /**
+         * 0 = server default, -1 = don't reset, 1..=100 = percentage. Any other value
+         * throws an AerospikeException.
+         *
          * @param int $percent
          * @return void
+         * @throws \Aerospike\AerospikeException
          */
         public function setReadTouchTtlPercent(int $percent): void {}
 
@@ -5399,6 +5411,13 @@ namespace Aerospike {
         /**
          * Close the recordset. Background tasks finish at their next safe point.
          *
+         * To stop a paginated scan/query early AND keep the pagination cursor, drain the
+         * recordset after closing: keep calling next() until it returns null. Draining
+         * consumes the records already delivered and then writes the cursor back into the
+         * originating PartitionFilter, so the next scan resumes exactly after the consumed
+         * records. Abandoning the recordset right after close() leaves the cursor at the
+         * previous page boundary (already-seen records are returned again on resume).
+         *
          * @return void
          */
         public function close(): void {}
@@ -5412,9 +5431,14 @@ namespace Aerospike {
 
         /**
          * Returns the next record from the queue, blocking until a record arrives or the
-         * recordset closes. Returns `None` when the stream is exhausted.
+         * recordset closes. Returns `null` when the stream is exhausted.
+         *
+         * CAUTION: with total_timeout = 0 on the scan/query policy there is no upper
+         * bound on how long this blocks. Set a non-zero total_timeout (or the
+         * aerospike.read_timeout INI) for streaming reads in production.
          *
          * @return \Aerospike\Record|null
+         * @throws \Aerospike\AerospikeException
          */
         public function next(): ?\Aerospike\Record {}
     }

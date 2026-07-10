@@ -7,7 +7,7 @@ $set = "test";
 $hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
 $client = Client::connect($hosts);
-echo "* Connected to Aerospike: $client->getHosts() \n";
+echo "* Connected to Aerospike: {$client->getHosts()}\n";
 $ip = new InfoPolicy();
 $client->truncate($ip, $namespace, $set);
 usleep(100);
@@ -38,10 +38,10 @@ $batchDeletePolicy->setFilterExpression($exp);
 $batchDelete = new BatchDelete($batchDeletePolicy, $key);
 
 $batchPolicy = new BatchPolicy();
-$client->batch($batchPolicy, [$batchWrite]);
+$client->batch($batchPolicy, [$batchDelete]);
 
+// bin1 == 1, so the record was deleted; exists() confirms it.
 $rp = new ReadPolicy();
-$recs = $client->get($rp, $key);
-var_dump(count($recs->getBins()));
+var_dump($client->exists($rp, $key));
 
 

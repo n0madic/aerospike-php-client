@@ -317,6 +317,15 @@ final class ClientTest extends TestCase
         $this->assertGreaterThanOrEqual(8, $record->getRemainingTtl());
     }
 
+    // Regression test: out-of-range values used to silently fall back to the server
+    // default (which the getter reports as 0), hiding the mistake from the caller.
+    public function testReadTouchTtlPercentOutOfRangeThrows()
+    {
+        $rp = new ReadPolicy();
+        $this->expectException(AerospikeException::class);
+        $rp->setReadTouchTtlPercent(101);
+    }
+
     public function testPutGetBinary()
     {
         $binary = Value::blob("\x41\x42\xFF\x43\x00\x7F\x80\xE2\x98\x85");
@@ -348,32 +357,33 @@ final class ClientTest extends TestCase
     {
         $stringKey = new Key(self::$namespace, self::$set, "new_key");
         $wp = new WritePolicy();
-        $wp->setExpiration(Expiration::Seconds(3));
-        self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_3")]);
-        sleep(1);
+        $wp->setExpiration(Expiration::Seconds(10));
+        self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_10")]);
+        sleep(2);
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, $stringKey);
-        // Remaining TTL after 1 s of a 3 s expiration is ~1-2 s depending on
-        // sub-second timing between put() and get().
-        $this->assertGreaterThanOrEqual(1, $record->getRemainingTtl());
-        $this->assertLessThanOrEqual(2, $record->getRemainingTtl());
+        // Remaining TTL after 2 s of a 10 s expiration is ~8 s; the wide bounds absorb
+        // scheduler jitter and server-side second rounding without weakening the check.
+        $this->assertGreaterThanOrEqual(6, $record->getRemainingTtl());
+        $this->assertLessThanOrEqual(9, $record->getRemainingTtl());
     }
 
     public function testReadTtlNotUpdated()
     {
         $stringKey = new Key(self::$namespace, self::$set, "new_key");
         $wp = new WritePolicy();
-        $wp->setExpiration(Expiration::Seconds(3));
-        self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_3")]);
-        sleep(1);
+        $wp->setExpiration(Expiration::Seconds(10));
+        self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_10")]);
+        sleep(2);
         $wp->setExpiration(Expiration::DontUpdate());
         $this->assertFalse($wp->getExpiration()->willUpdateExpiration());
-        self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_2_hopefully")]);
+        self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_8_hopefully")]);
         $rp = new ReadPolicy();
         $record = self::$client->get($rp, $stringKey);
-        // The DontUpdate write must NOT reset the TTL — remaining ≈ 1-2 s.
-        $this->assertGreaterThanOrEqual(1, $record->getRemainingTtl());
-        $this->assertLessThanOrEqual(2, $record->getRemainingTtl());
+        // The DontUpdate write must NOT reset the TTL: remaining stays ~8 s. A reset
+        // would report ~10 s, which the upper bound of 9 catches even with jitter.
+        $this->assertGreaterThanOrEqual(6, $record->getRemainingTtl());
+        $this->assertLessThanOrEqual(9, $record->getRemainingTtl());
     }
 
     public function testReadTtlNeverExpires()

@@ -122,6 +122,55 @@ class ScanTest extends TestCase
         );
     }
 
+    // Regression test for the documented early-stop pattern: close() the recordset
+    // mid-page and then DRAIN it (next() until null). Draining consumes the records the
+    // server already delivered and writes the cursor back into the PartitionFilter, so
+    // the next scan resumes exactly after the consumed records — nothing is lost and
+    // nothing repeats. (Syncing the cursor inside close() itself would be wrong: the
+    // upstream tracker records delivered records, not consumed ones, so it would skip
+    // whatever was still buffered — that variant lost ~half the records when tried.)
+    public function testScanPaginateWithEarlyCloseAndDrain()
+    {
+        $pf = PartitionFilter::all();
+        $sp = new ScanPolicy();
+        $sp->setMaxRecords(25);
+
+        $closeAfter = 5;
+        $seen = [];
+        // Each non-final page consumes at least one new record, bounding the loop.
+        $maxPages = self::$keyCount + 5;
+        for ($page = 0; $page < $maxPages; $page++) {
+            $rs = self::$client->scan($sp, $pf, self::$namespace, self::$set);
+            $this->assertNotNull($rs);
+
+            $thisPage = 0;
+            while ($rec = $rs->next()) {
+                $digest = $rec->getKey()->getDigest();
+                $this->assertArrayNotHasKey(
+                    $digest,
+                    $seen,
+                    "record $digest returned twice — cursor was not preserved across close()+drain"
+                );
+                $seen[$digest] = true;
+                $thisPage++;
+                if ($thisPage === $closeAfter) {
+                    // Stop fetching more records, but keep iterating: the while loop
+                    // drains what is already buffered, then the cursor is synced.
+                    $rs->close();
+                }
+            }
+            if ($thisPage === 0) {
+                break;
+            }
+        }
+
+        $this->assertCount(
+            self::$keyCount,
+            $seen,
+            "expected " . self::$keyCount . " unique records after close()+drain pagination, got " . count($seen)
+        );
+    }
+
     public function testScanAllPartitionsOneByOne()
     {
         $pf = PartitionFilter::all();

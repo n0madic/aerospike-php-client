@@ -42,6 +42,31 @@ All notable changes to this project will be documented in this file.
 - **`ListOp::append` / `ListOp::insert` with an empty values array and `ListOp::set` with a
   null value now throw `AerospikeException`** instead of panicking inside the native library
   (a panic across the FFI boundary aborts the PHP worker).
+- **`connect()` no longer serializes on a slow cluster**: the network connect happens outside
+  the process-wide client-cache lock, guarded per hosts+policy key — an unreachable cluster A
+  no longer stalls unrelated `connect()` calls to cluster B for its whole connect timeout
+  (relevant for ZTS builds).
+- **Tokio runtime creation failure is a catchable `Exception`** instead of a panic that
+  aborted the PHP worker (possible under thread/fd exhaustion).
+- **Early-stop pagination pattern documented and covered by a test**: to stop a paginated
+  scan/query early *and* keep the cursor, call `Recordset::close()` and then drain the
+  recordset (`next()` until `null`) — the cursor is written back after the drain, so the
+  next scan resumes exactly after the consumed records. The cursor is deliberately not
+  extracted inside `close()` itself: the upstream tracker records *delivered* records, not
+  consumed ones, so that variant silently skipped everything still buffered.
+- **`MapOp::put` with a non-map value throws `AerospikeException`** instead of returning
+  null, which surfaced later as a confusing error when the null "operation" was consumed.
+- **`setReadTouchTtlPercent` throws on out-of-range values** (valid: 0, -1, 1..=100) instead
+  of silently falling back to the server default.
+- **`listUdf` throws when no cluster nodes are available** instead of returning an empty
+  list indistinguishable from "no UDFs registered".
+- **Stubs: `AerospikeException` no longer redeclares typed `$code`/`$message`** — loading the
+  stub file was a PHP fatal ("must be omitted to match the parent definition").
+- **`benchmark.php`: the String10/100/1000/10000 get-benchmarks now read the set they
+  seeded** — a copy-paste bug made them measure get-misses on empty sets.
+- **CI/test infrastructure**: `build.yml` also triggers on `v2-native-client` and `v*` tags
+  (release artifacts silently never built for the active branch); Aerospike server images
+  pinned to 8.1.2.3 instead of `:latest`; `dtolnay/rust-toolchain` pinned to a commit.
 
 ### Changed
 
@@ -149,8 +174,8 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
 ### Improvements
 
 - Removed dependency on Go toolchain, `protoc`, `tonic`, `prost`, gRPC, and all proto-generated code.
-- **86 PHPUnit tests** (85 passing + 1 paginated-scan test marked `markTestSkipped`; see
-  Known limitations) against live Aerospike CE 8.1.2.1.
+- **86 PHPUnit tests** passing against live Aerospike CE 8.1.x, including the concurrent
+  paginated-scan test (`ScanTest::testScanAndPaginateAllPartitionsConcurrently`).
 - Extension binary is a single `.so` / `.dylib` — no daemon process to manage.
 - Faster startup: no IPC round-trip to the connection manager.
 - `ext-php-rs` upgraded to **0.15.x**. Macro attribute syntax migrated (`#[php_class(name=…)]`
@@ -181,11 +206,6 @@ The Aerospike Connection Manager (ACM) daemon is no longer required.
 
 ### Known limitations
 
-- `tests/QueryAndScanTests/ScanTest::testScanAndPaginateAllPartitionsConcurrently`
-  is `markTestSkipped`. The PHP `PartitionFilter` wrapper clones the underlying
-  `aero::PartitionFilter` on every `Client::scan()` call, so cursor state is not propagated
-  back across consecutive paginated scans. Will be re-enabled once the wrapper holds a shared
-  mutable reference.
 - `read_touch_ttl_percent` requires Aerospike server v8+ — `ClientTest::testReadTouchTTlPercent`
   is auto-skipped on older servers.
 

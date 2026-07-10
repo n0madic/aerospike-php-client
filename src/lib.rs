@@ -94,34 +94,40 @@ static TOKIO_RT_INIT: Mutex<()> = Mutex::new(());
 /// the runtime was built in with the current pid. The stale runtime is intentionally
 /// *leaked*, not dropped — dropping it would try to join worker threads that only exist
 /// in the parent process. At most one runtime leaks per fork generation.
-fn tokio_rt() -> &'static tokio::runtime::Runtime {
+///
+/// Building the runtime can fail (thread/fd exhaustion); the error is returned as a
+/// catchable PHP exception instead of aborting the worker with a panic.
+fn tokio_rt() -> PhpResult<&'static tokio::runtime::Runtime> {
     let pid = std::process::id();
     if TOKIO_RT_PID.load(Ordering::Acquire) == pid {
         // SAFETY: a matching pid is stored only after a valid, never-freed (leaked)
         // runtime pointer — see the invariant on TOKIO_RT_PTR/TOKIO_RT_PID above.
-        return unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) };
+        return Ok(unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) });
     }
 
     let _init = TOKIO_RT_INIT.lock().unwrap_or_else(PoisonError::into_inner);
     // Another thread may have built the runtime while we waited for the lock.
     if TOKIO_RT_PID.load(Ordering::Acquire) == pid {
-        return unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) };
+        return Ok(unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) });
     }
     if !TOKIO_RT_PTR.load(Ordering::Acquire).is_null() {
         trace!("pid changed (fork detected): rebuilding Tokio runtime");
     }
     let worker_threads = ini_long_positive(&INI_WORKER_THREADS)
         .map_or(TOKIO_WORKER_THREADS_DEFAULT, |v| v as usize);
-    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()
-            .expect("failed to create Tokio runtime"),
-    ));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            PhpException::from_class::<AerospikeException>(format!(
+                "failed to create Tokio runtime: {e}"
+            ))
+        })?;
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
     TOKIO_RT_PTR.store(rt as *const _ as *mut _, Ordering::Release);
     TOKIO_RT_PID.store(pid, Ordering::Release);
-    rt
+    Ok(rt)
 }
 
 struct ClientCache {
@@ -157,6 +163,50 @@ fn clients_lock() -> MutexGuard<'static, ClientCache> {
         cache.pid = pid;
     }
     cache
+}
+
+struct ConnectGuards {
+    /// Process id the guards belong to; a mismatch means we are in a fork() child, where
+    /// an inherited guard could be locked forever by a parent-only thread.
+    pid: u32,
+    map: HashMap<String, Arc<Mutex<()>>>,
+}
+
+/// Per-cache-key connect locks. `Client::connect` serializes on the key it is building
+/// (so two threads racing on the *same* hosts+policy build one client, not two) while the
+/// process-wide `CLIENTS` lock is held only for map lookup/insert — a slow or unreachable
+/// cluster no longer stalls unrelated `connect()` calls for its whole connect timeout.
+static CONNECT_GUARDS: LazyLock<Mutex<ConnectGuards>> = LazyLock::new(|| {
+    Mutex::new(ConnectGuards {
+        pid: std::process::id(),
+        map: HashMap::new(),
+    })
+});
+
+/// Returns the connect lock for `cache_key`, creating it on first use and discarding all
+/// inherited guards after fork() (same rationale as `clients_lock`).
+fn connect_guard(cache_key: &str) -> Arc<Mutex<()>> {
+    let mut guards = CONNECT_GUARDS.lock().unwrap_or_else(PoisonError::into_inner);
+    let pid = std::process::id();
+    if guards.pid != pid {
+        guards.map.clear();
+        guards.pid = pid;
+    }
+    guards.map.entry(cache_key.to_string()).or_default().clone()
+}
+
+/// Drop the connect lock for `cache_key` if no other thread holds it. Called after a
+/// connect completes so the guard map does not grow one entry per distinct hosts+policy
+/// ever used (mirroring the client-cache eviction rationale). Under the `CONNECT_GUARDS`
+/// lock a strong count of 1 proves no other thread holds a clone, because cloning requires
+/// that same lock.
+fn release_connect_guard(cache_key: &str) {
+    let mut guards = CONNECT_GUARDS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(g) = guards.map.get(cache_key) {
+        if Arc::strong_count(g) == 1 {
+            guards.map.remove(cache_key);
+        }
+    }
 }
 
 /// The configured soft cap on cached clients. When an insert would exceed it, idle
@@ -206,7 +256,10 @@ fn close_client_entries(entries: impl IntoIterator<Item = ClientEntry>) {
     if entries.peek().is_none() {
         return;
     }
-    let _guard = tokio_rt().enter();
+    // Entries exist only if a client was built in this process, so the runtime is
+    // already cached and this cannot hit the fallible build path.
+    let Ok(rt) = tokio_rt() else { return };
+    let _guard = rt.enter();
     for entry in entries {
         trace!("closing cached client for {}", entry.hosts);
         if let Err(e) = entry.client.close() {
@@ -376,6 +429,24 @@ fn throw_msg<T>(msg: &str, default: T) -> PhpResult<T> {
     let error = AerospikeException::new(msg);
     throw_object(error.into_zval(true)?)?;
     Ok(default)
+}
+
+/// Parse a `readTouchTtlPercent` value: 0 = server default, -1 = don't reset,
+/// 1..=100 = percentage. Any other value throws an `AerospikeException` instead of
+/// silently falling back to the server default (which the getter reports as 0,
+/// hiding the mistake from the caller).
+fn read_touch_ttl_from_percent(percent: i32) -> PhpResult<aero::policy::ReadTouchTTL> {
+    match percent {
+        0 => Ok(aero::policy::ReadTouchTTL::ServerDefault),
+        -1 => Ok(aero::policy::ReadTouchTTL::DontReset),
+        p if (1..=100).contains(&p) => Ok(aero::policy::ReadTouchTTL::Percent(p as u8)),
+        _ => throw_msg(
+            &format!(
+                "readTouchTtlPercent must be 0 (server default), -1 (don't reset), or 1..=100, got {percent}"
+            ),
+            aero::policy::ReadTouchTTL::ServerDefault,
+        ),
+    }
 }
 
 pub type AsResult<T = ()> = std::result::Result<T, AerospikeException>;
@@ -1940,13 +2011,9 @@ impl ReadPolicy {
             aero::policy::ReadTouchTTL::DontReset => -1,
         }
     }
-    pub fn set_read_touch_ttl_percent(&mut self, percent: i32) {
-        self._as.base_policy.read_touch_ttl = match percent {
-            0 => aero::policy::ReadTouchTTL::ServerDefault,
-            -1 => aero::policy::ReadTouchTTL::DontReset,
-            p if (1..=100).contains(&p) => aero::policy::ReadTouchTTL::Percent(p as u8),
-            _ => aero::policy::ReadTouchTTL::ServerDefault,
-        };
+    pub fn set_read_touch_ttl_percent(&mut self, percent: i32) -> PhpResult<()> {
+        self._as.base_policy.read_touch_ttl = read_touch_ttl_from_percent(percent)?;
+        Ok(())
     }
 
     /// ReadModeAP indicates read policy for AP (availability) namespaces.
@@ -2729,6 +2796,8 @@ impl FromZval<'_> for Filter {
 /// - `return_data` toggle removed. Use `bin_names = Some(vec![])` for header-only reads
 ///   (maps to `aero::Bins::None`); `bin_names = None` returns all bins (`aero::Bins::All`);
 ///   non-empty `bin_names` returns the specified bins (`aero::Bins::Some(names)`).
+///   CAUTION: this is the *opposite* of `BatchRead`, where an empty bin list means "all
+///   bins" and header-only reads use the dedicated `BatchRead::header()` constructor.
 /// - `task_id` removed; the aerospike v2 client manages it internally.
 #[php_class]
 #[php(name = "Aerospike\\Statement")]
@@ -2971,6 +3040,16 @@ pub struct Recordset {
 #[php_impl]
 impl Recordset {
     /// Close the recordset. Background tasks finish at their next safe point.
+    ///
+    /// To stop a paginated scan/query early *and* keep the pagination cursor, drain the
+    /// recordset after closing: keep calling `next()` until it returns `null`. Draining
+    /// consumes the records the server already delivered and then writes the cursor back
+    /// into the originating `PartitionFilter`, so the next scan resumes exactly after the
+    /// consumed records. Abandoning the recordset right after `close()` leaves the
+    /// cursor at the previous page boundary (already-seen records are returned again on
+    /// resume). The cursor is deliberately NOT extracted here: the upstream tracker
+    /// records *delivered* records, not consumed ones, so syncing at close time would
+    /// silently skip everything still sitting in the buffer.
     pub fn close(&mut self) {
         if let Some(rs) = self._as.as_ref() {
             rs.close();
@@ -2986,6 +3065,11 @@ impl Recordset {
     /// recordset closes. Returns `None` when the stream is exhausted; throws an
     /// `AerospikeException` on read failure.
     ///
+    /// CAUTION: with `total_timeout = 0` on the scan/query policy there is no upper bound
+    /// on how long this blocks — a node that stalls mid-stream blocks the PHP worker
+    /// indefinitely. Set a non-zero `total_timeout` (or the `aerospike.read_timeout` INI)
+    /// for streaming reads in production.
+    ///
     /// Uses the canonical `Iterator for &aero::Recordset` implementation which yields the
     /// tokio scheduler between checks via `futures::executor::block_on(yield_now())` —
     /// no 1ms `thread::sleep` busy-wait. On end-of-stream the cursor inside the originating
@@ -2994,7 +3078,7 @@ impl Recordset {
         let Some(rs) = self._as.clone() else {
             return Ok(None);
         };
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         // `Iterator for &Recordset` requires a mutable reference to the `&Recordset` itself.
         let recordset: &aero::Recordset = &rs;
         let mut iter: &aero::Recordset = recordset;
@@ -3023,9 +3107,12 @@ impl Recordset {
         let Some(rs) = self._as.as_ref() else {
             return;
         };
-        // `aero::Recordset::partition_filter` is async; we're already inside `tokio_rt().enter()`
-        // when called from `next()`, but `block_on` requires an explicit handle.
-        let updated = tokio_rt().block_on(rs.partition_filter());
+        // A recordset exists only if a client was built in this process, so the runtime
+        // is already cached and this cannot hit the fallible build path.
+        let Ok(rt) = tokio_rt() else { return };
+        // `aero::Recordset::partition_filter` is async; we're already inside the runtime
+        // context when called from `next()`, but `block_on` requires an explicit handle.
+        let updated = rt.block_on(rs.partition_filter());
         if let Some(new_pf) = updated {
             if let Ok(mut guard) = pf_arc.lock() {
                 *guard = new_pf;
@@ -3358,13 +3445,9 @@ impl BatchReadPolicy {
             aero::policy::ReadTouchTTL::DontReset => -1,
         }
     }
-    pub fn set_read_touch_ttl_percent(&mut self, percent: i32) {
-        self._as.read_touch_ttl = match percent {
-            0 => aero::policy::ReadTouchTTL::ServerDefault,
-            -1 => aero::policy::ReadTouchTTL::DontReset,
-            p if (1..=100).contains(&p) => aero::policy::ReadTouchTTL::Percent(p as u8),
-            _ => aero::policy::ReadTouchTTL::ServerDefault,
-        };
+    pub fn set_read_touch_ttl_percent(&mut self, percent: i32) -> PhpResult<()> {
+        self._as.read_touch_ttl = read_touch_ttl_from_percent(percent)?;
+        Ok(())
     }
     pub fn get_filter_expression(&self) -> Option<Expression> {
         self._as
@@ -3699,6 +3782,10 @@ impl BatchRecord {
 /// - `None` → header only (`Bins::None`)
 /// - `Some([])` → read all bins (`Bins::All`)
 /// - `Some(names)` → read specified bins (`Bins::Some(names)`)
+///
+/// CAUTION: this is the *opposite* of `Statement`, where `None` means "all bins" and an
+/// empty list means header-only. Prefer the explicit `BatchRead::header()` constructor
+/// for header-only reads.
 #[php_class]
 #[php(name = "Aerospike\\BatchRead")]
 #[derive(Debug, Clone)]
@@ -5677,23 +5764,30 @@ impl CdtMapOperation {
 
     /// MapPutOp creates map put-items operation.
     /// Server writes each key/value item to the map bin and returns the map size.
-    /// Returns `None` if `map` is not a PHP associative array (HashMap).
+    /// Throws an AerospikeException if `map` is not a PHP associative array (map).
     pub fn put(
         policy: &CdtMapPolicy,
         bin_name: String,
         map: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Option<Operation> {
+    ) -> PhpResult<Operation> {
         let aero_map: HashMap<aero::Value, aero::Value> = match map {
             PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
             PHPValue::Json(h) => h
                 .into_iter()
                 .map(|(k, v)| (aero::Value::String(k), v.into()))
                 .collect(),
-            _ => return None,
+            // Previously returned PHP null here, which surfaced later as a confusing
+            // error when the null "Operation" was consumed — throw a clear error instead.
+            _ => {
+                return throw_msg(
+                    "MapOp::put requires an associative array (map)",
+                    Operation::get(None),
+                )
+            }
         };
         let op = aero::operations::maps::put_items(&policy._as, &bin_name, aero_map);
-        Some(Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
         })
     }
@@ -7698,47 +7792,52 @@ impl Client {
             );
         }
 
-        // Single critical section: lookup + insert under the same lock guards against the
-        // ZTS race where two threads simultaneously miss the cache and each build a fresh
-        // client (with its own connection pool). The first writer wins; subsequent waiters
-        // observe the cached entry and skip the expensive `aero::Client::new`. Evicted
-        // idle entries are only *removed* under the lock; closing them (which blocks on
-        // the tend channel) happens after the guard is dropped.
-        let (result, evicted) = {
-            let mut cache = clients_lock();
-            let clients = &mut cache.map;
+        // Serialize with other connects to the *same* hosts+policy only: two threads
+        // racing on one key build a single client, while connects to unrelated clusters
+        // proceed in parallel. The process-wide CLIENTS lock is held only for map
+        // lookup/insert, never across the network connect below.
+        let key_guard = connect_guard(&cache_key);
+        let (result, evicted) = (|| {
+            let _key_lock = key_guard.lock().unwrap_or_else(PoisonError::into_inner);
 
-            if let Some(entry) = clients.get_mut(&cache_key) {
+            if let Some(entry) = clients_lock().map.get_mut(&cache_key) {
                 trace!("Found Aerospike Client object for {hosts}");
                 entry.last_used = Instant::now();
-                return zval_from_entry(entry);
+                return (zval_from_entry(entry), Vec::new());
             }
 
+            let rt = match tokio_rt() {
+                Ok(rt) => rt,
+                Err(e) => return (Err(e), Vec::new()),
+            };
             let c = {
-                let _guard = tokio_rt().enter();
+                let _guard = rt.enter();
                 match aero::Client::new(&aero_policy, &hosts) {
                     Ok(c) => Arc::new(c),
                     // Preserve the structured AerospikeException (code + in_doubt) instead
                     // of flattening to a string with `e.to_string()`.
-                    Err(e) => return throw_aero_error(&e, Zval::new()),
+                    Err(e) => return (throw_aero_error(&e, Zval::new()), Vec::new()),
                 }
             };
 
-            // Make room before inserting: drop idle cached clients (LRU) so credential/cert
-            // rotation or per-tenant policies don't accumulate live connection pools for
-            // the lifetime of the process.
-            let evicted = evict_idle_clients(clients);
-
+            // Insert under the CLIENTS lock; evicted idle entries (LRU overflow — see
+            // evict_idle_clients) are only *removed* there and closed later, outside
+            // both the CLIENTS lock and this key guard, since close() blocks on the
+            // tend channel.
+            let mut cache = clients_lock();
+            let evicted = evict_idle_clients(&mut cache.map);
             let entry = ClientEntry {
                 client: c,
                 hosts: hosts.to_string(),
                 policy_fingerprint: fp,
                 last_used: Instant::now(),
             };
-            let inserted = clients.entry(cache_key).or_insert(entry);
+            let inserted = cache.map.entry(cache_key.clone()).or_insert(entry);
             (zval_from_entry(inserted), evicted)
-        };
+        })();
 
+        drop(key_guard);
+        release_connect_guard(&cache_key);
         close_client_entries(evicted);
         result
     }
@@ -7777,7 +7876,7 @@ impl Client {
                 }
             }
         }
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         if let Err(e) = self.client.close() {
             return throw_aero_error(&e, ());
         }
@@ -7804,7 +7903,7 @@ impl Client {
     /// how the transaction is handled when the record already exists.
     pub fn put(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.put(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7820,7 +7919,7 @@ impl Client {
         bins: Option<Vec<String>>,
     ) -> PhpResult<Option<Record>> {
         let aero_bins = php_bins_to_aero(bins);
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.get(&policy._as, &key._as, aero_bins) {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
@@ -7830,7 +7929,7 @@ impl Client {
 
     /// Read record header (generation, expiration) only. No bins are returned.
     pub fn get_header(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<Option<Record>> {
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.get(&policy._as, &key._as, aero::Bins::None) {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
@@ -7841,7 +7940,7 @@ impl Client {
     /// Add integer bin values to existing record bin values.
     pub fn add(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.add(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7851,7 +7950,7 @@ impl Client {
     /// Append bin string values to existing record bin values.
     pub fn append(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.append(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7861,7 +7960,7 @@ impl Client {
     /// Prepend bin string values to existing record bin values.
     pub fn prepend(&self, policy: &WritePolicy, key: &Key, bins: Vec<&Bin>) -> PhpResult<()> {
         let aero_bins: Vec<aero::Bin> = bins.iter().map(|b| b._as.clone()).collect();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.prepend(&policy._as, &key._as, &aero_bins) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7870,7 +7969,7 @@ impl Client {
 
     /// Delete record for specified key. Returns `true` if the record existed before deletion.
     pub fn delete(&self, policy: &WritePolicy, key: &Key) -> PhpResult<bool> {
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.delete(&policy._as, &key._as) {
             Ok(existed) => Ok(existed),
             Err(e) => throw_aero_error(&e, false),
@@ -7879,7 +7978,7 @@ impl Client {
 
     /// Reset record's time to expiration using the policy's expiration.
     pub fn touch(&self, policy: &WritePolicy, key: &Key) -> PhpResult<()> {
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.touch(&policy._as, &key._as) {
             Ok(()) => Ok(()),
             Err(e) => throw_aero_error(&e, ()),
@@ -7888,7 +7987,7 @@ impl Client {
 
     /// Determine if a record key exists.
     pub fn exists(&self, policy: &ReadPolicy, key: &Key) -> PhpResult<bool> {
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.exists(&policy._as, &key._as) {
             Ok(exists) => Ok(exists),
             Err(e) => throw_aero_error(&e, false),
@@ -7911,7 +8010,7 @@ impl Client {
     ) -> PhpResult<Option<Record>> {
         let aero_ops: Vec<aero::operations::Operation> =
             ops.iter().map(|o| o._as.clone()).collect();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.operate(&policy._as, &key._as, &aero_ops) {
             Ok(record) => Ok(Some(Record { _as: record })),
             Err(aero::Error::ServerError(aero::ResultCode::KeyNotFoundError, ..)) => Ok(None),
@@ -7937,7 +8036,7 @@ impl Client {
                 return throw_msg("Invalid Batch command", vec![]);
             }
         }
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.batch(&policy._as, &batch_ops) {
             Ok(results) => Ok(results
                 .into_iter()
@@ -7956,7 +8055,7 @@ impl Client {
         before_nanos: Option<i64>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy.timeout);
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self
             .client
             .truncate(&admin, namespace, set_name, before_nanos.unwrap_or(0))
@@ -7988,7 +8087,7 @@ impl Client {
             .lock()
             .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
             .clone();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.query(&policy._as, pf, stmt) {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
@@ -8013,7 +8112,7 @@ impl Client {
             .lock()
             .map_err(|_| PhpException::default("PartitionFilter mutex poisoned".into()))?
             .clone();
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.query(&policy._as, pf, stmt) {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
@@ -8043,7 +8142,7 @@ impl Client {
         let cit_val = cit
             .map(|c| c._as.clone())
             .unwrap_or(aero::CollectionIndexType::Default);
-        let task = match tokio_rt().block_on(self.client.create_index_on_bin(
+        let task = match tokio_rt()?.block_on(self.client.create_index_on_bin(
             &admin,
             namespace,
             set_name,
@@ -8056,7 +8155,7 @@ impl Client {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8072,7 +8171,7 @@ impl Client {
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let task = {
-            let _guard = tokio_rt().enter();
+            let _guard = tokio_rt()?.enter();
             match self
                 .client
                 .drop_index(&admin, namespace, set_name, index_name)
@@ -8081,7 +8180,7 @@ impl Client {
                 Err(e) => return throw_aero_error(&e, ()),
             }
         };
-        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8098,7 +8197,7 @@ impl Client {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let lang = language.map(|l| l._as).unwrap_or(aero::UDFLang::Lua);
         let task = {
-            let _guard = tokio_rt().enter();
+            let _guard = tokio_rt()?.enter();
             match self
                 .client
                 .register_udf(&admin, udf_body.as_bytes(), package_name, lang)
@@ -8107,7 +8206,7 @@ impl Client {
                 Err(e) => return throw_aero_error(&e, ()),
             }
         };
-        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8116,13 +8215,13 @@ impl Client {
     pub fn drop_udf(&self, policy: &WritePolicy, package_name: &str) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let task = {
-            let _guard = tokio_rt().enter();
+            let _guard = tokio_rt()?.enter();
             match self.client.remove_udf(&admin, package_name) {
                 Ok(t) => t,
                 Err(e) => return throw_aero_error(&e, ()),
             }
         };
-        if let Err(e) = tokio_rt().block_on(AeroTask::wait_till_complete(&task, None)) {
+        if let Err(e) = tokio_rt()?.block_on(AeroTask::wait_till_complete(&task, None)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8133,9 +8232,16 @@ impl Client {
         let nodes = self.client.nodes();
         let node = match nodes.first() {
             Some(n) => n.clone(),
-            None => return Ok(vec![]),
+            // An empty node list means the cluster is (momentarily) unreachable — throw
+            // rather than return an empty Vec indistinguishable from "no UDFs registered".
+            None => {
+                return throw_msg(
+                    "listUdf: no cluster nodes available (cluster unreachable or client closed)",
+                    vec![],
+                )
+            }
         };
-        let result = match tokio_rt().block_on(node.info(&admin, &["udf-list"])) {
+        let result = match tokio_rt()?.block_on(node.info(&admin, &["udf-list"])) {
             Ok(r) => r,
             Err(e) => return throw_aero_error(&e, vec![]),
         };
@@ -8180,7 +8286,7 @@ impl Client {
         let nodes = self.client.nodes();
         let mut versions = std::collections::HashMap::new();
         for node in &nodes {
-            match tokio_rt().block_on(node.info(&aero::AdminPolicy::default(), &["build"])) {
+            match tokio_rt()?.block_on(node.info(&aero::AdminPolicy::default(), &["build"])) {
                 Ok(result) => {
                     let ver = result.get("build").cloned().unwrap_or_default();
                     versions.insert(node.name().to_string(), ver);
@@ -8207,7 +8313,7 @@ impl Client {
         } else {
             Some(&aero_args)
         };
-        let _guard = tokio_rt().enter();
+        let _guard = tokio_rt()?.enter();
         match self.client.execute_udf(
             &policy._as,
             &key._as,
@@ -8234,7 +8340,7 @@ impl Client {
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
         if let Err(e) =
-            tokio_rt().block_on(
+            tokio_rt()?.block_on(
                 self.client
                     .create_user(&policy._as, &user, &password, &roles_ref),
             )
@@ -8245,7 +8351,7 @@ impl Client {
     }
 
     pub fn drop_user(&self, policy: &AdminPolicy, user: String) -> PhpResult<()> {
-        if let Err(e) = tokio_rt().block_on(self.client.drop_user(&policy._as, &user)) {
+        if let Err(e) = tokio_rt()?.block_on(self.client.drop_user(&policy._as, &user)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8258,7 +8364,7 @@ impl Client {
         password: String,
     ) -> PhpResult<()> {
         if let Err(e) =
-            tokio_rt().block_on(self.client.change_password(&policy._as, &user, &password))
+            tokio_rt()?.block_on(self.client.change_password(&policy._as, &user, &password))
         {
             return throw_aero_error(&e, ());
         }
@@ -8272,7 +8378,7 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt().block_on(self.client.grant_roles(&policy._as, &user, &roles_ref)) {
+        if let Err(e) = tokio_rt()?.block_on(self.client.grant_roles(&policy._as, &user, &roles_ref)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8285,7 +8391,7 @@ impl Client {
         roles: Vec<String>,
     ) -> PhpResult<()> {
         let roles_ref: Vec<&str> = roles.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt().block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))
+        if let Err(e) = tokio_rt()?.block_on(self.client.revoke_roles(&policy._as, &user, &roles_ref))
         {
             return throw_aero_error(&e, ());
         }
@@ -8297,7 +8403,7 @@ impl Client {
         policy: &AdminPolicy,
         user: Option<String>,
     ) -> PhpResult<Vec<UserRole>> {
-        match tokio_rt().block_on(self.client.query_users(&policy._as, user.as_deref())) {
+        match tokio_rt()?.block_on(self.client.query_users(&policy._as, user.as_deref())) {
             Ok(users) => Ok(users.into_iter().map(UserRole::from).collect()),
             Err(e) => throw_aero_error(&e, vec![]),
         }
@@ -8308,7 +8414,7 @@ impl Client {
         policy: &AdminPolicy,
         role_name: Option<String>,
     ) -> PhpResult<Vec<Role>> {
-        match tokio_rt().block_on(self.client.query_roles(&policy._as, role_name.as_deref())) {
+        match tokio_rt()?.block_on(self.client.query_roles(&policy._as, role_name.as_deref())) {
             Ok(roles) => Ok(roles.into_iter().map(Role::from).collect()),
             Err(e) => throw_aero_error(&e, vec![]),
         }
@@ -8325,7 +8431,7 @@ impl Client {
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
         let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt().block_on(self.client.create_role(
+        if let Err(e) = tokio_rt()?.block_on(self.client.create_role(
             &policy._as,
             &role_name,
             &privs,
@@ -8339,7 +8445,7 @@ impl Client {
     }
 
     pub fn drop_role(&self, policy: &AdminPolicy, role_name: String) -> PhpResult<()> {
-        if let Err(e) = tokio_rt().block_on(self.client.drop_role(&policy._as, &role_name)) {
+        if let Err(e) = tokio_rt()?.block_on(self.client.drop_role(&policy._as, &role_name)) {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8352,7 +8458,7 @@ impl Client {
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
-        if let Err(e) = tokio_rt().block_on(self.client.grant_privileges(
+        if let Err(e) = tokio_rt()?.block_on(self.client.grant_privileges(
             &policy._as,
             &role_name,
             &privs,
@@ -8369,7 +8475,7 @@ impl Client {
         privileges: Vec<Privilege>,
     ) -> PhpResult<()> {
         let privs: Vec<aero::Privilege> = privileges.into_iter().map(|p| p._as).collect();
-        if let Err(e) = tokio_rt().block_on(self.client.revoke_privileges(
+        if let Err(e) = tokio_rt()?.block_on(self.client.revoke_privileges(
             &policy._as,
             &role_name,
             &privs,
@@ -8386,7 +8492,7 @@ impl Client {
         allowlist: Vec<String>,
     ) -> PhpResult<()> {
         let allowlist_ref: Vec<&str> = allowlist.iter().map(String::as_str).collect();
-        if let Err(e) = tokio_rt().block_on(self.client.set_allowlist(
+        if let Err(e) = tokio_rt()?.block_on(self.client.set_allowlist(
             &policy._as,
             &role_name,
             &allowlist_ref,
@@ -8403,7 +8509,7 @@ impl Client {
         read_quota: u32,
         write_quota: u32,
     ) -> PhpResult<()> {
-        if let Err(e) = tokio_rt().block_on(self.client.set_quotas(
+        if let Err(e) = tokio_rt()?.block_on(self.client.set_quotas(
             &policy._as,
             &role_name,
             read_quota,

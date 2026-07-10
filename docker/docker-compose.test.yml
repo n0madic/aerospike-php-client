@@ -9,7 +9,9 @@ services:
     # on Apple Silicon transparently runs it under QEMU rather than failing to find
     # an arm64 manifest entry.
     platform: linux/amd64
-    image: aerospike/aerospike-server:latest
+    # Pinned for reproducible test runs (`:latest` makes failures non-reproducible and
+    # is a supply-chain risk). Bump deliberately when validating against a newer server.
+    image: aerospike/aerospike-server:8.1.2.3
     # The image regenerates /etc/aerospike/aerospike.conf from its own template at
     # every start (envsubst), so a bind-mounted config is overwritten anyway — the
     # stock template (namespace `test`, storage-engine device, 4 GB file) is what

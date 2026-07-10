@@ -100,4 +100,12 @@ class CDTMapOpTest extends TestCase{
         $this->assertEquals(["a", "e", "f"], $keys);
     }
 
+    // Regression test: MapOp::put used to return null for a non-map value, which
+    // surfaced later as a confusing error when the null "operation" was consumed.
+    public function testPutNonMapThrows(){
+        $mp = new MapPolicy(MapOrderType::Unordered());
+        $this->expectException(AerospikeException::class);
+        MapOp::put($mp, self::$cdtBinName, "not a map");
+    }
+
 }

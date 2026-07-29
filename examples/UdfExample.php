@@ -7,7 +7,7 @@ $set = "test";
 $hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
 $client = Client::connect($hosts);
-echo "* Connected to Aerospike: $client->getHosts() \n";
+echo "* Connected to Aerospike: {$client->getHosts()} \n";
 
 
 $udfBody = 'function testFunc1(rec, div)

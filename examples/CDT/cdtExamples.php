@@ -7,7 +7,7 @@ $set = "test";
 $hosts = getenv('AEROSPIKE_HOSTS') ?: '127.0.0.1:3000';
 
 $client = Client::connect($hosts);
-echo "* Connected to Aerospike: $client->getHosts() \n";
+echo "* Connected to Aerospike: {$client->getHosts()} \n";
 
 $key = new Key($namespace, $set, 1);
 
@@ -27,7 +27,7 @@ $ops = [ListOp::append($lp, "list", [999]), MapOp::put($mp, "map", ["999" => 999
 $bw = new BatchWrite($bwp, $key, $ops);
 $recs = $client->batch($bp, [$bw]);
 // echo "\n Record after append: ";
-// $listBinData = $recs[0]->record->bins;
+// $listBinData = $recs[0]->getRecord()?->getBins();
 
 // echo "\n Count: ".$listBinData["list"];
 

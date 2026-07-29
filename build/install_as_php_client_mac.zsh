@@ -7,14 +7,17 @@ SCRIPT_PATH="${0:A:h}"
 PROJ_FOLDER="php-client"
 
 
+# NOTE: `set -e` is active, so every "is it installed?" probe must live inside the
+# `if` condition (or be suffixed with `|| true`). A bare probe followed by
+# `if [[ $? != 0 ]]` would abort the script before the check ever runs.
+
 #install XCode command-line developer tools, if needed:
-xcode-select -p 1>/dev/null
-if [ $? -ne 0 ]; then
+if ! xcode-select -p 1>/dev/null 2>&1; then
   printf 'xcode tools were not found.  Attempting to install them.  Please look for the confirmation dialogue...\n'
   xcode-select --install
 
   printf 'xcode-select install has been requested.  Please look for the confirmation dialogue...\n'
-  until $(xcode-select --print-path &> /dev/null); do
+  until xcode-select --print-path &> /dev/null; do
     printf 'waiting for xcode-slect to finish installation...\n'
     sleep 10;
   done
@@ -49,9 +52,8 @@ pwd
 #NOTE: we should now be in the project root, regardless of where the script is or where it was run from
 
 # Install Homebrew if not already installed
-which -s brew
-if [[ $? != 0 ]] ; then
-    mkdir ~/homebrew
+if ! which -s brew >/dev/null 2>&1 ; then
+    mkdir -p ~/homebrew
     curl -L https://github.com/Homebrew/brew/tarball/master | tar xz --strip 1 -C ~/homebrew
     wait
     echo 'export PATH=$PATH:~/homebrew/bin' >> ~/.zshrc
@@ -82,8 +84,7 @@ fi
 
 
 #install PHPUnit via Homebew, if needed
-which -s phpunit
-if [[ $? != 0 ]] ; then
+if ! which -s phpunit >/dev/null 2>&1 ; then
   printf 'phpunit was not installed.  Installing phpunit...\n'
   brew install phpunit
   wait
@@ -103,8 +104,7 @@ fi
 
 
 #install pkg-config (required by openssl-sys) via Homebrew, if needed
-which -s pkg-config
-if [[ $? != 0 ]] ; then
+if ! which -s pkg-config >/dev/null 2>&1 ; then
   printf 'pkg-config was not installed.  Installing pkg-config...\n'
   brew install pkg-config
   wait
@@ -114,8 +114,7 @@ fi
 
 
 #install latest rustup via Homebrew, if needed
-which -s rustup
-if [[ $? != 0 ]] ; then
+if ! which -s rustup >/dev/null 2>&1 ; then
   printf 'rustup was not installed.  Installing rustup...\n'
   brew install rustup
   wait
@@ -127,8 +126,7 @@ fi
 
 
 #install Rust and the Rust Toolchain via rustup - standard installation is recommended (Option 1), if needed
-which -s rustc
-if [[ $? != 0 ]] ; then
+if ! which -s rustc >/dev/null 2>&1 ; then
   printf 'rust was not installed.  Installing rust...\n'
   rustup-init -y
   wait
@@ -140,8 +138,7 @@ fi
 
 
 #repair broken cargo / toolchain, if needed
-cargo -v > /dev/null
-if [[ $? != 0 ]] ; then
+if ! cargo -v > /dev/null 2>&1 ; then
   printf 'cargo was not installed successfully. fixing... \n'
   rustup install stable
   wait

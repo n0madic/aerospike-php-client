@@ -33,5 +33,5 @@ $brp = new BatchReadPolicy();
 $br = BatchRead::ops($brp, $key, $opsGetSize);
 $bw1 = new BatchWrite($bwp, $key, $opsGetSize);
 $recs = $client->batch($bp, [$br]);
-var_dump($recs[0]->record->bins);
+var_dump($recs[0]->getRecord()?->getBins());
 

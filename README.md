@@ -360,7 +360,7 @@ listed continues to work unchanged.
 | `$client->close()`                                         | **unchanged** — closes the pooled connection and evicts it from the per-process cache (optional; cached clients are closed at module shutdown) |
 | `$record->bins`, `$record->generation`, `$record->ttl`     | `$record->getBins()` / `getGeneration()` / `getTtl()` (property access works via `__get`)            |
 | `$record->getTtl()` (remaining TTL in seconds)              | **unchanged** — still returns remaining seconds, same as v1. `getRemainingTtl()` is an equivalent accessor. For the record's expiration state (including "never expires"), use `getExpiration()`. |
-| `MapOp::getByKeys([$k], MapReturnType::value())` → 1 value | now returns a list per key — index with `$result[0]`                                                  |
+| `MapOp::getByKeys($mp, "bin", [$k], MapReturnType::value())` → 1 value | **signature unchanged** — still `getByKeys(MapPolicy $policy, string $bin, array $keys, ?MapReturnType $returnType = null, ?array $ctx = null)`; `$returnType`/`$ctx` are now optional. The *result* changed: it is a list with one entry per requested key, so index with `$result[0]` |
 | `BatchPolicy::setConcurrentNodes($n)`                      | **unchanged** (restored as alias). Use `setConcurrency(Concurrency::Parallel())` for typed control. |
 | `Expression::xor([...])` (integer XOR)                     | **unchanged** (alias for `intXor`). New `Expression::boolXor()` for boolean XOR.                     |
 | `UdfMeta::getLanguage()` → `UdfLanguage`                   | **unchanged** — returns `UdfLanguage::Lua()`                                                          |

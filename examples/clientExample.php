@@ -106,7 +106,8 @@ $rp = new ReadPolicy();
 
 $rp->setMaxRetries(3);
 $timeInMillis = 3000;
-$rp->setTimeout($timeInMillis);
+$rp->setTotalTimeout($timeInMillis);
+$rp->setSocketTimeout($timeInMillis);
 
 for ($x = 0; $x <= 1000; $x++) {
 	$record = $client->get($rp, $key, ["bin1"]);
@@ -146,10 +147,17 @@ $brkey = new Key($namespace, $set, 1);
 $batchRead = new BatchRead($brp, $brkey, []);
 
 $bp = new BatchPolicy();
+// batch() returns an array of BatchRecord — one per submitted operation.
+// Use getRecord() to reach the Record (null when the key was not found).
 $recs = $client->batch($bp, [$batchRead]);
 
-foreach ($recs->getBins() as $rec) {
-	var_dump($rec);
+foreach ($recs as $batchRecord) {
+	$rec = $batchRecord->getRecord();
+	if ($rec === null) {
+		var_dump(null);
+		continue;
+	}
+	var_dump($rec->getBins());
 }
 
 
@@ -177,14 +185,6 @@ var_dump($exists);
 
 ////////////////////////////////////////////////////////////////////////////////
 //
-// client->dropIndex
-//
-////////////////////////////////////////////////////////////////////////////////
-
-$client->dropIndex($wp, "test", "test", "test.test.bin1");
-
-////////////////////////////////////////////////////////////////////////////////
-//
 // $client->createIndex
 //
 ////////////////////////////////////////////////////////////////////////////////
@@ -192,6 +192,20 @@ $client->dropIndex($wp, "test", "test", "test.test.bin1");
 $client->createIndex($wp, "test", "test", "bin1", "test.test.bin1", IndexType::Numeric());
 
 sleep(1);
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// client->dropIndex
+//
+////////////////////////////////////////////////////////////////////////////////
+
+// Dropping an index that does not exist throws IndexNotFound, so guard the call
+// — the index only exists once createIndex() above has been applied.
+try {
+	$client->dropIndex($wp, "test", "test", "test.test.bin1");
+} catch (AerospikeException $e) {
+	echo "dropIndex failed: ", $e->getMessage(), "\n";
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////

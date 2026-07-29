@@ -20,10 +20,10 @@ $bw = new BatchWrite($bwp, $key, $ops);
 // $ops = [MapOp::put($mp, "map", ["mk1" => 1, "mk2" => 2])];
 // $bw = new BatchWrite($bwp, $key, $ops);
 $recs = $client->batch($bp, [$bw]);
-// var_dump($recs[0]->record->bins);
+// var_dump($recs[0]->getRecord()?->getBins());
 
 $brp = new BatchReadPolicy();
 $ops = [MapOp::getByValues($mp, "map", [1, 3], null)];
 $br = BatchRead::ops($brp, $key, $ops);
 $recs = $client->batch($bp, [$br]);
-var_dump($recs[0]->record->bins);
+var_dump($recs[0]->getRecord()?->getBins());

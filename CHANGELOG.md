@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`Replica` policy class**: `Replica::master()`, `Replica::sequence()` (default) and
+  `Replica::preferRack()`, settable on `ReadPolicy` and `BatchPolicy` via
+  `setReplica()`/`getReplica()`. Rack-aware deployments could not select `PreferRack` before.
+- **`RegexFlag` constants** for `Expression::regexCompare()` — `none`, `extended`, `icase`,
+  `nosub`, `newline`, combined with the bitwise OR operator. Previously callers had to pass
+  magic numbers.
+- **`BatchRecord::getResultCode()` and `getInDoubt()`**: per-key batch outcome. Without them
+  a record dropped by a batch filter expression, a missing record and an in-doubt write were
+  all indistinguishable from `getRecord() === null`.
+- **`Privilege::__construct($code, $namespace, $setName)`**: the class had no constructor, so
+  `createRole()`, `grantPrivileges()` and `revokePrivileges()` could not be called at all.
+- **`Json::__construct($value)`** — likewise unconstructible before, and `Json` objects are
+  now accepted anywhere a value is taken.
+- **`MapPolicy::__construct(..., ?MapWriteMode $writeMode)`**: makes the registered but
+  previously unreachable `MapWriteMode` class usable (servers < 4.3).
+- **`UdfMeta::getFilename()`**: the server-side name including `.lua`, which is what
+  `dropUdf()` expects — `getPackageName()` strips the extension.
+- **Policy accessors** the crate supports but PHP could not reach:
+  `sleepBetweenRetries` and `timeoutDelay` on every policy, `maxRecords` and
+  `recordsPerSecond` on `QueryPolicy`, `recordsPerSecond` on `ScanPolicy`.
+- **`Client::serverVersion(?ReadPolicy $policy)`** now honours the caller's timeout instead
+  of pinning the 3s admin default.
+- **`HllPolicy` and `BitwisePolicy` accept an array of flags**, so combinations such as
+  `ALLOW_FOLD | NO_FAIL` are expressible (they take a single flag no longer).
+
 - **`Client::close()` re-introduced**: closes the pooled connection (stopping its connection
   pool and background cluster-tend task) and evicts it from the per-process client cache.
   Optional — cached clients are reused across requests by design and closed automatically at
@@ -27,6 +52,59 @@ All notable changes to this project will be documented in this file.
   client-cache cap and the Tokio runtime thread count without recompiling.
 
 ### Fixed
+
+- **Panics that aborted the PHP worker** instead of raising a catchable exception. Three
+  paths ran outside the panic barrier: building the Tokio runtime (it *panics*, not errors,
+  when the OS refuses a thread under `pids.max`/`RLIMIT_NPROC`), `new Key()` with
+  `Value::infinity()`/`wildcard()` as the user key, and `Filter::equal()`/`range()`/
+  `contains()`/`containsRange()` with a float or bool operand. `aerospike.worker_threads` is
+  now capped, since it fed that thread count unchecked.
+- **Abandoned scans leaked a socket and a background task permanently**: breaking out of a
+  `while ($rs->next())` loop parked the reader tasks forever (the crate's `close()` does not
+  close its channel), and neither `close()` nor module shutdown could reclaim them. The
+  recordset now drains on destruction.
+- **`Recordset::next()` burned a full CPU core** for the duration of a scan — the crate's
+  iterator "yields" via a `block_on(yield_now())` that spins outside a scheduler context.
+  Replaced with a bounded backoff; buffered records now also survive `close()`.
+- **The pagination cursor was extracted while reader tasks were still writing**, truncating
+  it and panicking those tasks; it is now read only after they finish.
+- **`createIndex()` silently ignored `ctx`**, creating a CDT index on the top-level bin, so
+  later queries with a matching `Filter` context returned nothing.
+- **`MapOp::create()` silently dropped `ctx`** when `withIndex` was set, retyping the
+  top-level bin instead; both it and `ListOp::create()` now reject the impossible
+  combination rather than doing something else.
+- **Numeric-string map keys (`"1"`) produced unreachable PHP array entries** — neither
+  `$m["1"]` nor `$m[1]` found them. Same for bin names like `"0"`.
+- **`MapOp::put()`, `Value::map()` and `Expression::mapVal()` rejected valid maps**: an empty
+  array and an array keyed `0..N-1` are both legal Aerospike maps. `mapVal()` also returned
+  PHP `null` on bad input, surfacing as a TypeError far from the cause.
+- **Reading a float32 written by another client panicked** (Go/Java/C write msgpack float32
+  into lists and maps), making such records unreadable — and unrecoverable inside a scan,
+  where the panic fired in a background task.
+- **PHP references inside arrays were rejected** as "unsupported value type", breaking the
+  ordinary `foreach ($data as &$v)` idiom.
+- **Non-UTF-8 strings** now report what is wrong and point at `Value::blob()`.
+- **Index and UDF task waits could hang forever**: `wait_till_complete` polled without a
+  deadline, so `setTotalTimeout()` had no effect on `createIndex`/`dropIndex`/`registerUdf`/
+  `dropUdf`.
+- **`ini_set()` on an `aerospike.*` directive leaked across threads in ZTS builds**; values
+  are per-thread now.
+- **The Tokio runtime outlived `dlclose()`**: MSHUTDOWN now shuts it down, instead of leaving
+  worker threads to return into unmapped code as the worker exits.
+- **`Client::close()` raced a concurrent `connect()`**, which could hand back a PHP client
+  wrapping an already-closed cluster.
+- **The client cache keyed on the raw hosts string**, so `"host"` and `"host:3000"` (or a
+  different ordering) built separate clients with separate tend loops and pools.
+- **A running scan could have its client evicted and closed** — `Recordset` now keeps the
+  client alive.
+- **`ClientPolicy::fingerprint()` is no longer exposed to PHP**: it is an internal cache key,
+  and its value was an unsalted SipHash of the password. The password component is now keyed
+  per-process.
+- **`dropUdf()` accepts what `listUdf()` returns** — a bare module name gets the `.lua`
+  suffix instead of failing with "file not found".
+- **`new PartitionStatus($id)` validates the id** rather than truncating it to 16 bits
+  (65537 silently became partition 1).
+- **`ResultCode::XDR_KEY_BUSY` (32)** was missing, so that code could not be compared against.
 
 - **Fork safety**: the Tokio runtime and the client cache now detect `fork()` (pid change)
   and rebuild themselves in the child process. Previously a connection opened before fork —

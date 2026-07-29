@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::cell::Cell;
 use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::time::Instant;
 
@@ -74,6 +76,14 @@ struct ClientEntry {
 /// of mostly-idle threads across prefork php-fpm workers.
 const TOKIO_WORKER_THREADS_DEFAULT: usize = 2;
 
+/// Upper bound for `aerospike.worker_threads`. Each worker is an OS thread and Tokio
+/// *panics* when the OS refuses to spawn one, so a typo in php.ini must not be able to
+/// abort the process. Far above any useful value for a synchronously driven client.
+const TOKIO_WORKER_THREADS_MAX: usize = 64;
+
+/// Number of partitions in an Aerospike namespace; partition ids run 0..=4095.
+const PARTITIONS_PER_NAMESPACE: u16 = 4096;
+
 /// Default soft cap on cached clients (override via `aerospike.max_cached_clients` INI).
 const MAX_CACHED_CLIENTS_DEFAULT: usize = 8;
 
@@ -96,7 +106,11 @@ static TOKIO_RT_INIT: Mutex<()> = Mutex::new(());
 /// in the parent process. At most one runtime leaks per fork generation.
 ///
 /// Building the runtime can fail (thread/fd exhaustion); the error is returned as a
-/// catchable PHP exception instead of aborting the worker with a panic.
+/// catchable PHP exception instead of aborting the worker with a panic. The build is
+/// additionally wrapped in `catch_panic` because Tokio does not always return an error
+/// on thread-spawn failure: `Spawner::spawn_blocking` panics with "OS can't spawn worker
+/// thread" (tokio runtime/blocking/pool.rs), and that unwind would cross the `extern "C"`
+/// boundary and abort the whole PHP worker.
 fn tokio_rt() -> PhpResult<&'static tokio::runtime::Runtime> {
     let pid = std::process::id();
     if TOKIO_RT_PID.load(Ordering::Acquire) == pid {
@@ -113,17 +127,24 @@ fn tokio_rt() -> PhpResult<&'static tokio::runtime::Runtime> {
     if !TOKIO_RT_PTR.load(Ordering::Acquire).is_null() {
         trace!("pid changed (fork detected): rebuilding Tokio runtime");
     }
-    let worker_threads = ini_long_positive(&INI_WORKER_THREADS)
-        .map_or(TOKIO_WORKER_THREADS_DEFAULT, |v| v as usize);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()
-        .map_err(|e| {
-            PhpException::from_class::<AerospikeException>(format!(
-                "failed to create Tokio runtime: {e}"
-            ))
-        })?;
+    // Capped: `worker_threads` is an OS thread count, and Tokio panics (not errors) when
+    // the OS refuses to spawn one. An absurd INI value must not be able to take the worker
+    // down, so it is clamped instead of trusted.
+    let worker_threads = ini_long_positive(INI_WORKER_THREADS)
+        .map_or(TOKIO_WORKER_THREADS_DEFAULT, |v| {
+            (v as usize).min(TOKIO_WORKER_THREADS_MAX)
+        });
+    let rt = catch_panic(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+    })?
+    .map_err(|e| {
+        PhpException::from_class::<AerospikeException>(format!(
+            "failed to create Tokio runtime: {e}"
+        ))
+    })?;
     let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(rt));
     TOKIO_RT_PTR.store(rt as *const _ as *mut _, Ordering::Release);
     TOKIO_RT_PID.store(pid, Ordering::Release);
@@ -225,7 +246,7 @@ fn release_connect_guard(cache_key: &str) {
 /// Entries still referenced by PHP objects are never evicted, so the cache can
 /// temporarily exceed the cap when more clients than this are in use simultaneously.
 fn max_cached_clients() -> usize {
-    ini_long_positive(&INI_MAX_CACHED_CLIENTS).map_or(MAX_CACHED_CLIENTS_DEFAULT, |v| v as usize)
+    ini_long_positive(INI_MAX_CACHED_CLIENTS).map_or(MAX_CACHED_CLIENTS_DEFAULT, |v| v as usize)
 }
 
 /// Remove idle cache entries in LRU order until the map is below `max_cached_clients()`,
@@ -292,14 +313,51 @@ fn close_client_entries(entries: impl IntoIterator<Item = ClientEntry>) {
     }
 }
 
+/// How long MSHUTDOWN waits for Tokio worker threads to wind down before detaching them.
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Module shutdown hook (MSHUTDOWN). Closes every cached client so connection pools and
-/// background tend tasks stop before the process exits. `clients_lock()` discards (leaks)
-/// entries inherited from a parent process, which cannot be closed safely from here.
-/// When nothing was ever connected the map is empty and no Tokio runtime is built.
+/// background tend tasks stop before the process exits, then shuts the Tokio runtime down.
+/// `clients_lock()` discards (leaks) entries inherited from a parent process, which cannot
+/// be closed safely from here. When nothing was ever connected the map is empty and no
+/// Tokio runtime is built.
+///
+/// Shutting the runtime down matters because PHP `dlclose()`s the extension right after
+/// MSHUTDOWN: a surviving worker thread, blocking-pool thread or tend task waking from its
+/// sleep would return into unmapped code and take the process down with SIGSEGV. Threads
+/// that do not finish within `RUNTIME_SHUTDOWN_TIMEOUT` are detached — the previous
+/// behaviour, but now the exception rather than the rule.
 pub extern "C" fn aerospike_php_shutdown(_ty: c_int, _mod_num: c_int) -> c_int {
     let entries = std::mem::take(&mut clients_lock().map);
     close_client_entries(entries.into_values());
+    if let Some(rt) = take_tokio_rt() {
+        // Panic boundary: this is an `extern "C"` frame (see close_client_entries).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        }));
+    }
     0
+}
+
+/// Reclaims ownership of this process's Tokio runtime, if it has one.
+///
+/// Only ever called from MSHUTDOWN, where no PHP code can still hold the `&'static`
+/// reference handed out by `tokio_rt()`. Runtimes inherited from a parent process (pid
+/// mismatch) are left alone: their worker threads do not exist here, so shutting one down
+/// would block forever joining threads that never run.
+fn take_tokio_rt() -> Option<Box<tokio::runtime::Runtime>> {
+    if TOKIO_RT_PID.load(Ordering::Acquire) != std::process::id() {
+        return None;
+    }
+    TOKIO_RT_PID.store(0, Ordering::Release);
+    let ptr = TOKIO_RT_PTR.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer came from `Box::leak` in `tokio_rt()` and is taken exactly once —
+    // the swap above leaves null behind, and the pid guard is cleared first so no other
+    // caller can observe this pointer as live.
+    Some(unsafe { Box::from_raw(ptr) })
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -335,17 +393,37 @@ const INI_NAME_WORKER_THREADS: &str = "aerospike.worker_threads";
 /// and `ini_long_positive` interprets 0 as "no override".
 const INI_DEFAULT: &str = "0";
 
-static INI_TEND_INTERVAL: AtomicI64 = AtomicI64::new(0);
-static INI_CONNECT_TIMEOUT: AtomicI64 = AtomicI64::new(0);
-static INI_READ_TIMEOUT: AtomicI64 = AtomicI64::new(0);
-static INI_WRITE_TIMEOUT: AtomicI64 = AtomicI64::new(0);
-static INI_MAX_CACHED_CLIENTS: AtomicI64 = AtomicI64::new(0);
-static INI_WORKER_THREADS: AtomicI64 = AtomicI64::new(0);
+/// Index of each directive in `INI_PROCESS` / `INI_THREAD`.
+const INI_TEND_INTERVAL: usize = 0;
+const INI_CONNECT_TIMEOUT: usize = 1;
+const INI_READ_TIMEOUT: usize = 2;
+const INI_WRITE_TIMEOUT: usize = 3;
+const INI_MAX_CACHED_CLIENTS: usize = 4;
+const INI_WORKER_THREADS: usize = 5;
+const INI_COUNT: usize = 6;
+
+/// Last value seen for each directive, process-wide. Written by every `on_modify_long`
+/// call, and read by threads that have not been handed their own copy of the directive.
+static INI_PROCESS: [AtomicI64; INI_COUNT] = [const { AtomicI64::new(0) }; INI_COUNT];
+
+thread_local! {
+    /// Per-thread view of each directive; `None` until this thread sees an `on_modify`.
+    ///
+    /// `PHP_INI_ALL` allows `ini_set()` at runtime, and in a ZTS build (Apache
+    /// worker/event MPM) each request runs on its own thread with its own INI table. A
+    /// process-wide value would let one request's `ini_set('aerospike.write_timeout', 50)`
+    /// silently reconfigure a policy being constructed on another thread, until the first
+    /// request ended and PHP restored the old value. Keeping the value thread-local makes
+    /// the override affect exactly the request that set it. In a non-ZTS build there is one
+    /// request per process, so this behaves exactly as the old global did.
+    static INI_THREAD: [Cell<Option<i64>>; INI_COUNT] = const { [const { Cell::new(None) }; INI_COUNT] };
+}
 
 /// PHP `OnUpdateLong`-style callback. Parses the new value as a signed integer and stores
-/// it into the `AtomicI64` passed through `mh_arg1`. PHP invokes this on module startup
-/// (with the configured INI value or the registered default) and again on every
-/// `ini_set()` for the directive. Returning `0` is SUCCESS; `-1` is FAILURE.
+/// it for the directive whose index is passed through `mh_arg1` (offset by one so index 0
+/// is not confused with a null pointer). PHP invokes this on module startup (with the
+/// configured INI value or the registered default), per-thread in ZTS builds, and again on
+/// every `ini_set()` for the directive. Returning `0` is SUCCESS; `-1` is FAILURE.
 unsafe extern "C" fn on_modify_long(
     _entry: *mut ext_php_rs::ffi::zend_ini_entry,
     new_value: *mut ext_php_rs::ffi::zend_string,
@@ -356,6 +434,10 @@ unsafe extern "C" fn on_modify_long(
 ) -> c_int {
     if new_value.is_null() || mh_arg1.is_null() {
         return 0;
+    }
+    let idx = mh_arg1 as usize - 1;
+    if idx >= INI_COUNT {
+        return -1;
     }
     let parsed: i64 = unsafe {
         let zs = &*new_value;
@@ -369,21 +451,22 @@ unsafe extern "C" fn on_modify_long(
             Err(_) => return -1,
         }
     };
-    unsafe {
-        let cell = &*(mh_arg1 as *const AtomicI64);
-        cell.store(parsed, Ordering::Relaxed);
-    }
+    INI_PROCESS[idx].store(parsed, Ordering::Relaxed);
+    // The thread-local table may already be torn down if PHP updates an INI entry during
+    // thread shutdown; the process-wide copy above is enough in that case.
+    let _ = INI_THREAD.try_with(|vals| vals[idx].set(Some(parsed)));
     0
 }
 
-fn ini_entry_for(name: &str, atomic: &'static AtomicI64) -> ext_php_rs::zend::IniEntryDef {
+fn ini_entry_for(name: &str, idx: usize) -> ext_php_rs::zend::IniEntryDef {
     let mut entry = ext_php_rs::zend::IniEntryDef::new(
         name.to_string(),
         INI_DEFAULT.to_string(),
         &ext_php_rs::flags::IniEntryPermission::All,
     );
     entry.on_modify = Some(on_modify_long);
-    entry.mh_arg1 = atomic as *const AtomicI64 as *mut c_void;
+    // +1 so directive 0 is distinguishable from a null `mh_arg1`.
+    entry.mh_arg1 = (idx + 1) as *mut c_void;
     entry
 }
 
@@ -393,12 +476,12 @@ fn ini_entry_for(name: &str, atomic: &'static AtomicI64) -> ext_php_rs::zend::In
 /// `on_modify_long` to populate the atomics from the configured value.
 pub extern "C" fn aerospike_php_startup(_ty: c_int, mod_num: c_int) -> c_int {
     let entries = vec![
-        ini_entry_for(INI_NAME_TEND_INTERVAL, &INI_TEND_INTERVAL),
-        ini_entry_for(INI_NAME_CONNECT_TIMEOUT, &INI_CONNECT_TIMEOUT),
-        ini_entry_for(INI_NAME_READ_TIMEOUT, &INI_READ_TIMEOUT),
-        ini_entry_for(INI_NAME_WRITE_TIMEOUT, &INI_WRITE_TIMEOUT),
-        ini_entry_for(INI_NAME_MAX_CACHED_CLIENTS, &INI_MAX_CACHED_CLIENTS),
-        ini_entry_for(INI_NAME_WORKER_THREADS, &INI_WORKER_THREADS),
+        ini_entry_for(INI_NAME_TEND_INTERVAL, INI_TEND_INTERVAL),
+        ini_entry_for(INI_NAME_CONNECT_TIMEOUT, INI_CONNECT_TIMEOUT),
+        ini_entry_for(INI_NAME_READ_TIMEOUT, INI_READ_TIMEOUT),
+        ini_entry_for(INI_NAME_WRITE_TIMEOUT, INI_WRITE_TIMEOUT),
+        ini_entry_for(INI_NAME_MAX_CACHED_CLIENTS, INI_MAX_CACHED_CLIENTS),
+        ini_entry_for(INI_NAME_WORKER_THREADS, INI_WORKER_THREADS),
     ];
     ext_php_rs::zend::IniEntryDef::register(entries, mod_num);
     0
@@ -409,8 +492,14 @@ pub extern "C" fn aerospike_php_startup(_ty: c_int, mod_num: c_int) -> c_int {
 /// underlying library default". Values that overflow u32 are also treated as no override
 /// rather than silently truncating; the user gets the upstream default and can detect
 /// the mistake via the explicit setter (`setTendInterval(u32::MAX + 1)` throws).
-fn ini_long_positive(atomic: &AtomicI64) -> Option<u32> {
-    let v = atomic.load(Ordering::Relaxed);
+fn ini_long_positive(idx: usize) -> Option<u32> {
+    // Prefer this thread's value (see INI_THREAD); fall back to the last process-wide one
+    // for threads PHP has not run `on_modify` on yet.
+    let v = INI_THREAD
+        .try_with(|vals| vals[idx].get())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| INI_PROCESS[idx].load(Ordering::Relaxed));
     if v > 0 && v <= u32::MAX as i64 {
         Some(v as u32)
     } else {
@@ -842,6 +931,9 @@ impl Expression {
     }
 
     /// Create function like regular expression string operation.
+    ///
+    /// `flags` is a bitmask of `RegexFlag` constants, e.g.
+    /// `RegexFlag::icase() | RegexFlag::newline()`.
     pub fn regex_compare(regex: String, flags: i64, bin: &Expression) -> Self {
         Expression {
             _as: aero::expressions::regex_compare(regex, flags, bin._as.clone()),
@@ -897,17 +989,25 @@ impl Expression {
         }
     }
 
-    /// Create Map bin value. Returns `None` if `val` is not a PHP associative array (HashMap/Json).
-    pub fn map_val(val: PHPValue) -> Option<Self> {
-        let m: HashMap<aero::Value, aero::Value> = match val {
-            PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            PHPValue::Json(h) => h
-                .into_iter()
-                .map(|(k, v)| (aero::Value::String(k), v.into()))
-                .collect(),
-            _ => return None,
-        };
-        Some(Expression {
+    /// Create Map bin value from any PHP array; a list is treated as a map keyed 0..N-1.
+    ///
+    /// Throws an AerospikeException if `val` is not an array. It used to return PHP `null`,
+    /// which surfaced far from the cause as a TypeError inside whatever comparison consumed
+    /// the expression.
+    pub fn map_val(val: &Zval) -> PhpResult<Self> {
+        let m: HashMap<aero::Value, aero::Value> =
+            match php_array_as_map(val, "Expression::mapVal")? {
+                PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+                _ => {
+                    return throw_msg(
+                        "Expression::mapVal requires an array",
+                        Expression {
+                            _as: aero::expressions::nil(),
+                        },
+                    )
+                }
+            };
+        Ok(Expression {
             _as: aero::expressions::map_val(m),
         })
     }
@@ -1280,6 +1380,105 @@ impl_from_zval_wrapper!(clone ReadModeAP);
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 //
+//  RegexFlag
+//
+////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Flags for `Expression::regexCompare`, matching the POSIX `regcomp` flags the server
+/// uses. Combine them with the bitwise OR operator:
+/// `RegexFlag::icase() | RegexFlag::newline()`.
+///
+/// Values mirror `aero::expressions::regex_flag::RegexFlag`; they are returned as plain
+/// integers because `regexCompare` takes an int bitmask.
+#[php_class]
+#[php(name = "Aerospike\\RegexFlag")]
+pub struct RegexFlag;
+
+#[php_impl]
+impl RegexFlag {
+    /// Use regex defaults.
+    pub fn None() -> i64 {
+        aero::expressions::regex_flag::RegexFlag::NONE as i64
+    }
+
+    /// Use POSIX Extended Regular Expression syntax when interpreting the regex.
+    pub fn Extended() -> i64 {
+        aero::expressions::regex_flag::RegexFlag::EXTENDED as i64
+    }
+
+    /// Do not differentiate case.
+    pub fn Icase() -> i64 {
+        aero::expressions::regex_flag::RegexFlag::ICASE as i64
+    }
+
+    /// Do not report the position of matches.
+    pub fn Nosub() -> i64 {
+        aero::expressions::regex_flag::RegexFlag::NOSUB as i64
+    }
+
+    /// Match-any-character operators do not match a newline.
+    pub fn Newline() -> i64 {
+        aero::expressions::regex_flag::RegexFlag::NEWLINE as i64
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////
+//
+//  Replica
+//
+////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Replica determines which node a single-record or batch command targets.
+///
+/// Only single-record and batch commands honour this — scans and queries always visit every
+/// node. `PreferRack` additionally requires `ClientPolicy::setRackIds()` and matching server
+/// rack configuration; without them it behaves like `Sequence`.
+#[php_class]
+#[php(name = "Aerospike\\Replica")]
+#[derive(Clone, Copy)]
+pub struct Replica {
+    _as: aero::policy::Replica,
+}
+
+#[php_impl]
+impl Replica {
+    /// Always use the node holding the key's master partition.
+    pub fn Master() -> Self {
+        Replica {
+            _as: aero::policy::Replica::Master,
+        }
+    }
+
+    /// Try the master partition's node first, then nodes holding replicated partitions.
+    /// This is the default.
+    pub fn Sequence() -> Self {
+        Replica {
+            _as: aero::policy::Replica::Sequence,
+        }
+    }
+
+    /// Prefer a node on the client's own rack, falling back to `Sequence` when the rack has
+    /// no suitable node.
+    pub fn PreferRack() -> Self {
+        Replica {
+            _as: aero::policy::Replica::PreferRack,
+        }
+    }
+
+    /// Returns the name of this replica algorithm ("master", "sequence", "prefer-rack").
+    pub fn get_name(&self) -> String {
+        match self._as {
+            aero::policy::Replica::Master => "master".into(),
+            aero::policy::Replica::Sequence => "sequence".into(),
+            aero::policy::Replica::PreferRack => "prefer-rack".into(),
+        }
+    }
+}
+
+impl_from_zval_wrapper!(Replica);
+
+////////////////////////////////////////////////////////////////////////////////////////////
+//
 //  ReadModeSC
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -1287,9 +1486,10 @@ impl_from_zval_wrapper!(clone ReadModeAP);
 /// ReadModeSC is the read policy in SC (strong consistency) mode namespaces.
 /// Determines SC read consistency options.
 ///
-/// NOTE: aerospike-client-rust v2 does not yet model SC read modes separately; the
-/// chosen value is stored on the policy for forward compatibility but currently has
-/// no runtime effect.
+/// NOTE: aerospike-client-rust v2 does not model SC read modes at all — the wire encoding
+/// for them is commented out upstream (`commands/batch_attr.rs`). No policy accepts a value
+/// of this type, so the class exists only as a named set of constants for forward
+/// compatibility; constructing one has no effect on any command.
 #[php_class]
 #[php(name = "Aerospike\\ReadModeSC")]
 #[derive(Clone, Copy)]
@@ -1719,15 +1919,12 @@ impl Concurrency {
         }
     }
 
-    /// Issue up to N commands in parallel threads. When a request completes, a new request
-    /// will be issued until all threads are complete. This mode prevents too many parallel threads
-    /// being created for large cluster implementations. The downside is extra threads will still
-    /// need to be created (or taken from a thread pool).
+    /// v1 compatibility: requests up to N parallel commands.
     ///
-    /// E.g. if there are 16 nodes/namespace combinations requested and concurrency is set to
-    /// `MaxThreads(8)`, then batch requests will be made for 8 node/namespace combinations in
-    /// parallel threads. When a request completes, a new request will be issued until all 16
-    /// requests are complete.
+    /// NOTE: aerospike-client-rust v2 dropped the per-thread limit — its `Concurrency` enum
+    /// has only `Sequential` and `Parallel` — so any N greater than 1 is applied as
+    /// `Parallel()` and `BatchPolicy::getConcurrency()` reports `Parallel()` back. The count
+    /// is not preserved. Prefer `Concurrency::parallel()` in new code.
     pub fn Max_Threads(threads: u32) -> Self {
         Concurrency {
             v: _Concurrency::MaxThreads(threads),
@@ -2033,6 +2230,28 @@ macro_rules! php_policy_impl {
                 self._as.base_policy.consistency_level = read_mode_ap._as;
             }
 
+            /// SleepBetweenRetries is the milliseconds to sleep between retries when a command
+            /// fails and the timeout has not been exceeded. 0 skips the sleep entirely.
+            pub fn get_sleep_between_retries(&self) -> u64 {
+                u64::from(self._as.base_policy.sleep_between_retries)
+            }
+            pub fn set_sleep_between_retries(&mut self, sleep_millis: u64) -> PhpResult<()> {
+                self._as.base_policy.sleep_between_retries = millis_u64_to_u32(sleep_millis)?;
+                Ok(())
+            }
+
+            /// TimeoutDelay is the milliseconds spent draining a socket after a read timeout
+            /// before giving up and closing it. Draining lets the connection return to the pool
+            /// instead of being torn down with an RST, which some cloud networks penalize.
+            /// 0 (the default) closes the connection immediately.
+            pub fn get_timeout_delay(&self) -> u64 {
+                u64::from(self._as.base_policy.timeout_delay)
+            }
+            pub fn set_timeout_delay(&mut self, delay_millis: u64) -> PhpResult<()> {
+                self._as.base_policy.timeout_delay = millis_u64_to_u32(delay_millis)?;
+                Ok(())
+            }
+
             /// FilterExpression is the optional Filter Expression. Supported on Server v5.2+
             pub fn get_filter_expression(&self) -> Option<Expression> {
                 self.$($filter_holder).+
@@ -2050,7 +2269,7 @@ macro_rules! php_policy_impl {
 php_policy_impl!(ReadPolicy, filter_in: _as.base_policy, {
     pub fn __construct() -> Self {
         let mut p = ReadPolicy::default();
-        if let Some(v) = ini_long_positive(&INI_READ_TIMEOUT) {
+        if let Some(v) = ini_long_positive(INI_READ_TIMEOUT) {
             p._as.base_policy.total_timeout = v;
         }
         p
@@ -2068,6 +2287,17 @@ php_policy_impl!(ReadPolicy, filter_in: _as.base_policy, {
     pub fn set_read_touch_ttl_percent(&mut self, percent: i32) -> PhpResult<()> {
         self._as.base_policy.read_touch_ttl = read_touch_ttl_from_percent(percent)?;
         Ok(())
+    }
+
+    /// Replica algorithm used to pick the target node for a read. Defaults to
+    /// `Replica::sequence()`; use `Replica::preferRack()` on a rack-aware deployment.
+    pub fn get_replica(&self) -> Replica {
+        Replica {
+            _as: self._as.replica,
+        }
+    }
+    pub fn set_replica(&mut self, replica: Replica) {
+        self._as.replica = replica._as;
     }
 });
 
@@ -2161,7 +2391,7 @@ pub struct WritePolicy {
 php_policy_impl!(WritePolicy, filter_in: _as.base_policy, {
     pub fn __construct() -> Self {
         let mut p = WritePolicy::default();
-        if let Some(v) = ini_long_positive(&INI_WRITE_TIMEOUT) {
+        if let Some(v) = ini_long_positive(INI_WRITE_TIMEOUT) {
             p._as.base_policy.total_timeout = v;
         }
         p
@@ -2287,6 +2517,24 @@ php_policy_impl!(QueryPolicy, filter_in: _as.base_policy, {
     pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
         self._as.record_queue_size = record_queue_size as usize;
     }
+
+    /// Number of records to return, divided across the nodes involved in the query
+    /// (0 = no limit). Server v4.9+. This is what bounds a page when paginating a query
+    /// with a `PartitionFilter`.
+    pub fn get_max_records(&self) -> u64 {
+        self._as.max_records
+    }
+    pub fn set_max_records(&mut self, max_records: u64) {
+        self._as.max_records = max_records;
+    }
+
+    /// Per-node limit on returned records per second (0 = unlimited). Server v6.0+.
+    pub fn get_records_per_second(&self) -> u32 {
+        self._as.records_per_second
+    }
+    pub fn set_records_per_second(&mut self, records_per_second: u32) {
+        self._as.records_per_second = records_per_second;
+    }
 });
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -2334,6 +2582,15 @@ php_policy_impl!(ScanPolicy, filter_in: _as.base_policy, {
     }
     pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
         self._as.record_queue_size = record_queue_size as usize;
+    }
+
+    /// Per-node limit on returned records per second (0 = unlimited). Server v6.0+.
+    /// Throttles a background scan so it does not saturate the cluster.
+    pub fn get_records_per_second(&self) -> u32 {
+        self._as.records_per_second
+    }
+    pub fn set_records_per_second(&mut self, records_per_second: u32) {
+        self._as.records_per_second = records_per_second;
     }
 });
 
@@ -2553,15 +2810,63 @@ fn filter_with_ctx(f: aero::query::Filter, ctx: Option<Vec<&CDTContext>>) -> aer
     }
 }
 
+/// Converts a PHP filter operand, rejecting types a secondary index cannot hold.
+///
+/// `EqFilterValue`/`RangeFilterValue` for `aero::Value` `assert!` that the particle type is
+/// INTEGER, STRING or BLOB, and `particle_type()` is itself `unreachable!()` for
+/// Infinity/Wildcard. Both are reachable from PHP (`Filter::equal("bin", 3.14)`,
+/// `Filter::equal("bin", Value::infinity())`), and a panic there would cross the
+/// `extern "C"` boundary and abort the worker — so the check happens here, with a message
+/// naming the offending argument.
+fn filter_value(value: PHPValue, arg: &str) -> PhpResult<aero::Value> {
+    let v: aero::Value = value.into();
+    match v {
+        aero::Value::Int(_) | aero::Value::String(_) | aero::Value::Blob(_) => Ok(v),
+        other => throw_msg(
+            &format!(
+                "Filter argument `{arg}` must be an integer, string or blob, got {}",
+                aero_value_type_name(&other)
+            ),
+            aero::Value::Nil,
+        ),
+    }
+}
+
+/// Human-readable name of an `aero::Value` variant for error messages. Deliberately does
+/// not use `as_string()`: that would echo the value itself (possibly large or sensitive)
+/// and panics on nothing, but says nothing about the type.
+fn aero_value_type_name(v: &aero::Value) -> &'static str {
+    match v {
+        aero::Value::Nil => "null",
+        aero::Value::Bool(_) => "bool",
+        aero::Value::Int(_) => "int",
+        aero::Value::Float(_) => "float",
+        aero::Value::String(_) => "string",
+        aero::Value::Blob(_) => "blob",
+        aero::Value::List(_) | aero::Value::MultiResult(_) => "list",
+        aero::Value::HashMap(_) | aero::Value::OrderedMap(_) | aero::Value::KeyValueList(_) => {
+            "map"
+        }
+        aero::Value::GeoJSON(_) => "GeoJSON",
+        aero::Value::HLL(_) => "HLL",
+        aero::Value::Infinity => "Infinity",
+        aero::Value::Wildcard => "Wildcard",
+    }
+}
+
 #[php_impl]
 impl Filter {
     /// Creates an equality filter for queries. Value can be an integer, string, or blob.
     /// Byte arrays are only supported on server v7+.
-    pub fn equal(bin_name: &str, value: PHPValue, ctx: Option<Vec<&CDTContext>>) -> Self {
-        let v: aero::Value = value.into();
-        Filter {
+    pub fn equal(
+        bin_name: &str,
+        value: PHPValue,
+        ctx: Option<Vec<&CDTContext>>,
+    ) -> PhpResult<Self> {
+        let v = filter_value(value, "value")?;
+        Ok(Filter {
             _as: filter_with_ctx(aero::query::Filter::equal(bin_name, v), ctx),
-        }
+        })
     }
 
     /// Creates a range filter for queries. Only integer ranges are supported.
@@ -2570,12 +2875,12 @@ impl Filter {
         begin: PHPValue,
         end: PHPValue,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Self {
-        let b: aero::Value = begin.into();
-        let e: aero::Value = end.into();
-        Filter {
+    ) -> PhpResult<Self> {
+        let b = filter_value(begin, "begin")?;
+        let e = filter_value(end, "end")?;
+        Ok(Filter {
             _as: filter_with_ctx(aero::query::Filter::range(bin_name, b, e), ctx),
-        }
+        })
     }
 
     /// Creates a contains filter for queries on a collection index.
@@ -2584,16 +2889,16 @@ impl Filter {
         value: PHPValue,
         cit: Option<&IndexCollectionType>,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Self {
+    ) -> PhpResult<Self> {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        let v: aero::Value = value.into();
-        Filter {
+        let v = filter_value(value, "value")?;
+        Ok(Filter {
             _as: filter_with_ctx(
                 aero::query::Filter::contains(bin_name, v, cit._as.clone()),
                 ctx,
             ),
-        }
+        })
     }
 
     /// Creates a contains-range filter for queries on a collection index. Only integer values
@@ -2604,17 +2909,17 @@ impl Filter {
         end: PHPValue,
         cit: Option<&IndexCollectionType>,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Self {
+    ) -> PhpResult<Self> {
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        let b: aero::Value = begin.into();
-        let e: aero::Value = end.into();
-        Filter {
+        let b = filter_value(begin, "begin")?;
+        let e = filter_value(end, "end")?;
+        Ok(Filter {
             _as: filter_with_ctx(
                 aero::query::Filter::contains_range(bin_name, b, e, cit._as.clone()),
                 ctx,
             ),
-        }
+        })
     }
 
     /// Creates a geospatial "within region" filter for query. Argument must be a valid GeoJSON region.
@@ -2787,17 +3092,27 @@ pub struct PartitionStatus {
 
 #[php_impl]
 impl PartitionStatus {
-    pub fn __construct(id: u32) -> Self {
-        PartitionStatus {
+    /// Builds a partition status for partition `id`.
+    ///
+    /// Throws an AerospikeException for an id outside 0..=4095: the field is a `u16`
+    /// upstream, so an unchecked cast silently turned 65537 into partition 1.
+    pub fn __construct(id: u32) -> PhpResult<Self> {
+        let id = u16::try_from(id).ok().filter(|v| *v < PARTITIONS_PER_NAMESPACE);
+        let Some(id) = id else {
+            return Err(PhpException::from_class::<AerospikeException>(
+                "PartitionStatus: partition id must be in 0..=4095".into(),
+            ));
+        };
+        Ok(PartitionStatus {
             _as: aero::query::PartitionStatus {
                 bval: None,
-                id: id as u16,
+                id,
                 retry: true,
                 digest: None,
                 node: None,
                 sequence: None,
             },
-        }
+        })
     }
 
     /// Record's bval.
@@ -2924,6 +3239,97 @@ pub struct Recordset {
     /// only yields its filter once (it extracts from an internal tracker), so subsequent
     /// `next()` calls returning `None` would otherwise overwrite the filter with `None`.
     pf_synced: bool,
+    /// Keeps the client that produced this stream alive. Without it the cache's idle test
+    /// (`Arc::strong_count == 1`) considers the client unused as soon as the PHP `$client`
+    /// goes out of scope — `$rs = Client::connect(...)->scan(...)` — and a later connect
+    /// could evict and close the cluster out from under a running scan.
+    _client: Option<Arc<aero::Client>>,
+}
+
+/// Deadline for the abandoned-recordset drain in `Drop`. Bounded so destroying a PHP
+/// object can never hang a request indefinitely; on expiry we give up and leak, which is
+/// strictly better than blocking the worker forever.
+const RECORDSET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `sync_partition_filter_back` waits for the recordset's tracker lock before
+/// concluding a reader task is parked holding it. Short: this runs on the request path,
+/// and the fallback (drain, skip the cursor update) is cheap and safe.
+const RECORDSET_CURSOR_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Backoff bounds used while waiting on the recordset queue.
+///
+/// The upstream `Iterator for &aero::Recordset` calls `block_on(yield_now())` between
+/// `try_recv` attempts. Outside a scheduler context — which is where we are, since
+/// `rt.enter()` installs a runtime *handle* but not a scheduler — `yield_now` immediately
+/// wakes its own waker, so `block_on` re-polls at once and the "yield" degenerates into a
+/// spin that burns a full core for the entire scan. We poll ourselves instead, sleeping
+/// between attempts: the first records usually arrive within microseconds, so start small
+/// and back off to keep an idle stall cheap.
+const RECORDSET_POLL_MIN: std::time::Duration = std::time::Duration::from_micros(50);
+const RECORDSET_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Sleeps for `backoff`, then doubles it up to `RECORDSET_POLL_MAX`.
+fn recordset_backoff(backoff: &mut std::time::Duration) {
+    std::thread::sleep(*backoff);
+    *backoff = (*backoff * 2).min(RECORDSET_POLL_MAX);
+}
+
+/// Drains a recordset's queue in the background until every reader task has finished.
+///
+/// Reader tasks block in `push().await` on a bounded queue *while holding the recordset's
+/// tracker lock*, and they never check `is_active()`. So a queue nobody reads parks them
+/// permanently: they keep a pooled connection (with unread data still in the socket) and
+/// they keep the tracker lock, which in turn hangs anything that needs the partition
+/// cursor. Reading the queue out is the only way to let them finish.
+///
+/// This runs as a Tokio task rather than on the PHP thread. Draining can take as long as
+/// the rest of the scan, and a script that abandons recordsets in a loop (paginating with
+/// `maxRecords(1)`, say) would otherwise pay that cost on every destructor.
+///
+/// The `Arc` is moved into the task, so `strong_count == 1` inside it means every reader
+/// has gone. `RECORDSET_DRAIN_TIMEOUT` keeps the task from becoming immortal if a node
+/// stops responding; giving up leaks exactly what the old code always leaked.
+fn drain_recordset(rs: Arc<aero::Recordset>) {
+    let Ok(rt) = tokio_rt() else { return };
+    if Arc::strong_count(&rs) == 1 {
+        return;
+    }
+    rt.spawn(async move {
+        let deadline = Instant::now() + RECORDSET_DRAIN_TIMEOUT;
+        while Arc::strong_count(&rs) > 1 {
+            if Instant::now() >= deadline {
+                trace!("recordset drain timed out; reader tasks may still hold connections");
+                return;
+            }
+            if rs.next_record().is_some() {
+                continue;
+            }
+            // Nothing buffered yet: the readers are either finishing their current
+            // partition or waiting on the socket.
+            tokio::time::sleep(RECORDSET_POLL_MAX).await;
+        }
+    });
+}
+
+impl Drop for Recordset {
+    /// Releases the connections held by an abandoned scan/query.
+    ///
+    /// `aero::Recordset::close()` only flips an `active` flag — its channel is never closed
+    /// (an upstream TODO), and the node-reader tasks block in `push().await` on a bounded
+    /// queue without ever checking `is_active()`. A recordset dropped mid-stream (the usual
+    /// `break` out of a `while ($rs->next())` loop) therefore parks those tasks forever,
+    /// each holding a `PooledConnection` that never returns to the pool — neither
+    /// `Client::close()` nor module shutdown can reclaim it. In a long-lived worker this
+    /// leaks a socket per abandoned scan until the process runs out of file descriptors.
+    ///
+    /// So: close first (that stops the outer loop from starting further partitions), then
+    /// hand the queue to `drain_recordset`, which finishes the job on a background task so
+    /// destroying the object stays free for the caller.
+    fn drop(&mut self) {
+        let Some(rs) = self._as.take() else { return };
+        rs.close();
+        drain_recordset(rs);
+    }
 }
 
 #[php_impl]
@@ -2959,18 +3365,32 @@ impl Recordset {
     /// indefinitely. Set a non-zero `total_timeout` (or the `aerospike.read_timeout` INI)
     /// for streaming reads in production.
     ///
-    /// Uses the canonical `Iterator for &aero::Recordset` implementation which yields the
-    /// tokio scheduler between checks via `futures::executor::block_on(yield_now())` —
-    /// no 1ms `thread::sleep` busy-wait. On end-of-stream the cursor inside the originating
-    /// `PartitionFilter` is updated so paginated scans resume from the last digest.
+    /// Polls the queue with a bounded backoff (see `RECORDSET_POLL_MIN`) rather than using
+    /// the upstream `Iterator for &aero::Recordset`, whose `yield_now` degenerates into a
+    /// full-core spin outside a scheduler context. On end-of-stream the cursor inside the
+    /// originating `PartitionFilter` is updated so paginated scans resume from the last
+    /// digest.
     pub fn next(&mut self) -> PhpResult<Option<Record>> {
         let Some(rs) = self._as.clone() else {
             return Ok(None);
         };
-        // `Iterator for &Recordset` requires a mutable reference to the `&Recordset` itself.
-        let recordset: &aero::Recordset = &rs;
-        let mut iter: &aero::Recordset = recordset;
-        match rt_call(|| Iterator::next(&mut iter))? {
+        let next = rt_call(|| {
+            let mut backoff = RECORDSET_POLL_MIN;
+            loop {
+                if let Some(rec) = rs.next_record() {
+                    return Some(rec);
+                }
+                if !rs.is_active() {
+                    // Re-check after observing the flag: a reader task may have queued a
+                    // record between the `try_recv` above and the flag load. Returning
+                    // `None` while records are still buffered would lose them and move the
+                    // pagination cursor past records the caller never saw.
+                    return rs.next_record();
+                }
+                recordset_backoff(&mut backoff);
+            }
+        })?;
+        match next {
             Some(Ok(r)) => Ok(Some(Record { _as: r })),
             Some(Err(e)) => throw_aero_error(&e, None),
             None => {
@@ -2983,31 +3403,44 @@ impl Recordset {
 
 impl Recordset {
     /// Copy the post-scan partition cursor from the underlying `aero::Recordset` into the
-    /// originating PHP `PartitionFilter` wrapper. Runs once per recordset, on the first
-    /// end-of-stream that syncs successfully.
+    /// originating PHP `PartitionFilter` wrapper.
+    ///
+    /// Attempted on every end-of-stream; the flag is set only once the cursor has actually
+    /// been written back, so a `next()` that failed (or found the tracker still busy) is
+    /// retried instead of silently leaving the filter on the previous page.
     fn sync_partition_filter_back(&mut self) -> PhpResult<()> {
         if self.pf_synced {
             return Ok(());
         }
-        let Some(pf_arc) = self.partition_filter.as_ref() else {
+        let (Some(pf_arc), Some(rs)) = (self.partition_filter.as_ref(), self._as.as_ref()) else {
+            // Nothing to sync into (plain scan without a PartitionFilter, or a sentinel):
+            // there is no cursor to lose, so this is terminal rather than retryable.
             self.pf_synced = true;
             return Ok(());
         };
-        let Some(rs) = self._as.as_ref() else {
-            self.pf_synced = true;
+        // `partition_filter()` takes the recordset's tracker lock — and a reader task holds
+        // that same lock across `push().await` (aerospike-core stream_command.rs). After a
+        // `close()` mid-stream nobody drains the queue, so that task parks holding the lock
+        // and an unbounded wait here hangs the PHP worker forever. Bound the wait; if it
+        // expires, drain the queue to unpark the readers and give up on the cursor rather
+        // than moving it past records the caller never received.
+        let updated = rt_block_on(async {
+            tokio::time::timeout(RECORDSET_CURSOR_TIMEOUT, rs.partition_filter()).await
+        })?;
+        let Ok(updated) = updated else {
+            trace!("partition cursor unavailable (readers still busy); leaving filter unchanged");
+            drain_recordset(rs.clone());
             return Ok(());
         };
         // Errors must surface: silently dropping one leaves the PHP `PartitionFilter`
         // holding the pre-scan cursor, so the next page of a paginated scan would silently
-        // re-read the same range. `pf_synced` is only set on success, so a retried
-        // end-of-stream can still sync.
-        let updated = rt_block_on(rs.partition_filter())?;
+        // re-read the same range.
         if let Some(new_pf) = updated {
             if let Ok(mut guard) = pf_arc.lock() {
                 *guard = new_pf;
+                self.pf_synced = true;
             }
         }
-        self.pf_synced = true;
         Ok(())
     }
 }
@@ -3207,6 +3640,17 @@ php_policy_impl!(BatchPolicy, filter_in: _as, {
         self._as.respond_all_keys = respond_all_keys;
     }
 
+    /// Replica algorithm used to pick the target node for each batch sub-command. Defaults
+    /// to `Replica::sequence()`; use `Replica::preferRack()` on a rack-aware deployment.
+    pub fn get_replica(&self) -> Replica {
+        Replica {
+            _as: self._as.replica,
+        }
+    }
+    pub fn set_replica(&mut self, replica: Replica) {
+        self._as.replica = replica._as;
+    }
+
     /// v1 compatibility: set concurrency by node count. aerospike-rust 2.x dropped the
     /// per-thread limit, so values map to `Sequential` (n ≤ 1) or `Parallel` (n > 1).
     /// For explicit control over the typed enum, use `setConcurrency()`.
@@ -3243,6 +3687,11 @@ php_policy_impl!(BatchPolicy, filter_in: _as, {
 });
 
 impl Default for BatchPolicy {
+    /// NOTE: `concurrency` deliberately defaults to `Sequential`, where `aero::BatchPolicy`
+    /// defaults to `Parallel`. This preserves the v1 default (`concurrent_nodes = 1`).
+    /// Consequences worth knowing: batches are issued one node at a time, and a
+    /// node-specific error aborts the remaining sub-requests rather than being reported
+    /// per key. Call `setConcurrency(Concurrency::parallel())` on a multi-node cluster.
     fn default() -> Self {
         BatchPolicy {
             _as: aero::BatchPolicy {
@@ -3608,6 +4057,24 @@ impl BatchRecord {
     pub fn get_record(&self) -> Option<Record> {
         self._as.record.clone().map(|r| Record { _as: r })
     }
+
+    /// Per-key result code for this batch entry, or `null` when the server returned none.
+    ///
+    /// `batch()` succeeds as a whole even when individual keys fail, so this is the only way
+    /// to tell a successful write from one the server rejected. Compare against
+    /// `ResultCode`: `ResultCode::KEY_NOT_FOUND_ERROR` for a missing record and
+    /// `ResultCode::FILTERED_OUT` for a record dropped by a batch filter expression — both
+    /// of which otherwise look identical to a plain `getRecord() === null`.
+    pub fn get_result_code(&self) -> Option<i32> {
+        self._as.result_code.map(aero_result_code_to_i32)
+    }
+
+    /// True when a write for this key may have been applied despite the reported error —
+    /// typically a timeout that fired after the command reached the server. Retrying such a
+    /// write is not safe unless the operation is idempotent.
+    pub fn get_in_doubt(&self) -> bool {
+        self._as.in_doubt
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -3818,6 +4285,9 @@ impl From<UdfLanguage> for i32 {
 #[derive(Debug, PartialEq, Clone)]
 pub struct UdfMeta {
     pub package_name: String,
+    /// Server-side file name including its extension, e.g. "udf1.lua". This — not
+    /// `package_name` — is what `registerUdf()` and `dropUdf()` take.
+    pub filename: String,
     pub hash: String,
     /// Language string, e.g. "lua".
     pub language: String,
@@ -3831,6 +4301,7 @@ impl UdfMeta {
         let mut zv = Zval::new();
         match name {
             "packageName" | "package_name" => zv.set_string(&self.get_package_name(), false)?,
+            "filename" | "fileName" => zv.set_string(&self.get_filename(), false)?,
             "hash" => zv.set_string(&self.get_hash(), false)?,
             "language" => {
                 let lang = self.get_language();
@@ -3842,9 +4313,16 @@ impl UdfMeta {
         Ok(zv)
     }
 
-    /// Getter method to retrieve the package name of the UDF.
+    /// Getter method to retrieve the package name of the UDF (file name without its
+    /// extension). Pass `getFilename()` — not this — to `dropUdf()`.
     pub fn get_package_name(&self) -> String {
         self.package_name.clone()
+    }
+
+    /// Getter method to retrieve the server-side file name of the UDF, e.g. "udf1.lua".
+    /// This is the identifier `registerUdf()` and `dropUdf()` operate on.
+    pub fn get_filename(&self) -> String {
+        self.filename.clone()
     }
 
     /// Getter method to retrieve the hash of the UDF.
@@ -4045,6 +4523,28 @@ pub struct Privilege {
 
 #[php_impl]
 impl Privilege {
+    /// Builds a privilege from a privilege code and an optional namespace/set scope.
+    ///
+    /// `code` is one of the strings returned by the static helpers on this class
+    /// (`Privilege::read()`, `Privilege::readWrite()`, …). `namespace` and `set_name` are
+    /// optional: an unscoped privilege applies to every namespace, and a namespace-scoped
+    /// one to every set within it. Only data-level codes (read and above) can be scoped —
+    /// the server rejects a scoped `user-admin`.
+    ///
+    /// Without this constructor the class could not be instantiated at all, which made
+    /// `createRole()`, `grantPrivileges()` and `revokePrivileges()` unreachable from PHP.
+    pub fn __construct(
+        code: &str,
+        namespace: Option<String>,
+        set_name: Option<String>,
+    ) -> PhpResult<Self> {
+        let code = aero::PrivilegeCode::try_from(code)
+            .map_err(|e| PhpException::from_class::<AerospikeException>(format!("{e}")))?;
+        Ok(Privilege {
+            _as: aero::Privilege::new(code, namespace, set_name),
+        })
+    }
+
     /// Returns the string name of the privilege code (e.g. "read", "read-write").
     /// Derived from `PrivilegeCode` — replaces proto's string `name` field.
     pub fn get_name(&self) -> String {
@@ -4434,15 +4934,35 @@ impl CdtListOperation {
         pad: bool,
         index: Option<bool>,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        let op = if index.unwrap_or(false) {
-            aero::operations::lists::create_with_index(&bin_name, order._as)
-        } else {
-            aero::operations::lists::create(&bin_name, order._as, pad)
-        };
-        Operation {
-            _as: with_ctx(op, ctx),
+    ) -> PhpResult<Operation> {
+        let index = index.unwrap_or(false);
+        if index {
+            // A persisted index lives on the bin itself: `create_with_index` ORs the
+            // persist bit into the type byte and hardcodes an empty context, and it takes
+            // no `pad`. Silently applying a caller's ctx here would send the persist bit
+            // down to a nested collection, so refuse the combination instead.
+            if ctx.as_ref().is_some_and(|c| !c.is_empty()) {
+                return throw_msg(
+                    "ListOp::create: a persisted index applies to the bin itself and cannot be combined with ctx",
+                    Operation::get(None),
+                );
+            }
+            if pad {
+                return throw_msg(
+                    "ListOp::create: pad is not supported together with a persisted index",
+                    Operation::get(None),
+                );
+            }
+            return Ok(Operation {
+                _as: aero::operations::lists::create_with_index(&bin_name, order._as),
+            });
         }
+        Ok(Operation {
+            _as: with_ctx(
+                aero::operations::lists::create(&bin_name, order._as, pad),
+                ctx,
+            ),
+        })
     }
 
     /// ListSetOrderOp creates a set list order operation.
@@ -4773,6 +5293,9 @@ impl CdtListOperation {
     /// ListSortOp creates list sort operation.
     /// Server sorts list according to sortFlags.
     /// Server does not return a result by default.
+    /// NOTE: exactly one flag can be applied. Upstream models sort flags as a plain enum
+    /// (`ListSortFlags`) rather than a bitmask, so `DESCENDING | DROP_DUPLICATES` is not
+    /// expressible through the crate's `lists::sort`.
     pub fn sort(
         bin_name: String,
         sort_flags: &CdtListSortFlags,
@@ -5362,14 +5885,19 @@ impl CdtMapPolicy {
         order: &MapOrderType,
         flags: Option<Vec<&CdtMapWriteFlags>>,
         persist_index: Option<bool>,
+        write_mode: Option<&CdtMapWriteMode>,
     ) -> Self {
         let combined_flags: u8 = flags
             .unwrap_or_default()
             .into_iter()
             .fold(aero::MapWriteFlags::DEFAULT, |acc, f| acc | f._as);
 
+        // Flags (server >= 4.3) win when present; `write_mode` is the pre-4.3 encoding and
+        // was previously impossible to select, leaving `MapWriteMode` a registered but
+        // unusable class.
         let mut policy = if combined_flags == aero::MapWriteFlags::DEFAULT {
-            aero::MapPolicy::new(order._as, aero::MapWriteMode::Update)
+            let mode = write_mode.map_or(aero::MapWriteMode::Update, |m| m._as);
+            aero::MapPolicy::new(order._as, mode)
         } else {
             aero::MapPolicy::new_with_flags(order._as, combined_flags)
         };
@@ -5489,13 +6017,25 @@ impl CdtMapOperation {
         order: &MapOrderType,
         with_index: Option<bool>,
         ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        let op = if with_index.unwrap_or(false) {
-            aero::operations::maps::create_with_index(&bin_name, order._as)
-        } else {
-            aero::operations::maps::create(&bin_name, order._as, ctx_to_aero(ctx))
-        };
-        Operation { _as: op }
+    ) -> PhpResult<Operation> {
+        if with_index.unwrap_or(false) {
+            // `create_with_index` ORs the persist bit into the type byte and hardcodes an
+            // empty context — it cannot address a nested map. Previously the ctx was simply
+            // dropped here, which retyped the *top-level* bin instead of creating the map
+            // the caller asked for.
+            if ctx.as_ref().is_some_and(|c| !c.is_empty()) {
+                return throw_msg(
+                    "MapOp::create: a persisted index applies to the bin itself and cannot be combined with ctx",
+                    Operation::get(None),
+                );
+            }
+            return Ok(Operation {
+                _as: aero::operations::maps::create_with_index(&bin_name, order._as),
+            });
+        }
+        Ok(Operation {
+            _as: aero::operations::maps::create(&bin_name, order._as, ctx_to_aero(ctx)),
+        })
     }
 
     /// MapSetPolicyOp creates set map policy operation.
@@ -5522,27 +6062,22 @@ impl CdtMapOperation {
 
     /// MapPutOp creates map put-items operation.
     /// Server writes each key/value item to the map bin and returns the map size.
-    /// Throws an AerospikeException if `map` is not a PHP associative array (map).
+    ///
+    /// Any PHP array is accepted: a list is written under its integer keys (`['a', 'b']`
+    /// becomes `0 => 'a', 1 => 'b'`), and an empty array is a no-op write. Throws an
+    /// AerospikeException if `map` is not an array at all.
     pub fn put(
         policy: &CdtMapPolicy,
         bin_name: String,
-        map: PHPValue,
+        map: &Zval,
         ctx: Option<Vec<&CDTContext>>,
     ) -> PhpResult<Operation> {
-        let aero_map: HashMap<aero::Value, aero::Value> = match map {
+        let aero_map: HashMap<aero::Value, aero::Value> = match php_array_as_map(map, "MapOp::put")?
+        {
             PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            PHPValue::Json(h) => h
-                .into_iter()
-                .map(|(k, v)| (aero::Value::String(k), v.into()))
-                .collect(),
-            // Previously returned PHP null here, which surfaced later as a confusing
-            // error when the null "Operation" was consumed — throw a clear error instead.
-            _ => {
-                return throw_msg(
-                    "MapOp::put requires an associative array (map)",
-                    Operation::get(None),
-                )
-            }
+            // `php_array_as_map` only ever yields a HashMap on the success path; anything
+            // else means it threw, and that exception has to win.
+            _ => return throw_msg("MapOp::put requires an array", Operation::get(None)),
         };
         let op = aero::operations::maps::put_items(&policy._as, &bin_name, aero_map);
         Ok(Operation {
@@ -6235,15 +6770,18 @@ pub struct CdtHllPolicy {
 
 #[php_impl]
 impl CdtHllPolicy {
-    /// new HLLPolicy uses specified optional HLLWriteFlags when performing HLL operations.
-    pub fn __construct(flags: Option<CdtHllWriteFlags>) -> Self {
-        let write_flags = flags
-            .map(|f| f._as)
-            .unwrap_or(aero::operations::hll::HLLWriteFlags::Default);
+    /// new HLLPolicy uses the specified optional HLLWriteFlags when performing HLL
+    /// operations. Pass several in the array to combine them (bitwise OR) — e.g.
+    /// `[HllWriteFlags::allowFold(), HllWriteFlags::noFail()]`, which a single flag could
+    /// not express.
+    pub fn __construct(flags: Option<Vec<CdtHllWriteFlags>>) -> Self {
+        let write_flags: Vec<aero::operations::hll::HLLWriteFlags> = flags
+            .map(|f| f.iter().map(|x| x._as).collect())
+            .unwrap_or_default();
 
         // DefaultHLLPolicy uses the default policy when performing HLL operations.
         CdtHllPolicy {
-            _as: aero::operations::hll::HLLPolicy::new(write_flags),
+            _as: aero::operations::hll::HLLPolicy::new_with_flags(write_flags),
         }
     }
 }
@@ -6582,10 +7120,13 @@ pub struct CdtBitwisePolicy {
 
 #[php_impl]
 impl CdtBitwisePolicy {
-    /// new BitwisePolicy(flags) will return a BitPolicy with provided write flags.
-    pub fn __construct(flags: Option<CdtBitwiseWriteFlags>) -> Self {
+    /// new BitwisePolicy(flags) will return a BitPolicy with the provided write flags.
+    /// Pass several in the array to combine them (bitwise OR) — e.g.
+    /// `[BitwiseWriteFlags::updateOnly(), BitwiseWriteFlags::noFail()]`, which a single
+    /// flag could not express.
+    pub fn __construct(flags: Option<Vec<CdtBitwiseWriteFlags>>) -> Self {
         let flag_byte = flags
-            .map(|f| f._as as u8)
+            .map(|f| f.iter().fold(0u8, |acc, x| acc | x._as.clone() as u8))
             .unwrap_or(aero::operations::bitwise::BitwiseWriteFlags::Default as u8);
 
         CdtBitwisePolicy {
@@ -7140,10 +7681,10 @@ fn tls_material_fingerprint(
 impl ClientPolicy {
     pub fn __construct() -> Self {
         let mut p = ClientPolicy::default();
-        if let Some(v) = ini_long_positive(&INI_TEND_INTERVAL) {
+        if let Some(v) = ini_long_positive(INI_TEND_INTERVAL) {
             p._as.tend_interval = v;
         }
-        if let Some(v) = ini_long_positive(&INI_CONNECT_TIMEOUT) {
+        if let Some(v) = ini_long_positive(INI_CONNECT_TIMEOUT) {
             p._as.timeout = v;
         }
         p
@@ -7352,17 +7893,34 @@ impl ClientPolicy {
         self._as.application_id = id;
     }
 
-    /// Returns a deterministic fingerprint for this policy used to key the per-process
-    /// client cache. Two policies with the same fingerprint produce equivalent clients and
-    /// may share the cached instance. The password is hashed (never printed in clear) so
-    /// password rotation invalidates the cached client without leaking the secret.
+}
+
+/// Per-process, randomly keyed hash state used for the password component of
+/// `ClientPolicy::fingerprint`.
+///
+/// `DefaultHasher::new()` is SipHash-1-3 with fixed zero keys: deterministic across
+/// processes and machines, and cheap to brute-force when the other inputs (hosts, user,
+/// timeouts) come from a deployment config. Keying the password hash with a value that
+/// exists only in this process's memory means the fingerprint carries no offline-attackable
+/// material, at no cost — the fingerprint is only ever a key into a per-process cache.
+static PASSWORD_HASH_STATE: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+
+impl ClientPolicy {
+    /// Returns a fingerprint for this policy used to key the per-process client cache. Two
+    /// policies with the same fingerprint produce equivalent clients and may share the
+    /// cached instance.
     ///
     /// All fields that influence cluster connectivity or behavior are mixed in — a change
     /// to any of them (e.g. `ip_map`, `tend_interval`, TLS config presence) produces a
     /// different cache key so the second `Client::connect` call gets a fresh client
     /// instead of silently reusing a stale one.
-    pub fn fingerprint(&self) -> String {
+    ///
+    /// Deliberately *not* exposed to PHP: it is an internal cache key, and publishing a
+    /// value derived from the password invites it into logs and diagnostics. It is stable
+    /// only within one process (see `PASSWORD_HASH_STATE`).
+    fn fingerprint(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::BuildHasher;
         let mut h = DefaultHasher::new();
 
         let auth_mode = self.get_auth_mode();
@@ -7373,7 +7931,8 @@ impl ClientPolicy {
         }
         if let aero::AuthMode::Internal(_, p) | aero::AuthMode::External(_, p) = &self._as.auth_mode
         {
-            p.as_str().hash(&mut h);
+            let state = PASSWORD_HASH_STATE.get_or_init(std::collections::hash_map::RandomState::new);
+            state.hash_one(p.as_str()).hash(&mut h);
         }
 
         self._as.cluster_name.hash(&mut h);
@@ -7419,6 +7978,40 @@ impl ClientPolicy {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Default Aerospike service port, appended to a bare host when building the cache key.
+const DEFAULT_PORT: &str = "3000";
+
+/// Canonical form of a hosts string for use as a client-cache key.
+///
+/// The seed list is only a starting point — the cluster is discovered from it — so
+/// `"127.0.0.1"`, `"127.0.0.1:3000"` and `"b:3000,a:3000"` all describe the same cluster
+/// and must share one cached client. Keying on the raw string instead built a separate
+/// client (and a separate tend loop and connection pools) per spelling.
+fn normalize_hosts(hosts: &str) -> String {
+    let mut parts: Vec<String> = hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            // Only a trailing `host:port` counts: bare IPv6 literals contain colons too,
+            // and `ToHosts` expects them bracketed when a port is present.
+            match h.rsplit_once(':') {
+                Some((head, port))
+                    if !port.is_empty()
+                        && port.bytes().all(|b| b.is_ascii_digit())
+                        && !head.is_empty() =>
+                {
+                    format!("{}:{port}", head.to_ascii_lowercase())
+                }
+                _ => format!("{}:{DEFAULT_PORT}", h.to_ascii_lowercase()),
+            }
+        })
+        .collect();
+    parts.sort();
+    parts.dedup();
+    parts.join(",")
+}
+
 /// Build an `aero::AdminPolicy` from a `total_timeout` (milliseconds). Used to forward
 /// the caller-supplied timeout into operations that internally take `AdminPolicy`
 /// (truncate, index create/drop, UDF register/remove/list).
@@ -7428,6 +8021,17 @@ fn admin_policy_with_timeout(timeout_ms: u32) -> aero::AdminPolicy {
         ap.timeout = timeout_ms;
     }
     ap
+}
+
+/// Deadline for `IndexTask`/`RegisterTask` completion polling, derived from the caller's
+/// `total_timeout`.
+///
+/// `wait_till_complete(&task, None)` polls forever, so a stuck index build or a node that
+/// never reports completion pins the PHP worker indefinitely and `setTotalTimeout()` has no
+/// effect on it. A zero (unset) timeout keeps the previous unbounded behaviour, since index
+/// builds and UDF propagation on a large cluster legitimately outlast any request timeout.
+fn task_wait_timeout(timeout_ms: u32) -> Option<std::time::Duration> {
+    (timeout_ms > 0).then(|| std::time::Duration::from_millis(u64::from(timeout_ms)))
 }
 
 /// Single conversion point from a PHP bin-name list to an `aero::Bins` selector.
@@ -7484,7 +8088,7 @@ impl Client {
     /// * `policy` - Optional client policy controlling auth, pool sizes, timeouts, etc.
     pub fn connect(hosts: &str, policy: Option<&ClientPolicy>) -> PhpResult<Zval> {
         let fp = policy.map(|p| p.fingerprint()).unwrap_or_default();
-        let cache_key = format!("{hosts}|{fp}");
+        let cache_key = format!("{}|{fp}", normalize_hosts(hosts));
 
         trace!("Creating a new Aerospike Client object for {hosts}");
         let aero_policy = policy.map(|p| p._as.clone()).unwrap_or_default();
@@ -7576,25 +8180,42 @@ impl Client {
     /// and are closed automatically at module shutdown. Use it when a connection is known
     /// to be obsolete (e.g. after credential rotation) to release its pool immediately.
     pub fn close(&self) -> PhpResult<()> {
-        // Close *before* evicting: `rt_call` turns a panic inside close() into a thrown
-        // exception, and an entry already removed from the cache would then leak its pool
-        // and tend task with nothing left referencing it — module shutdown could not close
-        // it either. On the error path the entry stays cached and MSHUTDOWN retries.
-        let closed = rt_call(|| self.client.close())?;
-        {
-            let mut cache = clients_lock();
-            let cache_key = format!("{}|{}", self.hosts, self.policy_fingerprint);
-            // Only evict the entry if it still holds *this* client. After close() +
-            // connect() with the same hosts/policy, the key maps to a fresh live client;
-            // a second close() on the old object must not orphan it (an entry removed
-            // without being closed leaks its pool and tend task).
-            if let Some(entry) = cache.map.get(&cache_key) {
-                if Arc::ptr_eq(&entry.client, &self.client) {
-                    cache.map.remove(&cache_key);
+        // Must match how `connect()` built the key, normalization included.
+        let cache_key = format!(
+            "{}|{}",
+            normalize_hosts(&self.hosts),
+            self.policy_fingerprint
+        );
+        // Hold the same per-key guard `connect()` takes. Without it a concurrent connect to
+        // the same hosts+policy can hit the cache in the window between the close below and
+        // the eviction that follows, and hand back a PHP Client wrapping an already-closed
+        // cluster — `connect()` succeeds, every operation on it then fails.
+        let key_guard = connect_guard(&cache_key);
+        let closed = {
+            let _key_lock = key_guard.lock().unwrap_or_else(PoisonError::into_inner);
+            // Close *before* evicting: `rt_call` turns a panic inside close() into a thrown
+            // exception, and an entry already removed from the cache would then leak its
+            // pool and tend task with nothing left referencing it — module shutdown could
+            // not close it either. On the error path the entry stays cached and MSHUTDOWN
+            // retries.
+            let closed = rt_call(|| self.client.close());
+            if closed.is_ok() {
+                let mut cache = clients_lock();
+                // Only evict the entry if it still holds *this* client. After close() +
+                // connect() with the same hosts/policy, the key maps to a fresh live client;
+                // a second close() on the old object must not orphan it (an entry removed
+                // without being closed leaks its pool and tend task).
+                if let Some(entry) = cache.map.get(&cache_key) {
+                    if Arc::ptr_eq(&entry.client, &self.client) {
+                        cache.map.remove(&cache_key);
+                    }
                 }
             }
-        }
-        if let Err(e) = closed {
+            closed
+        };
+        drop(key_guard);
+        release_connect_guard(&cache_key);
+        if let Err(e) = closed? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7804,6 +8425,7 @@ impl Client {
                 _as: Some(arc_rs),
                 partition_filter: Some(pf_arc),
                 pf_synced: false,
+                _client: Some(self.client.clone()),
             }),
             Err(e) => throw_aero_error(&e, Recordset::default()),
         }
@@ -7828,6 +8450,7 @@ impl Client {
                 _as: Some(arc_rs),
                 partition_filter: Some(pf_arc),
                 pf_synced: false,
+                _client: Some(self.client.clone()),
             }),
             Err(e) => throw_aero_error(&e, Recordset::default()),
         }
@@ -7835,8 +8458,9 @@ impl Client {
 
     /// Create a secondary index on a bin.
     ///
-    /// v2 BREAKING: `ctx` is currently ignored; the underlying aerospike crate does not yet
-    /// expose ctx-aware index creation through `create_index_on_bin`.
+    /// `ctx` scopes the index to a path inside a CDT (e.g. a map key or list index), so the
+    /// index covers the nested collection rather than the top-level bin. Queries must then
+    /// use the same context on their `Filter`.
     pub fn create_index(
         &self,
         policy: &WritePolicy,
@@ -7846,12 +8470,18 @@ impl Client {
         index_name: &str,
         index_type: &IndexType,
         cit: Option<&IndexCollectionType>,
-        _ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<Vec<&CDTContext>>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let cit_val = cit
             .map(|c| c._as.clone())
             .unwrap_or(aero::CollectionIndexType::Default);
+        // An empty array from PHP means "no context" — passing an empty slice would make
+        // the crate base64-encode a zero-element context into the sindex-create command.
+        let ctx_vec: Vec<aero::operations::cdt_context::CdtContext> = ctx
+            .map(|c| c.iter().map(|x| x._as.clone()).collect())
+            .unwrap_or_default();
+        let ctx_arg = (!ctx_vec.is_empty()).then_some(ctx_vec.as_slice());
         let task = match rt_block_on(self.client.create_index_on_bin(
             &admin,
             namespace,
@@ -7860,12 +8490,15 @@ impl Client {
             index_name,
             index_type._as.clone(),
             cit_val,
-            None,
+            ctx_arg,
         ))? {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
+            &task,
+            task_wait_timeout(policy._as.base_policy.total_timeout),
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7887,7 +8520,10 @@ impl Client {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
+            &task,
+            task_wait_timeout(policy._as.base_policy.total_timeout),
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7910,19 +8546,36 @@ impl Client {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
+            &task,
+            task_wait_timeout(policy._as.base_policy.total_timeout),
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
     }
 
+    /// Drops a registered UDF module.
+    ///
+    /// `package_name` is the server-side file name, e.g. "udf1.lua". A bare module name is
+    /// accepted too and gets the ".lua" suffix, so feeding `UdfMeta::getPackageName()`
+    /// straight back in works instead of failing with "file not found".
     pub fn drop_udf(&self, policy: &WritePolicy, package_name: &str) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
+        let filename = if package_name.contains('.') {
+            package_name.to_string()
+        } else {
+            format!("{package_name}.lua")
+        };
+        let package_name = filename.as_str();
         let task = match rt_call(|| self.client.remove_udf(&admin, package_name))? {
             Ok(t) => t,
             Err(e) => return throw_aero_error(&e, ()),
         };
-        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(&task, None))? {
+        if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
+            &task,
+            task_wait_timeout(policy._as.base_policy.total_timeout),
+        ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -7973,6 +8626,7 @@ impl Client {
                     .to_string();
                 udfs.push(UdfMeta {
                     package_name,
+                    filename,
                     hash,
                     language,
                 });
@@ -7983,11 +8637,16 @@ impl Client {
 
     /// Returns the server build version string for each node in the cluster.
     /// The returned HashMap maps node name (host:port) to version string (e.g. "7.0.0.1").
-    pub fn server_version(&self) -> PhpResult<HashMap<String, String>> {
+    pub fn server_version(&self, policy: Option<&ReadPolicy>) -> PhpResult<HashMap<String, String>> {
+        // Honour the caller's timeout like listUdf/truncate do, instead of pinning the
+        // AdminPolicy default (3s) regardless of what the caller asked for.
+        let admin = admin_policy_with_timeout(
+            policy.map_or(0, |p| p._as.base_policy.total_timeout),
+        );
         let nodes = self.client.nodes();
         let mut versions = std::collections::HashMap::new();
         for node in &nodes {
-            match rt_block_on(node.info(&aero::AdminPolicy::default(), &["build"]))? {
+            match rt_block_on(node.info(&admin, &["build"]))? {
                 Ok(result) => {
                     let ver = result.get("build").cloned().unwrap_or_default();
                     versions.insert(node.name().to_string(), ver);
@@ -8386,7 +9045,11 @@ pub struct Key {
 impl Key {
     pub fn __construct(namespace: &str, set: &str, key: PHPValue) -> PhpResult<Self> {
         let aero_value: aero::Value = key.into();
-        match aero::Key::new(namespace.to_string(), set.to_string(), aero_value) {
+        // `Key::new` digests the user key, and `particle_type()` is `unreachable!()` for
+        // Infinity/Wildcard (aerospike-core value.rs) — reachable from PHP via
+        // `Value::infinity()` / `Value::wildcard()`. Without this barrier the unwind would
+        // cross the `extern "C"` boundary and abort the worker.
+        match catch_panic(|| aero::Key::new(namespace.to_string(), set.to_string(), aero_value))? {
             Ok(k) => Ok(Key { _as: k }),
             Err(e) => Err(format!("Invalid key: {e}").into()),
         }
@@ -8512,6 +9175,16 @@ impl FromZval<'_> for Json {
 
 #[php_impl]
 impl Json {
+    /// Builds a Json wrapper around a string-keyed PHP array.
+    ///
+    /// Without a constructor the class could not be instantiated at all — ext-php-rs
+    /// rejects `new` on a class that declares neither `__construct` nor `Default`.
+    pub fn __construct(value: Option<HashMap<String, PHPValue>>) -> Self {
+        Json {
+            v: value.unwrap_or_default(),
+        }
+    }
+
     /// getter method to get the json value
     pub fn get_value(&self) -> HashMap<String, PHPValue> {
         self.v.clone()
@@ -8808,12 +9481,36 @@ impl fmt::Display for PHPValue {
     }
 }
 
-/// Insert a map entry into a PHP array under a properly typed key: integer keys stay
-/// integer keys, string keys stay string keys. Key types PHP arrays cannot represent
-/// (blob, list, map, ...) fall back to their string form.
+/// Returns the integer key PHP would use for `s`, if PHP treats it as a numeric key.
 ///
-/// PHP-level limitation: Zend normalizes numeric-string keys ("1") to integer keys, so an
-/// Aerospike map holding both `1` and `"1"` still collapses to a single PHP entry.
+/// Mirrors Zend's `ZEND_HANDLE_NUMERIC_STR`: an optional `-`, then digits with no leading
+/// zero (`"0"` itself is fine, `"01"` and `"-0"` are not), and the result must fit in
+/// `zend_long`. Anything else stays a real string key.
+///
+/// This has to be done by hand: `ZendHashTable::insert` calls `zend_hash_str_update`, not
+/// `zend_symtable_str_update`, so no normalization happens on the way in. Storing `"1"` as
+/// a literal string key produces an array whose entry is unreachable from PHP — both
+/// `$a["1"]` and `$a[1]` compile to a lookup of the *integer* key 1.
+fn php_numeric_string_key(s: &str) -> Option<i64> {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Leading zeros are not canonical ("01" stays a string key), and neither is "-0".
+    if digits.len() > 1 && digits.starts_with('0') || (s.starts_with('-') && digits == "0") {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
+/// Insert a map entry into a PHP array under a properly typed key: integer keys stay
+/// integer keys, string keys stay string keys, and numeric strings become integer keys
+/// exactly as PHP's own array semantics require (see `php_numeric_string_key`).
+/// Key types PHP arrays cannot represent (blob, list, map, ...) fall back to their string
+/// form, which is also normalized so the entry stays reachable.
+///
+/// PHP-level limitation: because `"1"` and `1` are the same PHP array key, an Aerospike map
+/// holding both collapses to a single PHP entry — last write wins.
 fn insert_map_entry(arr: &mut ZendHashTable, key: &PHPValue, val: PHPValue) -> Result<()> {
     match key {
         PHPValue::Int(i) => arr.insert_at_index(*i, val),
@@ -8821,8 +9518,16 @@ fn insert_map_entry(arr: &mut ZendHashTable, key: &PHPValue, val: PHPValue) -> R
             Ok(i) => arr.insert_at_index(i, val),
             Err(_) => Err(Error::IntegerOverflow),
         },
-        PHPValue::String(s) => arr.insert(s.as_str(), val),
-        other => arr.insert(other.as_string().as_str(), val),
+        PHPValue::String(s) => insert_string_key(arr, s, val),
+        other => insert_string_key(arr, &other.as_string(), val),
+    }
+}
+
+/// Insert under a string key, converting it to an integer key when PHP would.
+fn insert_string_key(arr: &mut ZendHashTable, key: &str, val: PHPValue) -> Result<()> {
+    match php_numeric_string_key(key) {
+        Some(i) => arr.insert_at_index(i, val),
+        None => arr.insert(key, val),
     }
 }
 
@@ -8844,7 +9549,7 @@ impl IntoZval for PHPValue {
             PHPValue::Json(h) => {
                 let mut arr = ZendHashTable::with_capacity(h.len() as u32);
                 for (k, v) in h {
-                    arr.insert(k.as_str(), v)?;
+                    insert_string_key(&mut arr, &k, v)?;
                 }
 
                 zv.set_hashtable(arr)
@@ -8901,7 +9606,43 @@ impl IntoZval for PHPValue {
 /// Converts a `Zval` into a `PHPValue`. Returns `None` (and may throw a PHP exception)
 /// for objects we don't recognise or values whose contents cannot be extracted; the caller
 /// must propagate the `None` so PHP sees the thrown exception.
+/// Interprets a PHP array as an Aerospike map, whatever its keys look like.
+///
+/// `from_zval` has to guess between list and map, and it guesses "list" for sequential
+/// integer keys — including the empty array. That guess is right for a bin value but wrong
+/// wherever a map is what the caller asked for: `['a', 'b']` is a legal map with integer
+/// keys 0 and 1, and `[]` is a legal empty map. Callers that need a map convert here so
+/// those two cases stop being rejected as "not an associative array".
+fn php_array_as_map(zval: &Zval, what: &str) -> PhpResult<PHPValue> {
+    match from_zval(zval) {
+        Some(PHPValue::HashMap(hm)) => Ok(PHPValue::HashMap(hm)),
+        // A list is a map keyed 0..N-1; an empty array arrives here too.
+        Some(PHPValue::List(items)) => Ok(PHPValue::HashMap(
+            items
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (PHPValue::Int(i as i64), v))
+                .collect(),
+        )),
+        Some(PHPValue::Json(h)) => Ok(PHPValue::HashMap(
+            h.into_iter()
+                .map(|(k, v)| (PHPValue::String(k), v))
+                .collect(),
+        )),
+        // `None` means a nested value already threw; keep that exception.
+        None => Err(PhpException::from_class::<AerospikeException>(format!(
+            "{what} received an unusable array"
+        ))),
+        Some(_) => throw_msg(&format!("{what} requires an array"), PHPValue::Nil),
+    }
+}
+
 fn from_zval(zval: &Zval) -> Option<PHPValue> {
+    // Top-level arguments are dereferenced by the argument parser, but array *elements*
+    // are not: `zval.get_type()` reports `Reference` and would fall through to the
+    // "unsupported type" arm. That hits the ordinary PHP idiom
+    // `foreach ($data as &$v) { ... }`, which leaves the last element a reference.
+    let zval = zval.dereference();
     match zval.get_type() {
         DataType::Object(_) => {
             if let Some(o) = zval.extract::<BLOB>() {
@@ -8910,6 +9651,8 @@ fn from_zval(zval: &Zval) -> Option<PHPValue> {
                 return Some(PHPValue::HLL(o.v));
             } else if let Some(o) = zval.extract::<GeoJSON>() {
                 return Some(PHPValue::GeoJSON(o.v));
+            } else if let Some(o) = zval.extract::<Json>() {
+                return Some(PHPValue::Json(o.v));
             } else if zval.extract::<Infinity>().is_some() {
                 return Some(PHPValue::Infinity);
             } else if zval.extract::<Wildcard>().is_some() {
@@ -8926,7 +9669,18 @@ fn from_zval(zval: &Zval) -> Option<PHPValue> {
         DataType::Double => zval
             .double()
             .map(|v| PHPValue::Float(ordered_float::OrderedFloat(v))),
-        DataType::String => zval.string().map(PHPValue::String),
+        // `zval.string()` validates UTF-8 and yields `None` otherwise. Aerospike's STRING
+        // particle is byte-oriented, so this rejects data the server would accept — say so
+        // instead of surfacing a bare "Invalid input for argument" from the arg parser.
+        DataType::String => match zval.string() {
+            Some(s) => Some(PHPValue::String(s)),
+            None => throw_msg(
+                "String value is not valid UTF-8; wrap raw bytes in Value::blob() to store them",
+                None,
+            )
+            .ok()
+            .flatten(),
+        },
         DataType::Array => {
             let arr = zval.array()?;
             if arr.has_sequential_keys() {
@@ -9049,7 +9803,16 @@ impl From<aero::Value> for PHPValue {
             aero::Value::Nil => PHPValue::Nil,
             aero::Value::Bool(b) => PHPValue::Bool(b),
             aero::Value::Int(i) => PHPValue::Int(i),
-            aero::Value::Float(f) => PHPValue::Float(ordered_float::OrderedFloat(f64::from(f))),
+            // `f64::from(FloatValue)` *panics* on the F32 variant, which the msgpack
+            // decoder produces for the 0xca marker — i.e. for any float32 written into a
+            // list or map by another client (Go/Java/C). Widen it ourselves: PHP has only
+            // one float type, so the value is representable, and a panic here would either
+            // make the record permanently unreadable or fire inside a background scan task
+            // where no barrier can catch it.
+            aero::Value::Float(f) => PHPValue::Float(ordered_float::OrderedFloat(match f {
+                aero::FloatValue::F32(bits) => f64::from(f32::from_bits(bits)),
+                aero::FloatValue::F64(bits) => f64::from_bits(bits),
+            })),
             aero::Value::String(s) => PHPValue::String(s),
             aero::Value::Blob(b) => PHPValue::Blob(b),
             aero::Value::List(l) | aero::Value::MultiResult(l) => {
@@ -9116,14 +9879,8 @@ impl Value {
         PHPValue::List(val)
     }
 
-    pub fn map(val: &Zval) -> PHPValue {
-        match from_zval(val) {
-            Some(PHPValue::HashMap(hm)) => PHPValue::HashMap(hm),
-            _ => {
-                let _ = throw_msg::<()>("Invalid value", ());
-                PHPValue::Nil
-            }
-        }
+    pub fn map(val: &Zval) -> PhpResult<PHPValue> {
+        php_array_as_map(val, "Value::map")
     }
 
     pub fn blob(zval: &Zval) -> PhpResult<PHPValue> {
@@ -9391,6 +10148,9 @@ impl ResultCode {
     /// LOST_CONFLICT defines write command loses conflict to XDR.
     const LOST_CONFLICT: i32 = 28;
 
+    /// XDR_KEY_BUSY defines the XDR is not in the required state to process the write.
+    const XDR_KEY_BUSY: i32 = 32;
+
     /// QUERY_END defines there are no more records left for query.
     const QUERY_END: i32 = 50;
 
@@ -9573,6 +10333,7 @@ impl ResultCode {
              ResultCode::OP_NOT_APPLICABLE=> "the operation cannot be applied to the current bin value on the server".into(),
              ResultCode::FILTERED_OUT=> "the transaction was not performed because the filter was false".into(),
              ResultCode::LOST_CONFLICT=> "write command loses conflict to XDR".into(),
+             ResultCode::XDR_KEY_BUSY=> "the XDR is not in the required state to process the write".into(),
              ResultCode::QUERY_END=> "there are no more records left for query".into(),
              ResultCode::SECURITY_NOT_SUPPORTED=> "security type not supported by connected server".into(),
              ResultCode::SECURITY_NOT_ENABLED=> "administration command is invalid".into(),
@@ -9672,6 +10433,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<ExpType>()
         .class::<Expression>()
         .class::<ReadModeAP>()
+        .class::<Replica>()
+        .class::<RegexFlag>()
         .class::<ReadModeSC>()
         .class::<RecordExistsAction>()
         .class::<QueryDuration>()

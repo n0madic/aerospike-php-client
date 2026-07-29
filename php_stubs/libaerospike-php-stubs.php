@@ -170,6 +170,47 @@ namespace Aerospike {
      * `allow_partial_results` has been removed (controlled via `respond_all_keys`).
      */
     class BatchPolicy {
+        /**
+         * SleepBetweenRetries is the milliseconds to sleep between retries when a command
+         * fails and the timeout has not been exceeded. 0 skips the sleep entirely.
+         *
+         * @return int
+         */
+        public function getSleepBetweenRetries(): int {}
+
+        /**
+         * @param int $sleep_millis
+         * @return void
+         */
+        public function setSleepBetweenRetries(int $sleep_millis): void {}
+
+        /**
+         * TimeoutDelay is the milliseconds spent draining a socket after a read timeout
+         * before giving up and closing it.
+         *
+         * @return int
+         */
+        public function getTimeoutDelay(): int {}
+
+        /**
+         * @param int $delay_millis
+         * @return void
+         */
+        public function setTimeoutDelay(int $delay_millis): void {}
+
+        /**
+         * Replica algorithm used to pick the target node. Defaults to Replica::sequence().
+         *
+         * @return \Aerospike\Replica
+         */
+        public function getReplica(): \Aerospike\Replica {}
+
+        /**
+         * @param \Aerospike\Replica $replica
+         * @return void
+         */
+        public function setReplica(mixed $replica): void {}
+
         public function __construct() {}
 
         /**
@@ -383,6 +424,24 @@ namespace Aerospike {
      * shape mirrors `aero::BatchRecord`.
      */
     class BatchRecord {
+        /**
+         * Per-key result code for this batch entry, or null when the server returned none.
+         * batch() succeeds as a whole even when individual keys fail, so this is the only
+         * way to tell a successful write from one the server rejected: compare against
+         * ResultCode::KEY_NOT_FOUND_ERROR or ResultCode::FILTERED_OUT.
+         *
+         * @return int|null
+         */
+        public function getResultCode(): ?int {}
+
+        /**
+         * True when a write for this key may have been applied despite the reported error
+         * — typically a timeout that fired after the command reached the server.
+         *
+         * @return bool
+         */
+        public function getInDoubt(): bool {}
+
         public function __construct() {}
 
         /**
@@ -911,11 +970,14 @@ namespace Aerospike {
      */
     class BitwisePolicy {
         /**
-         * new BitwisePolicy(flags) will return a BitPolicy with provided write flags.
+         * new BitwisePolicy(flags) will return a BitPolicy with the provided write flags.
+         * Pass several in the array to combine them (bitwise OR) — e.g.
+         * `[BitwiseWriteFlags::updateOnly(), BitwiseWriteFlags::noFail()]`, which a single
+         * flag could not express.
          *
-         * @param mixed $flags
+         * @param \Aerospike\BitwiseWriteFlags[]|null $flags
          */
-        public function __construct(mixed $flags = null) {}
+        public function __construct(?array $flags = null) {}
     }
 
     /**
@@ -1077,10 +1139,10 @@ namespace Aerospike {
          * @param string $index_name
          * @param \Aerospike\IndexType $index_type
          * @param \Aerospike\IndexCollectionType|null $cit
-         * @param array|null $_ctx
+         * @param \Aerospike\Context[]|null $ctx
          * @return void
          */
-        public function createIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $bin_name, string $index_name, \Aerospike\IndexType $index_type, ?\Aerospike\IndexCollectionType $cit = null, ?array $_ctx = null): void {}
+        public function createIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $bin_name, string $index_name, \Aerospike\IndexType $index_type, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1336,7 +1398,7 @@ namespace Aerospike {
          *
          * @return array
          */
-        public function serverVersion(): array {}
+        public function serverVersion(?\Aerospike\ReadPolicy $policy = null): array {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1397,15 +1459,6 @@ namespace Aerospike {
     class ClientPolicy {
         public function __construct() {}
 
-        /**
-         * Returns a deterministic short fingerprint for this policy used to key the per-process
-         * client cache. Two policies with the same fingerprint produce equivalent clients and may
-         * share the cached instance. The password is hashed (never printed in clear) so
-         * password rotation invalidates the cached client without leaking the secret.
-         *
-         * @return string
-         */
-        public function fingerprint(): string {}
 
         /**
          * Optional application identifier. Used by the server to correlate client operations with
@@ -1637,8 +1690,8 @@ namespace Aerospike {
          * the aerospike client during connect). Accepted for forward compatibility.
          *
          * Throws an AerospikeException if a file is missing, contains no parseable
-         * certificates, or the key cannot be loaded. The file contents are hashed into
-         * fingerprint() so cert rotation invalidates the cached Client.
+         * certificates, or the key cannot be loaded. The file contents are hashed into the
+         * internal client-cache key so cert rotation invalidates the cached Client.
          *
          * @param string|null $ca_file
          * @param string|null $cert_file
@@ -2361,7 +2414,7 @@ namespace Aerospike {
          * @param mixed $val
          * @return \Aerospike\Expression|null
          */
-        public static function mapVal(mixed $val): ?\Aerospike\Expression {}
+        public static function mapVal(mixed $val): \Aerospike\Expression {}
 
         /**
          * Create expression that returns the maximum value in a variable number of expressions.
@@ -2937,11 +2990,14 @@ namespace Aerospike {
      */
     class HllPolicy {
         /**
-         * new HLLPolicy uses specified optional HLLWriteFlags when performing HLL operations.
+         * new HLLPolicy uses the specified optional HLLWriteFlags when performing HLL
+         * operations. Pass several in the array to combine them (bitwise OR) — e.g.
+         * `[HllWriteFlags::allowFold(), HllWriteFlags::noFail()]`, which a single flag
+         * could not express.
          *
-         * @param mixed $flags
+         * @param \Aerospike\HllWriteFlags[]|null $flags
          */
-        public function __construct(mixed $flags = null) {}
+        public function __construct(?array $flags = null) {}
     }
 
     /**
@@ -3085,7 +3141,12 @@ namespace Aerospike {
      * Implementation of the Json (Map<String, Value>) data structure for Aerospike.
      */
     class Json {
-        public function __construct() {}
+        /**
+         * Builds a Json wrapper around a string-keyed PHP array.
+         *
+         * @param array|null $value
+         */
+        public function __construct(?array $value = null) {}
 
         /**
          * Returns a string representation of the value.
@@ -4475,7 +4536,7 @@ namespace Aerospike {
          * @param array|null $flags
          * @param bool|null $persist_index
          */
-        public function __construct(\Aerospike\MapOrderType $order, ?array $flags = null, ?bool $persist_index = null) {}
+        public function __construct(\Aerospike\MapOrderType $order, ?array $flags = null, ?bool $persist_index = null, ?\Aerospike\MapWriteMode $write_mode = null) {}
     }
 
     /**
@@ -4902,7 +4963,18 @@ namespace Aerospike {
      * return an empty string when `None` for backward compatibility.
      */
     class Privilege {
-        public function __construct() {}
+        /**
+         * Builds a privilege from a privilege code and an optional namespace/set scope.
+         *
+         * `code` is one of the strings returned by the static helpers on this class
+         * (Privilege::read(), Privilege::readWrite(), ...). Only data-level codes (read and
+         * above) can be scoped — the server rejects a scoped user-admin.
+         *
+         * @param string $code
+         * @param string|null $namespace
+         * @param string|null $set_name
+         */
+        public function __construct(string $code, ?string $namespace = null, ?string $set_name = null) {}
 
         /**
          * DataAdmin allows to manage indicies and user defined functions.
@@ -5032,6 +5104,61 @@ namespace Aerospike {
      * `exit_fast_on_exhausted_connection_pool`, `read_mode_sc` have been removed.
      */
     class QueryPolicy {
+        /**
+         * SleepBetweenRetries is the milliseconds to sleep between retries when a command
+         * fails and the timeout has not been exceeded. 0 skips the sleep entirely.
+         *
+         * @return int
+         */
+        public function getSleepBetweenRetries(): int {}
+
+        /**
+         * @param int $sleep_millis
+         * @return void
+         */
+        public function setSleepBetweenRetries(int $sleep_millis): void {}
+
+        /**
+         * TimeoutDelay is the milliseconds spent draining a socket after a read timeout
+         * before giving up and closing it.
+         *
+         * @return int
+         */
+        public function getTimeoutDelay(): int {}
+
+        /**
+         * @param int $delay_millis
+         * @return void
+         */
+        public function setTimeoutDelay(int $delay_millis): void {}
+
+        /**
+         * Number of records to return, divided across the nodes involved in the query
+         * (0 = no limit). Server v4.9+. Bounds a page when paginating with a PartitionFilter.
+         *
+         * @return int
+         */
+        public function getMaxRecords(): int {}
+
+        /**
+         * @param int $max_records
+         * @return void
+         */
+        public function setMaxRecords(int $max_records): void {}
+
+        /**
+         * Per-node limit on returned records per second (0 = unlimited). Server v6.0+.
+         *
+         * @return int
+         */
+        public function getRecordsPerSecond(): int {}
+
+        /**
+         * @param int $records_per_second
+         * @return void
+         */
+        public function setRecordsPerSecond(int $records_per_second): void {}
+
         public function __construct() {}
 
         /**
@@ -5206,6 +5333,47 @@ namespace Aerospike {
      * and have been removed. `read_mode_ap` maps to the new `consistency_level` concept.
      */
     class ReadPolicy {
+        /**
+         * SleepBetweenRetries is the milliseconds to sleep between retries when a command
+         * fails and the timeout has not been exceeded. 0 skips the sleep entirely.
+         *
+         * @return int
+         */
+        public function getSleepBetweenRetries(): int {}
+
+        /**
+         * @param int $sleep_millis
+         * @return void
+         */
+        public function setSleepBetweenRetries(int $sleep_millis): void {}
+
+        /**
+         * TimeoutDelay is the milliseconds spent draining a socket after a read timeout
+         * before giving up and closing it.
+         *
+         * @return int
+         */
+        public function getTimeoutDelay(): int {}
+
+        /**
+         * @param int $delay_millis
+         * @return void
+         */
+        public function setTimeoutDelay(int $delay_millis): void {}
+
+        /**
+         * Replica algorithm used to pick the target node. Defaults to Replica::sequence().
+         *
+         * @return \Aerospike\Replica
+         */
+        public function getReplica(): \Aerospike\Replica {}
+
+        /**
+         * @param \Aerospike\Replica $replica
+         * @return void
+         */
+        public function setReplica(mixed $replica): void {}
+
         public function __construct() {}
 
         /**
@@ -5993,6 +6161,47 @@ namespace Aerospike {
      * `read_mode_sc` have been removed.
      */
     class ScanPolicy {
+        /**
+         * SleepBetweenRetries is the milliseconds to sleep between retries when a command
+         * fails and the timeout has not been exceeded. 0 skips the sleep entirely.
+         *
+         * @return int
+         */
+        public function getSleepBetweenRetries(): int {}
+
+        /**
+         * @param int $sleep_millis
+         * @return void
+         */
+        public function setSleepBetweenRetries(int $sleep_millis): void {}
+
+        /**
+         * TimeoutDelay is the milliseconds spent draining a socket after a read timeout
+         * before giving up and closing it.
+         *
+         * @return int
+         */
+        public function getTimeoutDelay(): int {}
+
+        /**
+         * @param int $delay_millis
+         * @return void
+         */
+        public function setTimeoutDelay(int $delay_millis): void {}
+
+        /**
+         * Per-node limit on returned records per second (0 = unlimited). Server v6.0+.
+         *
+         * @return int
+         */
+        public function getRecordsPerSecond(): int {}
+
+        /**
+         * @param int $records_per_second
+         * @return void
+         */
+        public function setRecordsPerSecond(int $records_per_second): void {}
+
         public function __construct() {}
 
         /**
@@ -6185,6 +6394,14 @@ namespace Aerospike {
      * UDF listing will be implemented later via the Info command.
      */
     class UdfMeta {
+        /**
+         * Server-side file name of the UDF, e.g. "udf1.lua". This is the identifier
+         * registerUdf() and dropUdf() operate on; getPackageName() strips the extension.
+         *
+         * @return string
+         */
+        public function getFilename(): string {}
+
         public function __construct() {}
 
         /**
@@ -6383,6 +6600,34 @@ namespace Aerospike {
      * `exit_fast_on_exhausted_connection_pool`, `read_mode_sc` have been removed.
      */
     class WritePolicy {
+        /**
+         * SleepBetweenRetries is the milliseconds to sleep between retries when a command
+         * fails and the timeout has not been exceeded. 0 skips the sleep entirely.
+         *
+         * @return int
+         */
+        public function getSleepBetweenRetries(): int {}
+
+        /**
+         * @param int $sleep_millis
+         * @return void
+         */
+        public function setSleepBetweenRetries(int $sleep_millis): void {}
+
+        /**
+         * TimeoutDelay is the milliseconds spent draining a socket after a read timeout
+         * before giving up and closing it.
+         *
+         * @return int
+         */
+        public function getTimeoutDelay(): int {}
+
+        /**
+         * @param int $delay_millis
+         * @return void
+         */
+        public function setTimeoutDelay(int $delay_millis): void {}
+
         public function __construct() {}
 
         /**
@@ -6543,5 +6788,88 @@ namespace Aerospike {
          * @return void
          */
         public function setTotalTimeout(int $timeout_millis): void {}
+    }
+
+    /**
+     * Replica determines which node a single-record or batch command targets.
+     *
+     * Only single-record and batch commands honour this — scans and queries always visit
+     * every node. PreferRack additionally requires ClientPolicy::setRackIds() and matching
+     * server rack configuration; without them it behaves like Sequence.
+     */
+    class Replica {
+        public function __construct() {}
+
+        /**
+         * Always use the node holding the key's master partition.
+         *
+         * @return \Aerospike\Replica
+         */
+        public static function master(): \Aerospike\Replica {}
+
+        /**
+         * Try the master partition's node first, then nodes holding replicated partitions.
+         * This is the default.
+         *
+         * @return \Aerospike\Replica
+         */
+        public static function sequence(): \Aerospike\Replica {}
+
+        /**
+         * Prefer a node on the client's own rack, falling back to Sequence.
+         *
+         * @return \Aerospike\Replica
+         */
+        public static function preferRack(): \Aerospike\Replica {}
+
+        /**
+         * Returns the name of this replica algorithm ("master", "sequence", "prefer-rack").
+         *
+         * @return string
+         */
+        public function getName(): string {}
+    }
+
+    /**
+     * Flags for Expression::regexCompare, matching the POSIX regcomp flags the server uses.
+     * Combine them with the bitwise OR operator: RegexFlag::icase() | RegexFlag::newline().
+     */
+    class RegexFlag {
+        public function __construct() {}
+
+        /**
+         * Use regex defaults.
+         *
+         * @return int
+         */
+        public static function none(): int {}
+
+        /**
+         * Use POSIX Extended Regular Expression syntax when interpreting the regex.
+         *
+         * @return int
+         */
+        public static function extended(): int {}
+
+        /**
+         * Do not differentiate case.
+         *
+         * @return int
+         */
+        public static function icase(): int {}
+
+        /**
+         * Do not report the position of matches.
+         *
+         * @return int
+         */
+        public static function nosub(): int {}
+
+        /**
+         * Match-any-character operators do not match a newline.
+         *
+         * @return int
+         */
+        public static function newline(): int {}
     }
 }

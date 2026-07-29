@@ -2835,7 +2835,7 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index_bit_count
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function fold(string $bin_name, int $index_bit_count): \Aerospike\Operation {}
 
@@ -2844,7 +2844,7 @@ namespace Aerospike {
          * Server returns estimated number of elements in the HLL bin.
          *
          * @param string $bin_name
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function getCount(string $bin_name): \Aerospike\Operation {}
 
@@ -2855,7 +2855,7 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $list
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function getIntersectCount(string $bin_name, array $list): \Aerospike\Operation {}
 
@@ -2865,7 +2865,7 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $list
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function getSimilarity(string $bin_name, array $list): \Aerospike\Operation {}
 
@@ -2876,7 +2876,7 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $list
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function getUnion(string $bin_name, array $list): \Aerospike\Operation {}
 
@@ -2887,7 +2887,7 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $list
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function getUnionCount(string $bin_name, array $list): \Aerospike\Operation {}
 
@@ -2915,7 +2915,7 @@ namespace Aerospike {
          * Server updates the cached count (if stale) and returns the count.
          *
          * @param string $bin_name
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function refreshCount(string $bin_name): \Aerospike\Operation {}
 
@@ -2927,7 +2927,7 @@ namespace Aerospike {
          * @param \Aerospike\HllPolicy $policy
          * @param string $bin_name
          * @param array $list
-         * @return \Aerospike\Operation|null
+         * @return \Aerospike\Operation
          */
         public static function setUnion(\Aerospike\HllPolicy $policy, string $bin_name, array $list): \Aerospike\Operation {}
     }

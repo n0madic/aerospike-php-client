@@ -48,6 +48,22 @@ All notable changes to this project will be documented in this file.
   (relevant for ZTS builds).
 - **Tokio runtime creation failure is a catchable `Exception`** instead of a panic that
   aborted the PHP worker (possible under thread/fd exhaustion).
+- **Ordered maps can be written back to the server**: a value read as an ordered map
+  (K-ordered bin or a `keyValue` CDT result) converted to a wire type the client refuses to
+  serialize, so writing it back failed with `InvalidArgument`. It is now sent as a K-ordered
+  map.
+- **Panic boundary extended to `connect()` and module shutdown**: cluster setup inside
+  `connect()` and the client close performed at MSHUTDOWN ran outside the panic barrier, so a
+  panic there unwound across the FFI boundary and aborted the PHP worker. `connect()` now
+  raises a catchable `AerospikeException`; shutdown logs the panic and still closes the
+  remaining cached clients.
+- **`Client::close()` no longer orphans a client when closing fails**: the cache entry was
+  removed before the close was attempted, so a failure left the connection pool and tend task
+  running with nothing referencing them (module shutdown could not close them either). The
+  entry is now evicted only after the close returns.
+- **Pagination cursor sync errors are no longer swallowed**: a failure while reading the
+  post-scan partition cursor at end-of-stream left the `PartitionFilter` on its previous
+  cursor, silently re-reading the same range on the next page. It now throws.
 - **Early-stop pagination pattern documented and covered by a test**: to stop a paginated
   scan/query early *and* keep the cursor, call `Recordset::close()` and then drain the
   recordset (`next()` until `null`) — the cursor is written back after the drain, so the

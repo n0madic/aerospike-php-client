@@ -273,8 +273,21 @@ fn close_client_entries(entries: impl IntoIterator<Item = ClientEntry>) {
     let _guard = rt.enter();
     for entry in entries {
         trace!("closing cached client for {}", entry.hosts);
-        if let Err(e) = entry.client.close() {
-            trace!("error closing client for {}: {e}", entry.hosts);
+        // Panic boundary is mandatory here: this runs from `aerospike_php_shutdown`, an
+        // `extern "C"` MSHUTDOWN hook, where an unwind would cross the FFI boundary and
+        // abort the PHP worker. Raw `catch_unwind` rather than `catch_panic`: there is no
+        // PHP frame left to throw into at shutdown, so a panic is logged and the remaining
+        // entries are still closed.
+        let closed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.client.close()));
+        match closed {
+            Ok(Err(e)) => trace!("error closing client for {}: {e}", entry.hosts),
+            Err(payload) => trace!(
+                "panic closing client for {}: {}",
+                entry.hosts,
+                panic_message(payload.as_ref())
+            ),
+            Ok(Ok(())) => {}
         }
     }
 }
@@ -453,15 +466,22 @@ fn throw_msg<T>(msg: &str, default: T) -> PhpResult<T> {
 /// invariant a panic can tear.
 fn catch_panic<T>(f: impl FnOnce() -> T) -> PhpResult<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
-        let msg = payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic".to_string());
         PhpException::from_class::<AerospikeException>(format!(
-            "internal error in aerospike client: {msg}"
+            "internal error in aerospike client: {}",
+            panic_message(payload.as_ref())
         ))
     })
+}
+
+/// Extracts the human-readable message from a `catch_unwind` payload. `panic!` produces
+/// either a `&'static str` (literal message) or a `String` (formatted message); anything
+/// else carries no message we can render.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// Runs a synchronous aerospike client call inside the Tokio runtime context with the
@@ -2954,7 +2974,7 @@ impl Recordset {
             Some(Ok(r)) => Ok(Some(Record { _as: r })),
             Some(Err(e)) => throw_aero_error(&e, None),
             None => {
-                self.sync_partition_filter_back();
+                self.sync_partition_filter_back()?;
                 Ok(None)
             }
         }
@@ -2963,28 +2983,32 @@ impl Recordset {
 
 impl Recordset {
     /// Copy the post-scan partition cursor from the underlying `aero::Recordset` into the
-    /// originating PHP `PartitionFilter` wrapper. Called exactly once on first end-of-stream.
-    fn sync_partition_filter_back(&mut self) {
+    /// originating PHP `PartitionFilter` wrapper. Runs once per recordset, on the first
+    /// end-of-stream that syncs successfully.
+    fn sync_partition_filter_back(&mut self) -> PhpResult<()> {
         if self.pf_synced {
-            return;
+            return Ok(());
         }
-        self.pf_synced = true;
         let Some(pf_arc) = self.partition_filter.as_ref() else {
-            return;
+            self.pf_synced = true;
+            return Ok(());
         };
         let Some(rs) = self._as.as_ref() else {
-            return;
+            self.pf_synced = true;
+            return Ok(());
         };
-        // A recordset exists only if a client was built in this process, so the runtime
-        // is already cached and this cannot hit the fallible build path.
-        let Ok(updated) = rt_block_on(rs.partition_filter()) else {
-            return;
-        };
+        // Errors must surface: silently dropping one leaves the PHP `PartitionFilter`
+        // holding the pre-scan cursor, so the next page of a paginated scan would silently
+        // re-read the same range. `pf_synced` is only set on success, so a retried
+        // end-of-stream can still sync.
+        let updated = rt_block_on(rs.partition_filter())?;
         if let Some(new_pf) = updated {
             if let Ok(mut guard) = pf_arc.lock() {
                 *guard = new_pf;
             }
         }
+        self.pf_synced = true;
+        Ok(())
     }
 }
 
@@ -7497,11 +7521,15 @@ impl Client {
             };
             let c = {
                 let _guard = rt.enter();
-                match aero::Client::new(&aero_policy, &hosts) {
-                    Ok(c) => Arc::new(c),
+                // Same panic boundary as `rt_call`: cluster/policy setup inside the
+                // aerospike crate can panic (e.g. malformed TLS material), and unwinding
+                // out of this `extern "C"` frame would abort the PHP worker.
+                match catch_panic(|| aero::Client::new(&aero_policy, &hosts)) {
+                    Ok(Ok(c)) => Arc::new(c),
                     // Preserve the structured AerospikeException (code + in_doubt) instead
                     // of flattening to a string with `e.to_string()`.
-                    Err(e) => return (throw_aero_error(&e, Zval::new()), Vec::new()),
+                    Ok(Err(e)) => return (throw_aero_error(&e, Zval::new()), Vec::new()),
+                    Err(e) => return (Err(e), Vec::new()),
                 }
             };
 
@@ -7548,6 +7576,11 @@ impl Client {
     /// and are closed automatically at module shutdown. Use it when a connection is known
     /// to be obsolete (e.g. after credential rotation) to release its pool immediately.
     pub fn close(&self) -> PhpResult<()> {
+        // Close *before* evicting: `rt_call` turns a panic inside close() into a thrown
+        // exception, and an entry already removed from the cache would then leak its pool
+        // and tend task with nothing left referencing it — module shutdown could not close
+        // it either. On the error path the entry stays cached and MSHUTDOWN retries.
+        let closed = rt_call(|| self.client.close())?;
         {
             let mut cache = clients_lock();
             let cache_key = format!("{}|{}", self.hosts, self.policy_fingerprint);
@@ -7561,7 +7594,7 @@ impl Client {
                 }
             }
         }
-        if let Err(e) = rt_call(|| self.client.close())? {
+        if let Err(e) = closed {
             return throw_aero_error(&e, ());
         }
         Ok(())
@@ -8988,8 +9021,12 @@ impl From<PHPValue> for aero::Value {
             PHPValue::HashMap(h) => {
                 aero::Value::HashMap(h.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
             }
-            // Entry order survives the round-trip as an ordered key/value pair list.
-            PHPValue::OrderedMap(pairs) => aero::Value::KeyValueList(
+            // Written back as a K-ordered map. `KeyValueList` would preserve the exact
+            // entry order, but the aerospike crate refuses to serialize it (estimate_size
+            // and write_to both return InvalidArgument), so a value read as an ordered map
+            // could never be stored again. A `BTreeMap` re-sorts by key — which is exactly
+            // the server-side ordering of a K-ordered map — and does serialize.
+            PHPValue::OrderedMap(pairs) => aero::Value::OrderedMap(
                 pairs.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
             ),
             // Aerospike has no separate Json type; collapse to a string-keyed HashMap.

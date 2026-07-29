@@ -46,31 +46,95 @@ class CDTBitwiseOpTest extends TestCase
         self::$cdtBinName = self::randomString(random_int(5, 10));
     }
 
-    protected function testBitModifyRegion($bin_sz, $offset, $set_sz, $expected, $isInsert, ...$ops)
+    /** Expands a byte array into its bit string, MSB first ("11111111" for [0xFF]). */
+    private static function bitString(array $bytes): string
     {
-        $dp = new WritePolicy();
-        self::$client->delete($dp, self::$key);
-        $initial = array_fill(0, $bin_sz, 0xFF);
-
-        $wp = new WritePolicy();
-        self::$client->put($wp, self::$key, [new Bin(self::$cdtBinName, $initial)]);
-
-        $int_sz = 64;
-
-        if ($set_sz < $int_sz) {
-            $int_sz = $set_sz;
+        $bits = '';
+        foreach ($bytes as $b) {
+            $bits .= str_pad(decbin($b & 0xFF), 8, '0', STR_PAD_LEFT);
         }
+        return $bits;
+    }
 
+    /** Index of the first bit equal to $value inside [$offset, $offset + $size), or -1. */
+    private static function expectedLscan(array $bytes, int $offset, int $size, bool $value): int
+    {
+        $bits = self::bitString($bytes);
+        $needle = $value ? '1' : '0';
+        for ($i = 0; $i < $size; $i++) {
+            if ($bits[$offset + $i] === $needle) {
+                return $i;
+            }
+        }
+        return -1;
+    }
+
+    /** Index of the last bit equal to $value inside [$offset, $offset + $size), or -1. */
+    private static function expectedRscan(array $bytes, int $offset, int $size, bool $value): int
+    {
+        $bits = self::bitString($bytes);
+        $needle = $value ? '1' : '0';
+        for ($i = $size - 1; $i >= 0; $i--) {
+            if ($bits[$offset + $i] === $needle) {
+                return $i;
+            }
+        }
+        return -1;
+    }
+
+    /** Number of set bits inside [$offset, $offset + $size). */
+    private static function expectedCount(array $bytes, int $offset, int $size): int
+    {
+        return substr_count(substr(self::bitString($bytes), $offset, $size), '1');
+    }
+
+    /** Unsigned integer value of the bits in [$offset, $offset + $size). */
+    private static function expectedInt(array $bytes, int $offset, int $size): int
+    {
+        return bindec(substr(self::bitString($bytes), $offset, $size));
+    }
+
+    /** The bits in [$offset, $offset + $size) repacked left-aligned into whole bytes. */
+    private static function expectedRegionBytes(array $bytes, int $offset, int $size): array
+    {
+        $region = str_pad(
+            substr(self::bitString($bytes), $offset, $size),
+            (int) (ceil($size / 8) * 8),
+            '0',
+            STR_PAD_RIGHT
+        );
+        return array_map('bindec', str_split($region, 8));
+    }
+
+    /**
+     * Applies bitwise modify ops to a bin pre-filled with $bin_sz 0xFF bytes and checks the
+     * result twice over: the stored bin must equal $expected, and the read-back ops
+     * (lscan/rscan/getInt/count/get) issued in the same `operate()` round trip must agree
+     * with what $expected implies.
+     *
+     * This used to be a `protected function testBitModifyRegion(...)`: PHPUnit only runs
+     * public methods, so it never executed — and it had no assertions at all (it built
+     * a BatchWrite and dropped it on the floor, never using $expected).
+     */
+    private function assertBitModifyRegion(int $bin_sz, int $offset, int $set_sz, array $expected, bool $isInsert, ...$ops): void
+    {
+        $wp = new WritePolicy();
+        self::$client->delete($wp, self::$key);
+        $initial = array_fill(0, $bin_sz, 0xFF);
+        self::$client->put($wp, self::$key, [new Bin(self::$cdtBinName, Value::blob($initial))]);
+
+        $int_sz = min(64, $set_sz);
         $bin_bit_sz = $bin_sz * 8;
-
         if ($isInsert) {
             $bin_bit_sz += $set_sz;
         }
+        $this->assertSame(
+            $bin_bit_sz,
+            count($expected) * 8,
+            "test case is inconsistent: \$expected does not match \$bin_sz/\$isInsert"
+        );
 
-        foreach ($ops as $op) {
-            $full_ops[] = $op;
-        }
-
+        $full_ops = $ops;
         $full_ops[] = BitwiseOp::lscan(self::$cdtBinName, $offset, $set_sz, true);
         $full_ops[] = BitwiseOp::rscan(self::$cdtBinName, $offset, $set_sz, true);
         $full_ops[] = BitwiseOp::getInt(self::$cdtBinName, $offset, $int_sz, false);
@@ -79,9 +143,72 @@ class CDTBitwiseOpTest extends TestCase
         $full_ops[] = BitwiseOp::rscan(self::$cdtBinName, 0, $bin_bit_sz, false);
         $full_ops[] = BitwiseOp::get(self::$cdtBinName, $offset, $set_sz);
 
-        $bwp = new BatchWritePolicy();
-        $bp = new BatchPolicy();
-        $batchWrite = new BatchWrite($bwp, self::$key, $full_ops);
+        $record = self::$client->operate($wp, self::$key, $full_ops);
+        $this->assertNotNull($record);
+
+        // The seven read ops all target the same bin, so their results arrive as a list
+        // in operation order; the modify ops return nothing and are not represented.
+        $results = $record->getBins()[self::$cdtBinName];
+        $this->assertIsArray($results);
+        $this->assertCount(7, $results);
+
+        $this->assertSame(self::expectedLscan($expected, $offset, $set_sz, true), $results[0], 'lscan(region, 1)');
+        $this->assertSame(self::expectedRscan($expected, $offset, $set_sz, true), $results[1], 'rscan(region, 1)');
+        $this->assertSame(self::expectedInt($expected, $offset, $int_sz), $results[2], 'getInt(region)');
+        $this->assertSame(self::expectedCount($expected, $offset, $set_sz), $results[3], 'count(region)');
+        $this->assertSame(self::expectedLscan($expected, 0, $bin_bit_sz, false), $results[4], 'lscan(bin, 0)');
+        $this->assertSame(self::expectedRscan($expected, 0, $bin_bit_sz, false), $results[5], 'rscan(bin, 0)');
+        $this->assertInstanceOf(BLOB::class, $results[6]);
+        $this->assertSame(self::expectedRegionBytes($expected, $offset, $set_sz), $results[6]->getValue(), 'get(region)');
+
+        // And the bin itself must hold exactly the expected bytes.
+        $rp = new ReadPolicy();
+        $stored = self::$client->get($rp, self::$key);
+        $storedBin = $stored->getBins()[self::$cdtBinName];
+        $this->assertInstanceOf(BLOB::class, $storedBin);
+        $this->assertSame($expected, $storedBin->getValue());
+    }
+
+    public function testBitModifyRegionSet()
+    {
+        $policy = new BitwisePolicy(BitwiseWriteFlags::Default());
+        // [FF FF FF FF] with the second byte overwritten by 0x55.
+        self::assertBitModifyRegion(
+            4,
+            8,
+            8,
+            [0xFF, 0x55, 0xFF, 0xFF],
+            false,
+            BitwiseOp::set($policy, self::$cdtBinName, 8, 8, [0x55])
+        );
+    }
+
+    public function testBitModifyRegionInsert()
+    {
+        $policy = new BitwisePolicy(BitwiseWriteFlags::Default());
+        // A whole byte is inserted, so the bin grows by 8 bits.
+        self::assertBitModifyRegion(
+            2,
+            8,
+            8,
+            [0xFF, 0x0F, 0xFF],
+            true,
+            BitwiseOp::insert($policy, self::$cdtBinName, 1, [0x0F])
+        );
+    }
+
+    public function testBitModifyRegionNot()
+    {
+        $policy = new BitwisePolicy(BitwiseWriteFlags::Default());
+        // Bits 4..11 of [FF FF FF] flipped to 0.
+        self::assertBitModifyRegion(
+            3,
+            0,
+            16,
+            [0xF0, 0x0F, 0xFF],
+            false,
+            BitwiseOp::not($policy, self::$cdtBinName, 4, 8)
+        );
     }
 
     protected function assertBitModifyOperations($initial, $expected, ...$ops)

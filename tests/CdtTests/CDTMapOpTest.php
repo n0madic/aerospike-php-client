@@ -58,24 +58,49 @@ class CDTMapOpTest extends TestCase{
         $this->assertEquals($record->getBins()[self::$cdtBinName], ["a" => 1, "b" => 2, "c" => 3, "d" => 4, "e" => 5, "f" => 6]);
     }
 
+    // Regression test: this used to pass `MapWriteFlags::UpdateOnly()` (an object) as
+    // MapPolicy's second parameter, which is declared `?array $flags` — ext-php-rs
+    // silently substituted `None` for the nullable argument, so the flag was dropped and
+    // the test was green without ever exercising it. Flags must be passed as an array;
+    // and with UPDATE_ONLY really applied, writing new keys into a non-existent map is
+    // denied by the server, so the map is created up front here.
     public function testShouldUnpackOrderedCDTMap(){
-        $bwp = new BatchWritePolicy(); 
+        $bwp = new BatchWritePolicy();
         $bp = new BatchPolicy();
-        $mp = new MapPolicy(MapOrderType::KeyValueOrdered(), MapWriteFlags::UpdateOnly());
+        $create = new MapPolicy(MapOrderType::KeyValueOrdered());
         $map = [
             "mk1" => ["v1.0", "v1.1"],
             "mk2" => ["v2.0", "v2.1"]
         ];
-        $ops = [MapOp::put($mp, self::$cdtBinName, $map)];
+        $ops = [MapOp::put($create, self::$cdtBinName, $map)];
+        $bw = new BatchWrite($bwp, self::$key, $ops);
+        self::$client->batch($bp, [$bw]);
+
+        // UPDATE_ONLY + NO_FAIL: "mk1" exists, so it is updated; "mk3" does not, so the
+        // server denies it silently instead of failing the whole operation. The denial is
+        // what proves the flags actually reached the server.
+        $updateOnly = new MapPolicy(
+            MapOrderType::KeyValueOrdered(),
+            [MapWriteFlags::updateOnly(), MapWriteFlags::noFail()]
+        );
+        $ops = [MapOp::put($updateOnly, self::$cdtBinName, [
+            "mk1" => ["v1.0", "v1.1"],
+            "mk3" => ["v3.0"],
+        ])];
         $bw = new BatchWrite($bwp, self::$key, $ops);
         self::$client->batch($bp, [$bw]);
 
         $brp = new BatchReadPolicy();
-        $ops = [MapOp::getByKeys($mp, self::$cdtBinName, ["mk1"], MapReturnType::value())];
+        $ops = [MapOp::getByKeys($create, self::$cdtBinName, ["mk1"], MapReturnType::value())];
         $br = BatchRead::ops($brp, self::$key, $ops);
         $recs = self::$client->batch($bp, [$br]);
         $this->assertEquals($recs[0]->getRecord()->getBins()[self::$cdtBinName][0][0], "v1.0");
         $this->assertEquals($recs[0]->getRecord()->getBins()[self::$cdtBinName][0][1], "v1.1");
+
+        // UPDATE_ONLY must have rejected the brand-new key.
+        $rp = new ReadPolicy();
+        $stored = self::$client->get($rp, self::$key);
+        $this->assertSame(["mk1", "mk2"], array_keys($stored->getBins()[self::$cdtBinName]));
     }
 
     // Regression test: MapReturnType INVERTED used to be a bare value with no base type

@@ -129,6 +129,44 @@ class ScanTest extends TestCase
     // nothing repeats. (Syncing the cursor inside close() itself would be wrong: the
     // upstream tracker records delivered records, not consumed ones, so it would skip
     // whatever was still buffered — that variant lost ~half the records when tried.)
+    /**
+     * Regression: closing a scan whose queue is full used to deadlock the worker forever.
+     *
+     * The reader tasks hold the recordset's tracker lock across `push().await`, so a queue
+     * nobody drains parks them with that lock held — and reading the pagination cursor at
+     * end-of-stream waits on the very same lock. `setRecordQueueSize(1)` makes the queue
+     * overflow immediately, which turns a timing-dependent hang into a deterministic one:
+     * before the fix this method never returned.
+     */
+    public function testScanCloseWithFullQueueDoesNotDeadlock()
+    {
+        $pf = PartitionFilter::all();
+        $sp = new ScanPolicy();
+        // One slot: the readers block on the second record they produce.
+        $sp->setRecordQueueSize(1);
+
+        $started = microtime(true);
+        $rs = self::$client->scan($sp, $pf, self::$namespace, self::$set);
+        $this->assertNotNull($rs);
+
+        $seen = 0;
+        while ($rec = $rs->next()) {
+            $seen++;
+            if ($seen === 10) {
+                // Cancel mid-stream, then keep draining — this is the documented
+                // early-stop pattern, and the path that used to hang.
+                $rs->close();
+            }
+        }
+
+        $this->assertGreaterThanOrEqual(10, $seen, "scan must deliver the records read before close()");
+        $this->assertLessThan(
+            60.0,
+            microtime(true) - $started,
+            "close() on a full queue must not block the worker"
+        );
+    }
+
     public function testScanPaginateWithEarlyCloseAndDrain()
     {
         $pf = PartitionFilter::all();
@@ -185,7 +223,8 @@ class ScanTest extends TestCase
             $this->assertNotNull($recordset);
 
             $recs = self::checkResults($recordset, 0);
-            $this->assertLessThanOrEqual($recs, $sp->getMaxRecords());
+            // A page may never exceed the configured max_records cap.
+            $this->assertLessThanOrEqual($sp->getMaxRecords(), $recs);
             $received += $recs;
         }
     }
@@ -208,22 +247,43 @@ class ScanTest extends TestCase
         }
     }
 
+    // Regression test: this used to combine max_records=20 with a cancel point of
+    // keyCount/2 = 50, so a page never reached the cancel point, close() was never called
+    // and the cancellation path was not exercised at all. The scan is now uncapped (every
+    // record is streamed by one call), so the cancel point is always reached mid-stream.
+    //
+    // What is asserted is the observable contract of close(): the recordset flips to
+    // inactive and iteration terminates. How *many* records still arrive afterwards is
+    // deliberately not asserted — the client buffers up to record_queue_size (1024 by
+    // default) records ahead of the consumer, so a 100-record scan may legitimately be
+    // fully buffered by the time close() lands.
     public function testScanMustCancel()
     {
         $pf = PartitionFilter::range(0, 4096);
         $sp = new ScanPolicy();
-        $sp->setMaxRecords(20);
 
-        $times = 0;
-        $received = 0;
-        while ($received < self::$keyCount) {
-            $times++;
-            $recordset = self::$client->scan($sp, $pf, self::$namespace, self::$set);
-            $this->assertNotNull($recordset);
+        $cancelAfter = 10;
+        $this->assertLessThan(self::$keyCount, $cancelAfter);
 
-            $recs = self::checkResults($recordset, self::$keyCount / 2);
-            $received += $recs;
+        $recordset = self::$client->scan($sp, $pf, self::$namespace, self::$set);
+        $this->assertNotNull($recordset);
+        $this->assertTrue($recordset->getActive());
+
+        $counter = 0;
+        $cancelled = false;
+        while ($rec = $recordset->next()) {
+            $this->assertEquals(23, $rec->getBins()['AerospikeBin1']);
+            $counter++;
+            if ($counter === $cancelAfter) {
+                $recordset->close();
+                $cancelled = true;
+                $this->assertFalse($recordset->getActive());
+            }
         }
+
+        $this->assertTrue($cancelled, "scan ended before the cancel point — cancellation was never exercised");
+        $this->assertFalse($recordset->getActive(), "close() must leave the recordset inactive");
+        $this->assertGreaterThanOrEqual($cancelAfter, $counter);
     }
 
     function randomString($length)

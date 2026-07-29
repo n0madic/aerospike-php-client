@@ -148,32 +148,51 @@ class QueryTest extends TestCase
         $this->assertEquals($counter, self::$keyCount - 334);
     }
 
+    /**
+     * Drains a query that is expected to fail and returns the raised exception.
+     *
+     * The failure may surface either from `query()` itself or from the first `next()`
+     * that reads the server's error off the stream, so both are covered. Previously
+     * these tests asserted `assertNull($rec)` *inside* `while ($rec = ...->next())`,
+     * where the body only runs when `$rec` is truthy — the assertion was unreachable.
+     */
+    private function expectFailingQuery($qp, $pf, $statement): AerospikeException
+    {
+        $received = 0;
+        $caught = null;
+        try {
+            $recordSet = self::$client->query($qp, $pf, $statement);
+            while ($recordSet->next() !== null) {
+                $received++;
+            }
+        } catch (AerospikeException $e) {
+            $caught = $e;
+        }
+        $this->assertSame(0, $received, "a failing query must not yield any record");
+        $this->assertNotNull($caught, "expected the query to raise an AerospikeException");
+        return $caught;
+    }
+
     public function testQueryIndexNotFound()
     {
-        $this->expectException(AerospikeException::class);
         $pf =  PartitionFilter::all();
         $qp = new QueryPolicy();
         $rangeFilter = Filter::Range(self::randomString(5), 1, 2);
         $statement = new Statement(self::$namespace, self::$set, $rangeFilter);
 
-        $recordSet = self::$client->query($qp, $pf, $statement);
-        while ($rec = $recordSet->next()) {
-            $this->assertNull($rec);
-        }
+        $e = self::expectFailingQuery($qp, $pf, $statement);
+        $this->assertNotEmpty($e->getMessage());
     }
 
     public function testQueryNonIndexedField()
     {
-        $this->expectException(AerospikeException::class);
         $pf =  PartitionFilter::all();
         $qp = new QueryPolicy();
         $rangeFilter = Filter::Range("AerospikeBin2", 1, 2);
         $statement = new Statement(self::$namespace, self::$set, $rangeFilter);
 
-        $recordSet = self::$client->query($qp, $pf, $statement);
-        while ($rec = $recordSet->next()) {
-            $this->assertNull($rec);
-        }
+        $e = self::expectFailingQuery($qp, $pf, $statement);
+        $this->assertNotEmpty($e->getMessage());
     }
 
     public function testQueryAndGetAllRecords()

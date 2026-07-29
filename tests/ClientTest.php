@@ -306,15 +306,51 @@ final class ClientTest extends TestCase
         if (version_compare(preg_replace('/[^0-9.].*/', '', $first), '8.0.0', '<')) {
             $this->markTestSkipped("read_touch_ttl_percent requires server v8+ (running {$first})");
         }
-        $stringKey = new Key(self::$namespace, self::$set, "new_key");
+        $stringKey = new Key(self::$namespace, self::$set, "read_touch_key");
+        $ttl = 10;
         $wp = new WritePolicy();
-        $wp->setExpiration(Expiration::Seconds(10));
+        $wp->setExpiration(Expiration::Seconds($ttl));
         self::$client->put($wp, $stringKey, [new Bin("record", "expires_in_10")]);
+
+        // The server only re-touches when the remaining TTL has dropped below
+        // read_touch_ttl_percent of the original. Reading immediately after the write
+        // (as this test used to do) leaves the TTL at 100%, so the assertion passed even
+        // when the policy field was never sent. Let the TTL decay past the 80% mark first.
+        sleep(4);
+
+        // Control: a plain read must NOT extend the TTL.
+        $plain = new ReadPolicy();
+        $beforeTouch = self::$client->get($plain, $stringKey)->getRemainingTtl();
+        $this->assertLessThan(
+            (int) ($ttl * 0.8),
+            $beforeTouch,
+            "TTL must have decayed below the 80% threshold for read-touch to trigger"
+        );
+
+        // Read with read_touch_ttl_percent=80: the server resets the record's TTL. The
+        // response to this very read still carries the pre-touch TTL.
         $rp = new ReadPolicy();
         $rp->setReadTouchTtlPercent(80);
-        $record = self::$client->get($rp, $stringKey);
-        // After a touch, remaining TTL should be reset close to the original 10s.
-        $this->assertGreaterThanOrEqual(8, $record->getRemainingTtl());
+        $touchedRead = self::$client->get($rp, $stringKey);
+        $this->assertSame("expires_in_10", $touchedRead->getBins()["record"]);
+
+        // The server applies the touch asynchronously, so re-read without the touch policy
+        // and poll until the refreshed TTL shows up (without the poll this is ~60% flaky).
+        $afterTouch = $beforeTouch;
+        $deadline = microtime(true) + 5.0;
+        while (microtime(true) < $deadline) {
+            $afterTouch = self::$client->get($plain, $stringKey)->getRemainingTtl();
+            if ($afterTouch > $beforeTouch) {
+                break;
+            }
+            usleep(100_000);
+        }
+        $this->assertGreaterThan(
+            $beforeTouch,
+            $afterTouch,
+            "read with read_touch_ttl_percent=80 must have extended the record TTL"
+        );
+        $this->assertGreaterThanOrEqual($ttl - 2, $afterTouch);
     }
 
     // Regression test: out-of-range values used to silently fall back to the server

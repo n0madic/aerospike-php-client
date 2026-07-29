@@ -155,11 +155,42 @@ final class SecurityTest extends TestCase
         if (!$this->isSecurityEnabled()) {
             $this->markTestSkipped("Enable Security in Aerospike.conf");
         }
-        $this->expectNotToPerformAssertions();
         $ap = new AdminPolicy();
         $user = $this->uniqueUserName();
         self::$client->createUser($ap, $user, "password", ["read-write"]);
         usleep(self::SMD_PROPAGATION_MS * 1000);
-        self::$client->changePassword($ap, $user, "newPassword");
+
+        // Single-user form: exactly the requested user, with the role it was created with.
+        $single = self::$client->queryUsers($ap, $user);
+        $this->assertCount(1, $single);
+        $this->assertInstanceOf(UserRole::class, $single[0]);
+        $this->assertSame($user, $single[0]->getUser());
+        $this->assertContains("read-write", $single[0]->getRoles());
+
+        // All-users form: must contain at least the user just created plus the admin
+        // account the test suite authenticates with.
+        $all = self::$client->queryUsers($ap);
+        $this->assertGreaterThanOrEqual(2, count($all));
+        $names = array_map(fn (UserRole $u) => $u->getUser(), $all);
+        $this->assertContains($user, $names);
+        $this->assertContains(getenv('AEROSPIKE_USER'), $names);
+    }
+
+    public function testQueryUsersReflectsRoleChanges()
+    {
+        if (!$this->isSecurityEnabled()) {
+            $this->markTestSkipped("Enable Security in Aerospike.conf");
+        }
+        $ap = new AdminPolicy();
+        $user = $this->uniqueUserName();
+        self::$client->createUser($ap, $user, "password", ["read"]);
+        usleep(self::SMD_PROPAGATION_MS * 1000);
+        $this->assertSame(["read"], self::$client->queryUsers($ap, $user)[0]->getRoles());
+
+        self::$client->grantRoles($ap, $user, ["read-write"]);
+        usleep(self::SMD_PROPAGATION_MS * 1000);
+        $roles = self::$client->queryUsers($ap, $user)[0]->getRoles();
+        sort($roles);
+        $this->assertSame(["read", "read-write"], $roles);
     }
 }

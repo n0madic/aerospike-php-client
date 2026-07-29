@@ -11,6 +11,9 @@ final class BatchOpsTest extends TestCase
     protected static $set = "test";
     protected static $hosts;
 
+    /** Bin values written by setUpBeforeClass(), keyed by user key ("record_1" ... "record_10"). */
+    protected static $written = [];
+
     public static function generateRandomReport() {
         $shape = ["circle", "triangle", "square"];
         $summary = "Summary " . mt_rand(1000, 9999);
@@ -57,18 +60,59 @@ final class BatchOpsTest extends TestCase
             // Write the record
             $wp = new WritePolicy();
             self::$client->put($wp, $key, $bins);
+
+            self::$written["record_$i"] = [
+                "Occurred" => $occurred,
+                "Reported" => $reported,
+                "Posted" => $posted,
+                "Report" => $reportData,
+            ];
         }
     }
 
     public function testBatchOpsRead(){
         $brp = new BatchReadPolicy();
 
-        $brkey = new Key(self::$namespace, self::$set, 1);
-        $batchRead = new BatchRead($brp, $brkey, []);
-        
+        // setUpBeforeClass() writes "record_1" ... "record_10". This used to read the key
+        // `1`, which was never written, so the batch returned an empty record and the lone
+        // assertIsArray() still passed.
+        $userKeys = ["record_1", "record_5", "record_10"];
+        $reads = [];
+        foreach ($userKeys as $userKey) {
+            $reads[] = new BatchRead($brp, new Key(self::$namespace, self::$set, $userKey), []);
+        }
+
         $bp = new BatchPolicy();
-        $recs = self::$client->batch($bp, [$batchRead]);
-        $this->assertIsArray($recs);
+        $recs = self::$client->batch($bp, $reads);
+        $this->assertCount(count($userKeys), $recs, "batch must return one result per command, in order");
+
+        foreach ($userKeys as $i => $userKey) {
+            $record = $recs[$i]->getRecord();
+            $this->assertNotNull($record, "$userKey must have been found");
+            $bins = $record->getBins();
+            $expected = self::$written[$userKey];
+            $this->assertSame($expected["Occurred"], $bins["Occurred"]);
+            $this->assertSame($expected["Reported"], $bins["Reported"]);
+            $this->assertSame($expected["Posted"], $bins["Posted"]);
+            $this->assertEquals($expected["Report"], $bins["Report"]);
+            $this->assertGreaterThan(0, $record->getGeneration());
+        }
+    }
+
+    public function testBatchOpsReadMissingKeyYieldsNoRecord(){
+        $brp = new BatchReadPolicy();
+        $missing = new Key(self::$namespace, self::$set, "record_does_not_exist_" . mt_rand());
+        $present = new Key(self::$namespace, self::$set, "record_1");
+
+        $bp = new BatchPolicy();
+        $recs = self::$client->batch($bp, [
+            new BatchRead($brp, $missing, []),
+            new BatchRead($brp, $present, []),
+        ]);
+
+        $this->assertCount(2, $recs);
+        $this->assertNull($recs[0]->getRecord(), "a missing key must yield a null record");
+        $this->assertNotNull($recs[1]->getRecord());
     }
 
     public function testBatchOpsWrite(){
@@ -77,10 +121,19 @@ final class BatchOpsTest extends TestCase
         $bwp = new BatchWritePolicy();
         $ops = [Operation::put(new Bin("ibin", 10)), Operation::put(new Bin("sbin", "string_val"))];
         $bw = new BatchWrite($bwp, $stringKey, $ops);
-        
+
         $bp = new BatchPolicy();
         $recs = self::$client->batch($bp, [$bw]);
-        $this->assertIsArray($recs);
+        $this->assertCount(1, $recs);
+        $this->assertEquals($stringKey->getDigest(), $recs[0]->getKey()->getDigest());
+
+        // The batch write must actually have landed on the server.
+        $rp = new ReadPolicy();
+        $stored = self::$client->get($rp, $stringKey);
+        $this->assertNotNull($stored);
+        $bins = $stored->getBins();
+        $this->assertSame(10, $bins["ibin"]);
+        $this->assertSame("string_val", $bins["sbin"]);
     }
 
     public function testBatchOpsDelete(){
@@ -106,14 +159,36 @@ final class BatchOpsTest extends TestCase
     public function testBatchReadWrite(){
         $brp = new BatchReadPolicy();
         $bwp = new BatchWritePolicy();
-        $batchKey = new Key(self::$namespace, self::$set, "batch_key");
+        $batchKey = new Key(self::$namespace, self::$set, "batch_read_write_key");
+        // Start from a known state so the read-back values cannot be leftovers.
+        $wp = new WritePolicy();
+        self::$client->put($wp, $batchKey, [new Bin("ibin", 1), new Bin("sbin", "seed")]);
+
         $ops = [Operation::put(new Bin("ibin", 10)), Operation::put(new Bin("sbin", "string_val"))];
         $batchRead = new BatchRead($brp, $batchKey, []);
         $batchWrite = new BatchWrite($bwp, $batchKey, $ops);
 
         $bp = new BatchPolicy();
         $batchRecords = self::$client->batch($bp, [$batchWrite, $batchRead]);
-        $this->assertIsArray($batchRecords);
+        $this->assertCount(2, $batchRecords, "one result per batch command");
+
+        foreach ($batchRecords as $br) {
+            $this->assertEquals($batchKey->getDigest(), $br->getKey()->getDigest());
+        }
+
+        // The read command must come back with the record. Batch sub-transactions are not
+        // ordered against each other, so it may observe the record either before or after
+        // the write in the same batch — both are valid, an absent record is not.
+        $readRecord = $batchRecords[1]->getRecord();
+        $this->assertNotNull($readRecord, "the read command must return the record");
+        $bins = $readRecord->getBins();
+        $this->assertContains($bins["ibin"], [1, 10]);
+        $this->assertContains($bins["sbin"], ["seed", "string_val"]);
+
+        // The write in the same batch must have landed.
+        $stored = self::$client->get(new ReadPolicy(), $batchKey)->getBins();
+        $this->assertSame(10, $stored["ibin"]);
+        $this->assertSame("string_val", $stored["sbin"]);
     }
 
     public function testBatchWriteMultipleOpsAppend(){

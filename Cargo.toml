@@ -2,7 +2,7 @@
 name = "aerospike_php"
 version = "2.0.0-dev"
 edition = "2021"
-authors = ["Khosrow Afroozeh <khosrow@aerospike.com>", "Sachin Venkatesha Murthy <smurthy@aerospike.com>"]
+authors = ["Khosrow Afroozeh <khosrow@aerospike.com>", "Sachin Venkatesha Murthy <smurthy@aerospike.com>", "n0madic <nomadic_ua@gmail.com>"]
 
 [lib]
 crate-type = ["cdylib"]

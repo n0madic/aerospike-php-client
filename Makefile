@@ -4,7 +4,33 @@
 UNAME_S := $(shell uname -s)
 EXT_DIR_PATH := $(shell php -r 'echo ini_get("extension_dir");')
 PHP_INI_PATH := $(shell php -r 'echo php_ini_loaded_file();')
-PHP_INI_CONTENT := $(shell cat ${PHP_INI_PATH})
+
+# Official `php:8.x-cli` images (and any build configured with --without-config-file)
+# load no php.ini at all, so PHP_INI_PATH comes back empty. Registering the
+# extension in the conf.d scan dir is what docker/test.sh does, so do the same
+# here instead of `cat`-ing / `tee`-ing an empty filename.
+PHP_INI_SCAN_DIR := $(shell php -r 'echo PHP_CONFIG_FILE_SCAN_DIR;')
+
+ifneq ($(strip $(PHP_INI_PATH)),)
+    PHP_INI_TARGET := $(PHP_INI_PATH)
+else ifneq ($(strip $(PHP_INI_SCAN_DIR)),)
+    PHP_INI_TARGET := $(PHP_INI_SCAN_DIR)/aerospike.ini
+else
+    PHP_INI_TARGET :=
+endif
+
+PHP_INI_CONTENT := $(if $(strip $(PHP_INI_TARGET)),$(shell cat $(PHP_INI_TARGET) 2>/dev/null))
+
+# Guard for the install recipes: never let the extension be "installed" without
+# actually being registered with PHP.
+define require_php_ini_target
+	@test -n "$(strip $(PHP_INI_TARGET))" || { \
+		echo "ERROR: this PHP loads no php.ini and reports no conf.d scan dir"; \
+		echo "       (php -r 'echo php_ini_loaded_file(), PHP_CONFIG_FILE_SCAN_DIR;' is empty)."; \
+		echo "       Point PHP at an ini file, or add 'extension=libaerospike_php$(EXTENSION)' manually."; \
+		exit 1; \
+	}
+endef
 
 ifeq ($(UNAME_S),Darwin)
     EXTENSION := .dylib
@@ -38,7 +64,8 @@ build:
 install-dev: build-dev
 	cp -f target/debug/libaerospike_php$(EXTENSION) $(EXT_DIR_PATH)
 ifeq (,$(findstring libaerospike_php,$(PHP_INI_CONTENT)))
-	echo "extension=libaerospike_php$(EXTENSION)" | tee -a $(PHP_INI_PATH)
+	$(require_php_ini_target)
+	echo "extension=libaerospike_php$(EXTENSION)" | tee -a $(PHP_INI_TARGET)
 endif
 
 # Copy-only: installs the already-built .so without touching cargo. Split out
@@ -47,7 +74,8 @@ endif
 install-only:
 	cp -f target/release/libaerospike_php$(EXTENSION) $(EXT_DIR_PATH)
 ifeq (,$(findstring libaerospike_php,$(PHP_INI_CONTENT)))
-	echo "extension=libaerospike_php$(EXTENSION)" | tee -a $(PHP_INI_PATH)
+	$(require_php_ini_target)
+	echo "extension=libaerospike_php$(EXTENSION)" | tee -a $(PHP_INI_TARGET)
 endif
 
 install: build install-only

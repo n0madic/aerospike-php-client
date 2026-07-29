@@ -46,7 +46,11 @@ echo "Copying extension to $EXT_DIR/"
 cp -f "$SO_FILE_PATH" "$EXT_DIR/" \
     || log_error_and_exit "Failed to copy extension."
 
-if [[ -n "$PHP_INI_PATH" ]] && ! grep -q "^extension=libaerospike_php\.so$" "$PHP_INI_PATH"; then
+# Tolerate the spacing php.ini allows around `=` so a second install does not
+# append a duplicate directive (`extension = libaerospike_php.so` counts too).
+EXT_DIRECTIVE_RE='^[[:space:]]*extension[[:space:]]*=[[:space:]]*libaerospike_php\.so[[:space:]]*$'
+
+if [[ -n "$PHP_INI_PATH" ]] && ! grep -Eq "$EXT_DIRECTIVE_RE" "$PHP_INI_PATH"; then
     echo "Adding 'extension=libaerospike_php.so' to $PHP_INI_PATH"
     echo "extension=libaerospike_php.so" | tee -a "$PHP_INI_PATH" > /dev/null \
         || log_error_and_exit "Failed to add extension directive."

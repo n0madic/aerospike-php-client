@@ -7,6 +7,13 @@ on:
     tags:
       - 'v*'
 
+# The extension is compiled against one PHP release's ZEND_MODULE_API_NO and only
+# loads under that PHP minor version. Single source of truth: it drives the PHP
+# toolchain used for the build, the package dependency metadata and the artefact
+# names, so those can never drift apart.
+env:
+  PHP_VERSION: '8.3'
+
 jobs:
   build-php-client:
     strategy:
@@ -30,7 +37,13 @@ jobs:
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.3'
+          php-version: ${{ env.PHP_VERSION }}
+          # phpize pulls in php$PHP_VERSION-dev, which provides the headers and
+          # php-config ext-php-rs builds against. Do not apt-install php-dev
+          # below: it would resolve to the distro's default PHP and silently
+          # build the extension against a different ZEND_MODULE_API_NO (and
+          # setup-php drops the ondrej apt lists anyway — see test.yml).
+          tools: phpize
 
       - name: Install build prerequisites
         run: |
@@ -40,7 +53,6 @@ jobs:
             build-essential \
             pkg-config \
             libssl-dev \
-            php-dev \
             rpm
 
       - name: Install Rust
@@ -66,11 +78,19 @@ jobs:
           echo "tag=${latest_tag:-2.0.0}" >> "$GITHUB_OUTPUT"
 
       - name: Substitute placeholders in deb control
+        env:
+          VERSION: ${{ steps.get_tag.outputs.tag }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
-          sed -i "s/@VERSION@/${{ steps.get_tag.outputs.tag }}/g" pkg/deb/control
-          sed -i "s/@ARCH@/${{ matrix.deb_arch }}/g" pkg/deb/control
+          sed -i "s/@VERSION@/${VERSION}/g" pkg/deb/control
+          sed -i "s/@ARCH@/${DEB_ARCH}/g" pkg/deb/control
+          sed -i "s/@PHP_VERSION@/${PHP_VERSION}/g" pkg/deb/control
+          cat pkg/deb/control
 
       - name: Package for deb (${{ matrix.deb_arch }})
+        env:
+          VERSION: ${{ steps.get_tag.outputs.tag }}
+          CPU_ARCH: ${{ matrix.cpu_arch }}
         run: |
           mkdir -p pkg/deb/aerospike-php-client-deb/DEBIAN
           mkdir -p pkg/deb/aerospike-php-client-deb/usr/lib
@@ -78,44 +98,50 @@ jobs:
           cp target/release/libaerospike_php.so pkg/deb/aerospike-php-client-deb/usr/lib
 
           cp pkg/deb/control pkg/deb/aerospike-php-client-deb/DEBIAN/
-          cp pkg/deb/scripts/postinst pkg/deb/aerospike-php-client-deb/DEBIAN/
+          # postinst/prerm are hooks by filename, not by a control field.
+          install -m 755 pkg/deb/scripts/postinst pkg/deb/aerospike-php-client-deb/DEBIAN/postinst
+          install -m 755 pkg/deb/scripts/prerm pkg/deb/aerospike-php-client-deb/DEBIAN/prerm
 
           dpkg-deb --build pkg/deb/aerospike-php-client-deb
           mv pkg/deb/aerospike-php-client-deb.deb \
-             pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-${{ matrix.cpu_arch }}.deb
+             "pkg/deb/aerospike-php-client-${VERSION}-php${PHP_VERSION}-${CPU_ARCH}.deb"
 
       - name: Upload DEB ${{ matrix.cpu_arch }} artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aerospike-php-client-deb-${{ matrix.cpu_arch }}
-          path: pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-${{ matrix.cpu_arch }}.deb
+          name: aerospike-php-client-deb-php${{ env.PHP_VERSION }}-${{ matrix.cpu_arch }}
+          path: pkg/deb/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-php${{ env.PHP_VERSION }}-${{ matrix.cpu_arch }}.deb
 
       - name: Package for rpm (${{ matrix.rpm_arch }})
+        env:
+          VERSION: ${{ steps.get_tag.outputs.tag }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+          WORKSPACE: ${{ github.workspace }}
         run: |
-          version="${{ steps.get_tag.outputs.tag }}"
-          rpm_arch="${{ matrix.rpm_arch }}"
-          src_root="${{ github.workspace }}/rpmbuild-src/aerospike-php-client-${version}"
+          src_root="${WORKSPACE}/rpmbuild-src/aerospike-php-client-${VERSION}"
           mkdir -p "$src_root"
           cp target/release/libaerospike_php.so "$src_root/"
           cp pkg/rpm/scripts/postinst "$src_root/"
+          cp pkg/rpm/scripts/prerm "$src_root/"
 
-          mkdir -p "${{ github.workspace }}/rpmbuild/SOURCES"
-          tar -C "${{ github.workspace }}/rpmbuild-src" -czf \
-              "${{ github.workspace }}/rpmbuild/SOURCES/aerospike-php-client-${version}.tar.gz" \
-              "aerospike-php-client-${version}"
+          mkdir -p "${WORKSPACE}/rpmbuild/SOURCES"
+          tar -C "${WORKSPACE}/rpmbuild-src" -czf \
+              "${WORKSPACE}/rpmbuild/SOURCES/aerospike-php-client-${VERSION}.tar.gz" \
+              "aerospike-php-client-${VERSION}"
 
           rpmbuild \
-            --define "_topdir ${{ github.workspace }}/rpmbuild" \
-            --define "VERSION ${version}" \
-            --target "${rpm_arch}" \
+            --define "_topdir ${WORKSPACE}/rpmbuild" \
+            --define "VERSION ${VERSION}" \
+            --define "PHP_VERSION ${PHP_VERSION}" \
+            --target "${RPM_ARCH}" \
             -bb pkg/rpm/aerospike-php-client.spec
 
           mkdir -p pkg/rpm/out
-          cp "${{ github.workspace }}/rpmbuild/RPMS/${rpm_arch}"/*.rpm \
-             "pkg/rpm/out/aerospike-php-client-${version}-${rpm_arch}.rpm"
+          cp "${WORKSPACE}/rpmbuild/RPMS/${RPM_ARCH}"/*.rpm \
+             "pkg/rpm/out/aerospike-php-client-${VERSION}-php${PHP_VERSION}-${RPM_ARCH}.rpm"
 
       - name: Upload RPM ${{ matrix.rpm_arch }} artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aerospike-php-client-rpm-${{ matrix.rpm_arch }}
-          path: pkg/rpm/out/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-${{ matrix.rpm_arch }}.rpm
+          name: aerospike-php-client-rpm-php${{ env.PHP_VERSION }}-${{ matrix.rpm_arch }}
+          path: pkg/rpm/out/aerospike-php-client-${{ steps.get_tag.outputs.tag }}-php${{ env.PHP_VERSION }}-${{ matrix.rpm_arch }}.rpm

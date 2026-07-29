@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+# GENERATED FROM pkg/scripts/prerm-common.sh via pkg/scripts/generate-postinst.sh
+# — do not edit pkg/deb/scripts/prerm or pkg/rpm/scripts/prerm directly.
+#
+# Pre-removal for RPM: undo what postinst did outside the rpm file list — the copy
+# of the extension inside PHP's extension_dir and the `extension=` line in php.ini.
+
+set -e
+
+[ "${1:-0}" = 0 ] || exit 0
+
+# Best effort from here on: a half-removed PHP must never block package removal,
+# so every step degrades to a no-op instead of failing the transaction.
+if ! command -v php > /dev/null; then
+    echo "PHP not found — skipping Aerospike extension cleanup."
+    exit 0
+fi
+
+EXT_DIR=$(php -r 'echo ini_get("extension_dir");' 2>/dev/null) || EXT_DIR=""
+PHP_INI_PATH=$(php -r 'echo php_ini_loaded_file();' 2>/dev/null) || PHP_INI_PATH=""
+
+# Mirror of the postinst copy: the .so inside PHP's extension_dir is not owned by
+# the package manager, so nothing else would ever delete it.
+if [[ -n "$EXT_DIR" && -f "$EXT_DIR/libaerospike_php.so" ]]; then
+    echo "Removing Aerospike PHP extension from $EXT_DIR/"
+    rm -f "$EXT_DIR/libaerospike_php.so" || true
+fi
+
+# Mirror of the postinst `extension=` line. Left behind it makes every later php
+# invocation print "Unable to load dynamic library 'libaerospike_php.so'".
+EXT_DIRECTIVE_RE='^[[:space:]]*extension[[:space:]]*=[[:space:]]*libaerospike_php\.so[[:space:]]*$'
+
+if [[ -n "$PHP_INI_PATH" && -f "$PHP_INI_PATH" ]] \
+    && grep -Eq "$EXT_DIRECTIVE_RE" "$PHP_INI_PATH"; then
+    echo "Removing 'extension=libaerospike_php.so' from $PHP_INI_PATH"
+    # Filtered through a temp file and copied back rather than `sed -i`: writing
+    # into the original inode keeps php.ini's owner, mode and any hard links —
+    # it is a package-manager conffile, not ours to replace.
+    tmp_ini=$(mktemp) || tmp_ini=""
+    if [[ -n "$tmp_ini" ]]; then
+        # grep exits 1 when every line matched; that is a valid (empty) result.
+        grep -Ev "$EXT_DIRECTIVE_RE" "$PHP_INI_PATH" > "$tmp_ini" || true
+        cat "$tmp_ini" > "$PHP_INI_PATH" || true
+        rm -f "$tmp_ini"
+    fi
+fi
+
+echo "Aerospike PHP client v2 removed."

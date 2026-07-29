@@ -1,6 +1,7 @@
-# Self-contained test harness — `make test-docker` brings up Aerospike CE next to a
-# PHP 8.3 + Rust container that builds the extension and runs phpunit against the
-# `test` namespace, then tears everything down. Nothing leaks into the host PHP.
+# Self-contained test harness — `make test-docker` brings up Aerospike CE next to the
+# PHP + Rust container from docker/Dockerfile.test (currently PHP 8.5) that builds
+# the extension and runs phpunit against the `test` namespace, then tears
+# everything down. Nothing leaks into the host PHP.
 #
 # All paths are relative to this file (docker/), so the build context is `..`.
 services:

@@ -1,8 +1,12 @@
-Package: aerospike-php-client-@VERSION@
+Package: aerospike-php-client
 Version: @VERSION@
 Section: Databases
 Priority: optional
 Architecture: @ARCH@
+Depends: php@PHP_VERSION@-cli | php@PHP_VERSION@-common | php@PHP_VERSION@-fpm
+Conflicts: aerospike-php-client-0.1.0, aerospike-php-client-0.2.0, aerospike-php-client-0.3.0-alpha, aerospike-php-client-0.4.0-alpha, aerospike-php-client-0.5.0-beta, aerospike-php-client-1.0.0, aerospike-php-client-1.0.1, aerospike-php-client-1.0.2, aerospike-php-client-1.1.0, aerospike-php-client-1.2.0, aerospike-php-client-1.3.0, aerospike-php-client-1.4.0
+Replaces: aerospike-php-client-0.1.0, aerospike-php-client-0.2.0, aerospike-php-client-0.3.0-alpha, aerospike-php-client-0.4.0-alpha, aerospike-php-client-0.5.0-beta, aerospike-php-client-1.0.0, aerospike-php-client-1.0.1, aerospike-php-client-1.0.2, aerospike-php-client-1.1.0, aerospike-php-client-1.2.0, aerospike-php-client-1.3.0, aerospike-php-client-1.4.0
 Maintainer: Aerospike, Inc. <support@aerospike.com>
 Description: The Aerospike php client library is an aerospike database client library that enables you to build applications using php
-Post-Inst: postinst
+ Built against PHP @PHP_VERSION@; the extension is bound to that PHP release's
+ ZEND_MODULE_API_NO and will not load under a different PHP minor version.

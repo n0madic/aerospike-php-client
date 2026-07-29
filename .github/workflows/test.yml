@@ -87,8 +87,14 @@ jobs:
           phpunit \
           build-essential \
           rustup
-    - name: Download and install latest Rust
-      run: sudo rustup default stable
+    # `sudo rustup default stable` used to live here: it configured root's rustup
+    # only, while every build step runs as the `runner` user. Invoking the cargo
+    # proxy as that user is what actually materialises the toolchain — rustup
+    # installs the channel and components pinned by rust-toolchain.toml on first use.
+    - name: Install Rust toolchain pinned by rust-toolchain.toml
+      run: |
+        cargo --version
+        rustc --version
 
     - name: Add clippy component
       run: rustup component add clippy

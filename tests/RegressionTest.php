@@ -415,4 +415,170 @@ final class RegressionTest extends TestCase
             self::$client->dropIndex($wp, self::$namespace, self::$set, $index, 60000);
         }
     }
+
+    // ---------------------------------------------------------------------------------
+    // 2026-09-28 review: error codes, CDT create encoding, silently dropped arguments.
+    // ---------------------------------------------------------------------------------
+
+    // Info-command errors arrive wrapped in Error::Chain; the server code used to be
+    // flattened to COMMON_ERROR (-17).
+    public function testIndexErrorKeepsServerResultCode()
+    {
+        $wp = new WritePolicy();
+        self::$client->put($wp, self::$key, [new Bin("n", 1)]);
+        $index = "idx_dup_" . self::randomString(8);
+        self::$client->createIndex($wp, self::$namespace, self::$set, "n", $index, IndexType::numeric());
+        try {
+            self::$client->createIndex($wp, self::$namespace, self::$set, "other", $index, IndexType::numeric());
+            $this->fail("creating a conflicting index must throw");
+        } catch (AerospikeException $e) {
+            $this->assertSame(ResultCode::INDEX_FOUND, $e->code);
+        } finally {
+            self::$client->dropIndex($wp, self::$namespace, self::$set, $index);
+        }
+    }
+
+    // Error::UdfBadResponse used to map to COMMON_ERROR instead of UDF_BAD_RESPONSE.
+    public function testUdfErrorReportsUdfBadResponse()
+    {
+        $wp = new WritePolicy();
+        self::$client->put($wp, self::$key, [new Bin("n", 1)]);
+        $module = "reg_udf_" . self::randomString(8);
+        self::$client->registerUdf($wp, "function boom(r)\n  error('boom')\nend\n", "$module.lua", UdfLanguage::lua());
+        try {
+            self::$client->udfExecute($wp, self::$key, $module, "boom", []);
+            $this->fail("a failing UDF must throw");
+        } catch (AerospikeException $e) {
+            $this->assertSame(ResultCode::UDF_BAD_RESPONSE, $e->code);
+        } finally {
+            self::$client->dropUdf($wp, "$module.lua");
+        }
+    }
+
+    // The crate sent the create flag as the list order: the server rejected every
+    // ListOp::create with PARAMETER_ERROR.
+    public function testListCreateOrdered()
+    {
+        $wp = new WritePolicy();
+        self::$client->operate($wp, self::$key, [ListOp::create("l", ListOrderType::ordered(), false)]);
+        self::$client->operate($wp, self::$key, [ListOp::append(new ListPolicy(ListOrderType::unordered()), "l", [3, 1, 2])]);
+        $this->assertSame([1, 2, 3], $this->getBins(self::$key)["l"]);
+    }
+
+    // With a ctx the create flag must travel on the last context element; it used to be
+    // sent as an extra argument and the server answered OP_NOT_APPLICABLE.
+    public function testListCreateOrderedInsideCtx()
+    {
+        $wp = new WritePolicy();
+        $ctx = [Context::mapKey(Value::string("x"))];
+        self::$client->put($wp, self::$key, [new Bin("m", ["a" => 1])]);
+        self::$client->operate($wp, self::$key, [ListOp::create("m", ListOrderType::ordered(), false, null, $ctx)]);
+        self::$client->operate($wp, self::$key, [ListOp::append(new ListPolicy(ListOrderType::unordered()), "m", [3, 1, 2], $ctx)]);
+        $this->assertSame([1, 2, 3], $this->getBins(self::$key)["m"]["x"]);
+    }
+
+    public function testMapCreateKeyOrderedInsideCtx()
+    {
+        $wp = new WritePolicy();
+        $ctx = [Context::mapKey(Value::string("x"))];
+        self::$client->put($wp, self::$key, [new Bin("m", ["a" => 1])]);
+        self::$client->operate($wp, self::$key, [MapOp::create("m", MapOrderType::keyOrdered(), null, $ctx)]);
+        self::$client->operate($wp, self::$key, [MapOp::put(new MapPolicy(MapOrderType::unordered()), "m", ["z" => 1, "b" => 2, "q" => 3], $ctx)]);
+        $this->assertSame(["b", "q", "z"], array_keys($this->getBins(self::$key)["m"]["x"]));
+    }
+
+    // ext-php-rs turns a nullable argument of the wrong type into null without an error:
+    // these calls used to drop the filter, the index filter, the ctx or the return type.
+    public function testSetFilterExpressionRejectsWrongType()
+    {
+        $this->expectException(AerospikeException::class);
+        (new ReadPolicy())->setFilterExpression(Filter::equal("n", 1));
+    }
+
+    public function testStatementRejectsFilterArray()
+    {
+        $this->expectException(AerospikeException::class);
+        new Statement(self::$namespace, self::$set, [Filter::equal("n", 1)]);
+    }
+
+    public function testOperationRejectsInvalidReturnType()
+    {
+        $this->expectException(AerospikeException::class);
+        ListOp::getByIndex("l", 0, 5);
+    }
+
+    public function testOperationRejectsInvalidCtx()
+    {
+        $this->expectException(AerospikeException::class);
+        ListOp::getByIndex("l", 0, null, ["not a context"]);
+    }
+
+    // A single Context is accepted as well as an array of them, and actually applied.
+    public function testOperationAcceptsSingleCtx()
+    {
+        $wp = new WritePolicy();
+        self::$client->put($wp, self::$key, [new Bin("m", ["x" => [1]])]);
+        self::$client->operate($wp, self::$key, [
+            ListOp::append(new ListPolicy(ListOrderType::unordered()), "m", [2], Context::mapKey(Value::string("x"))),
+        ]);
+        $this->assertSame([1, 2], $this->getBins(self::$key)["m"]["x"]);
+    }
+
+    // A wrong-typed `$beforeNanos` became null, which truncates *everything*.
+    public function testTruncateRejectsWrongTypedCutoff()
+    {
+        self::$client->put(new WritePolicy(), self::$key, [new Bin("n", 1)]);
+        try {
+            self::$client->truncate(new InfoPolicy(), self::$namespace, self::$set, "123");
+            $this->fail("a string cutoff must throw");
+        } catch (AerospikeException $e) {
+            $this->assertNotNull(self::$client->get(new ReadPolicy(), self::$key));
+        }
+    }
+
+    public function testCreateIndexRejectsWrongTypedWaitTimeout()
+    {
+        $this->expectException(AerospikeException::class);
+        self::$client->createIndex(new WritePolicy(), self::$namespace, self::$set, "n",
+            "idx_bad_" . self::randomString(8), IndexType::numeric(), null, null, "5000");
+    }
+
+    public function testInvalidKeyThrowsAerospikeException()
+    {
+        $this->expectException(AerospikeException::class);
+        new Key(self::$namespace, self::$set, [1, 2]);
+    }
+
+    public function testMissingTlsFileThrowsAerospikeException()
+    {
+        $this->expectException(AerospikeException::class);
+        (new ClientPolicy())->setTls("/nonexistent/ca.pem");
+    }
+
+    // getBinNames() returned [] for "all bins" too, so a round trip switched to header-only.
+    public function testStatementBinNamesRoundTrip()
+    {
+        $s = new Statement(self::$namespace, self::$set);
+        $this->assertNull($s->getBinNames());
+        $s->setBinNames($s->getBinNames());
+        $this->assertNull($s->getBinNames());
+
+        $s->setBinNames([]);
+        $this->assertSame([], $s->getBinNames());
+        $s->setBinNames(["a"]);
+        $this->assertSame(["a"], $s->getBinNames());
+    }
+
+    // Zero made the crate panic (bounded(0)) or divide by zero at connect time.
+    public function testRecordQueueSizeRejectsZero()
+    {
+        $this->expectException(AerospikeException::class);
+        (new ScanPolicy())->setRecordQueueSize(0);
+    }
+
+    public function testConnPoolsPerNodeRejectsZero()
+    {
+        $this->expectException(AerospikeException::class);
+        (new ClientPolicy())->setConnPoolsPerNode(0);
+    }
 }

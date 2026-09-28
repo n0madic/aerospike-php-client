@@ -569,29 +569,85 @@ fn pending_exception_or(msg: &str) -> PhpException {
     e
 }
 
-/// Parses a write-flags constructor argument: `null`, a single flag object, or an array of
-/// flag objects (combined by the caller, usually with bitwise OR).
+/// Converts an optional argument taken as a raw zval: `null` (or omitted) → `None`, a value
+/// convertible to `T` → `Some`, anything else throws.
 ///
-/// A `?array`-typed argument is not enough: ext-php-rs turns a nullable argument of the
-/// wrong type into `None` *without any error*, so the single-flag form
-/// `new BitwisePolicy(BitwiseWriteFlags::updateOnly())` silently ran with default flags.
-/// Taking the raw zval lets both forms work and makes anything else throw.
-fn write_flags_arg<T: for<'a> FromZval<'a>>(flags: Option<&Zval>, what: &str) -> PhpResult<Vec<T>> {
-    let invalid = || {
-        PhpException::from_class::<AerospikeException>(format!(
-            "{what}: flags must be null, a flag object or an array of flag objects"
-        ))
+/// Every optional parameter of the PHP API goes through this (or `opt_list_arg`) instead of
+/// being declared `Option<T>`: ext-php-rs turns a nullable argument of the wrong type into
+/// `None` *without any error*. `setFilterExpression(Filter::equal(..))` silently cleared
+/// the filter, `new Statement($ns, $set, [$filter])` ran a full scan, and
+/// `truncate($p, $ns, $set, "123")` truncated every record.
+fn opt_arg<'a, T: FromZval<'a>>(
+    arg: Option<&'a Zval>,
+    name: &str,
+    expected: &str,
+) -> PhpResult<Option<T>> {
+    let Some(zv) = arg.map(Zval::dereference).filter(|z| !z.is_null()) else {
+        return Ok(None);
     };
-    let Some(zv) = flags.map(Zval::dereference).filter(|z| !z.is_null()) else {
-        return Ok(Vec::new());
+    T::from_zval(zv)
+        .map(Some)
+        .ok_or_else(|| invalid_arg(name, expected))
+}
+
+/// `opt_arg` for list arguments, which also accept a single element: `null` → `None`, one
+/// `T` → `Some(vec![t])`, an array of `T` → `Some(vec)`, anything else throws.
+fn opt_list_arg<'a, T: FromZval<'a>>(
+    arg: Option<&'a Zval>,
+    name: &str,
+    expected: &str,
+) -> PhpResult<Option<Vec<T>>> {
+    let Some(zv) = arg.map(Zval::dereference).filter(|z| !z.is_null()) else {
+        return Ok(None);
     };
     if let Some(arr) = zv.array() {
         return arr
             .iter()
-            .map(|(_, v)| T::from_zval(v.dereference()).ok_or_else(invalid))
-            .collect();
+            .map(|(_, v)| T::from_zval(v.dereference()).ok_or_else(|| invalid_arg(name, expected)))
+            .collect::<PhpResult<Vec<T>>>()
+            .map(Some);
     }
-    T::from_zval(zv).map(|f| vec![f]).ok_or_else(invalid)
+    T::from_zval(zv)
+        .map(|v| Some(vec![v]))
+        .ok_or_else(|| invalid_arg(name, expected))
+}
+
+/// The exception for an argument `opt_arg`/`opt_list_arg` could not convert. Surfaces the
+/// exception the conversion itself may already have thrown (e.g. a non-UTF-8 string).
+fn invalid_arg(name: &str, expected: &str) -> PhpException {
+    pending_exception_or(&format!("{name} must be null, {expected}"))
+}
+
+/// The `$ctx` argument of CDT operations, filters and `createIndex()`: `null`, one `Context`
+/// or an array of them.
+fn ctx_arg(ctx: Option<&Zval>) -> PhpResult<Option<Vec<&CDTContext>>> {
+    opt_list_arg(ctx, "$ctx", "a Context or an array of Context objects")
+}
+
+/// A bin-name list argument: `null`, one bin name or an array of them.
+fn bin_names_arg(arg: Option<&Zval>, name: &str) -> PhpResult<Option<Vec<String>>> {
+    opt_list_arg(arg, name, "a bin name or an array of bin names")
+}
+
+/// Rejects 0 for sizes the crate divides by or uses as a channel capacity: a zero record
+/// queue made `scan()`/`query()` panic (`bounded(0)`) and zero connection pools divided by
+/// zero in the cluster tend at `connect()`, both surfacing as an opaque internal error.
+fn positive_arg(value: u32, what: &str) -> PhpResult<u32> {
+    if value == 0 {
+        return Err(PhpException::from_class::<AerospikeException>(format!(
+            "{what}: the value must be at least 1"
+        )));
+    }
+    Ok(value)
+}
+
+/// Parses a write-flags constructor argument: `null`, a single flag object, or an array of
+/// flag objects (combined by the caller, usually with bitwise OR). See `opt_arg` for why a
+/// `?array` parameter is not enough: the single-flag form
+/// `new BitwisePolicy(BitwiseWriteFlags::updateOnly())` silently ran with default flags.
+fn write_flags_arg<T: for<'a> FromZval<'a>>(flags: Option<&Zval>, what: &str) -> PhpResult<Vec<T>> {
+    let name = format!("{what}: flags");
+    Ok(opt_list_arg(flags, &name, "a flag object or an array of flag objects")?.unwrap_or_default())
 }
 
 /// Runs `f`, converting a Rust panic into a catchable `AerospikeException` instead of
@@ -2305,8 +2361,14 @@ macro_rules! php_policy_impl {
                     .clone()
                     .map(|fe| Expression { _as: fe })
             }
-            pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+            pub fn set_filter_expression(
+                &mut self,
+                filter_expression: Option<&Zval>,
+            ) -> PhpResult<()> {
+                let filter_expression: Option<Expression> =
+                    opt_arg(filter_expression, "$filter_expression", "an Expression")?;
                 self.$($filter_holder).+.filter_expression = filter_expression.map(|fe| fe._as);
+                Ok(())
             }
         }
     };
@@ -2560,8 +2622,10 @@ php_policy_impl!(QueryPolicy, filter_in: _as.base_policy, {
     pub fn get_record_queue_size(&self) -> u32 {
         self._as.record_queue_size as u32
     }
-    pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
-        self._as.record_queue_size = record_queue_size as usize;
+    pub fn set_record_queue_size(&mut self, record_queue_size: u32) -> PhpResult<()> {
+        self._as.record_queue_size =
+            positive_arg(record_queue_size, "setRecordQueueSize")? as usize;
+        Ok(())
     }
 
     /// Number of records to return, divided across the nodes involved in the query
@@ -2637,8 +2701,10 @@ php_policy_impl!(ScanPolicy, filter_in: _as.base_policy, {
     pub fn get_record_queue_size(&self) -> u32 {
         self._as.record_queue_size as u32
     }
-    pub fn set_record_queue_size(&mut self, record_queue_size: u32) {
-        self._as.record_queue_size = record_queue_size as usize;
+    pub fn set_record_queue_size(&mut self, record_queue_size: u32) -> PhpResult<()> {
+        self._as.record_queue_size =
+            positive_arg(record_queue_size, "setRecordQueueSize")? as usize;
+        Ok(())
     }
 
     /// Per-node limit on returned records per second (0 = unlimited). Server v6.0+.
@@ -2930,8 +2996,9 @@ impl Filter {
     pub fn equal(
         bin_name: &str,
         value: PHPValue,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let ctx = ctx_arg(ctx)?;
         let v = filter_value(value, "value")?;
         Ok(Filter {
             _as: filter_with_ctx(aero::query::Filter::equal(bin_name, v), ctx),
@@ -2943,8 +3010,9 @@ impl Filter {
         bin_name: &str,
         begin: PHPValue,
         end: PHPValue,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let ctx = ctx_arg(ctx)?;
         let b = filter_value(begin, "begin")?;
         let e = filter_value(end, "end")?;
         Ok(Filter {
@@ -2956,9 +3024,11 @@ impl Filter {
     pub fn contains(
         bin_name: &str,
         value: PHPValue,
-        cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
+        cit: Option<&Zval>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let cit: Option<&IndexCollectionType> = opt_arg(cit, "$cit", "an IndexCollectionType")?;
+        let ctx = ctx_arg(ctx)?;
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
         let v = filter_value(value, "value")?;
@@ -2976,9 +3046,11 @@ impl Filter {
         bin_name: &str,
         begin: PHPValue,
         end: PHPValue,
-        cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
+        cit: Option<&Zval>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let cit: Option<&IndexCollectionType> = opt_arg(cit, "$cit", "an IndexCollectionType")?;
+        let ctx = ctx_arg(ctx)?;
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
         let b = filter_value(begin, "begin")?;
@@ -2995,17 +3067,19 @@ impl Filter {
     pub fn within_region(
         bin_name: &str,
         region: &str,
-        cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Self {
+        cit: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Self> {
+        let cit: Option<&IndexCollectionType> = opt_arg(cit, "$cit", "an IndexCollectionType")?;
+        let ctx = ctx_arg(ctx)?;
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        Filter {
+        Ok(Filter {
             _as: filter_with_ctx(
                 aero::query::Filter::geo_within_region_cit(bin_name, region, cit._as.clone()),
                 ctx,
             ),
-        }
+        })
     }
 
     /// Creates a geospatial "within radius" filter for query.
@@ -3014,12 +3088,14 @@ impl Filter {
         lat: f64,
         lng: f64,
         radius: f64,
-        cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Self {
+        cit: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Self> {
+        let cit: Option<&IndexCollectionType> = opt_arg(cit, "$cit", "an IndexCollectionType")?;
+        let ctx = ctx_arg(ctx)?;
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
-        Filter {
+        Ok(Filter {
             _as: filter_with_ctx(
                 aero::query::Filter::geo_within_radius_cit(
                     bin_name,
@@ -3030,7 +3106,7 @@ impl Filter {
                 ),
                 ctx,
             ),
-        }
+        })
     }
 
     /// Creates a geospatial "regions containing point" filter for query.
@@ -3038,18 +3114,20 @@ impl Filter {
         bin_name: &str,
         lat: f64,
         lng: f64,
-        cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Self {
+        cit: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Self> {
+        let cit: Option<&IndexCollectionType> = opt_arg(cit, "$cit", "an IndexCollectionType")?;
+        let ctx = ctx_arg(ctx)?;
         let default = IndexCollectionType::Default();
         let cit = cit.unwrap_or(&default);
         let point = format!(r#"{{"type":"Point","coordinates":[{lng:.8},{lat:.8}]}}"#);
-        Filter {
+        Ok(Filter {
             _as: filter_with_ctx(
                 aero::query::Filter::geo_contains_cit(bin_name, &point, cit._as.clone()),
                 ctx,
             ),
-        }
+        })
     }
 }
 
@@ -3085,16 +3163,18 @@ impl Statement {
     pub fn __construct(
         namespace: &str,
         set_name: &str,
-        filter: Option<Filter>,
-        bin_names: Option<Vec<String>>,
-    ) -> Self {
+        filter: Option<&Zval>,
+        bin_names: Option<&Zval>,
+    ) -> PhpResult<Self> {
+        let filter: Option<Filter> = opt_arg(filter, "$filter", "a Filter")?;
+        let bin_names = bin_names_arg(bin_names, "$bin_names")?;
         // Documented v2 contract (see the class doc): None → all bins, [] → header only.
         let bins = php_bins_to_aero_with(bin_names, aero::Bins::All, aero::Bins::None);
         let mut stmt = aero::query::Statement::new(namespace, set_name, bins);
         if let Some(f) = filter {
             stmt.add_filter(f._as);
         }
-        Statement { _as: stmt }
+        Ok(Statement { _as: stmt })
     }
 
     /// Query index filter (optional). Applied to the secondary index on query.
@@ -3106,23 +3186,26 @@ impl Statement {
             .and_then(|fs| fs.first().cloned())
             .map(|f| Filter { _as: f })
     }
-    pub fn set_filter(&mut self, filter: Option<Filter>) {
+    pub fn set_filter(&mut self, filter: Option<&Zval>) -> PhpResult<()> {
+        let filter: Option<Filter> = opt_arg(filter, "$filter", "a Filter")?;
         self._as.filters = filter.map(|f| vec![f._as]);
+        Ok(())
     }
 
-    /// Bin names to return (optional). Empty Vec is treated as Bins::None (header-only).
-    pub fn get_bin_names(&self) -> Vec<String> {
+    /// Bin names to return: `null` = all bins, `[]` = header only (no bins), otherwise the
+    /// listed bins — the same contract as the constructor, so `setBinNames(getBinNames())`
+    /// is a no-op.
+    pub fn get_bin_names(&self) -> Option<Vec<String>> {
         match &self._as.bins {
-            aero::Bins::Some(names) => names.clone(),
-            _ => vec![],
+            aero::Bins::All => None,
+            aero::Bins::None => Some(vec![]),
+            aero::Bins::Some(names) => Some(names.clone()),
         }
     }
-    pub fn set_bin_names(&mut self, bin_names: Vec<String>) {
-        self._as.bins = if bin_names.is_empty() {
-            aero::Bins::None
-        } else {
-            aero::Bins::Some(bin_names)
-        };
+    pub fn set_bin_names(&mut self, bin_names: Option<&Zval>) -> PhpResult<()> {
+        let bin_names = bin_names_arg(bin_names, "$bin_names")?;
+        self._as.bins = php_bins_to_aero_with(bin_names, aero::Bins::All, aero::Bins::None);
+        Ok(())
     }
 
     /// Query namespace.
@@ -3833,8 +3916,11 @@ impl BatchReadPolicy {
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+    pub fn set_filter_expression(&mut self, filter_expression: Option<&Zval>) -> PhpResult<()> {
+        let filter_expression: Option<Expression> =
+            opt_arg(filter_expression, "$filter_expression", "an Expression")?;
         self._as.filter_expression = filter_expression.map(|fe| fe._as);
+        Ok(())
     }
 }
 
@@ -3913,8 +3999,11 @@ impl BatchWritePolicy {
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+    pub fn set_filter_expression(&mut self, filter_expression: Option<&Zval>) -> PhpResult<()> {
+        let filter_expression: Option<Expression> =
+            opt_arg(filter_expression, "$filter_expression", "an Expression")?;
         self._as.filter_expression = filter_expression.map(|fe| fe._as);
+        Ok(())
     }
 }
 
@@ -3977,8 +4066,11 @@ impl BatchDeletePolicy {
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+    pub fn set_filter_expression(&mut self, filter_expression: Option<&Zval>) -> PhpResult<()> {
+        let filter_expression: Option<Expression> =
+            opt_arg(filter_expression, "$filter_expression", "an Expression")?;
         self._as.filter_expression = filter_expression.map(|fe| fe._as);
+        Ok(())
     }
 }
 
@@ -4035,8 +4127,11 @@ impl BatchUdfPolicy {
             .clone()
             .map(|fe| Expression { _as: fe })
     }
-    pub fn set_filter_expression(&mut self, filter_expression: Option<Expression>) {
+    pub fn set_filter_expression(&mut self, filter_expression: Option<&Zval>) -> PhpResult<()> {
+        let filter_expression: Option<Expression> =
+            opt_arg(filter_expression, "$filter_expression", "an Expression")?;
         self._as.filter_expression = filter_expression.map(|fe| fe._as);
+        Ok(())
     }
 }
 
@@ -4191,12 +4286,17 @@ pub struct BatchRead {
 
 #[php_impl]
 impl BatchRead {
-    pub fn __construct(policy: &BatchReadPolicy, key: &Key, bins: Option<Vec<String>>) -> Self {
+    pub fn __construct(
+        policy: &BatchReadPolicy,
+        key: &Key,
+        bins: Option<&Zval>,
+    ) -> PhpResult<Self> {
+        let bins = bin_names_arg(bins, "$bins")?;
         // v1-compatible contract (see the class doc): None → header only, [] → all bins.
         let bins = php_bins_to_aero_with(bins, aero::Bins::None, aero::Bins::All);
-        BatchRead {
+        Ok(BatchRead {
             _as: aero::BatchOperation::read(&policy._as, key._as.clone(), bins),
-        }
+        })
     }
 
     /// Specifies the read-only operations to perform for the key. Mutually exclusive with `bins`.
@@ -4980,6 +5080,28 @@ fn with_ctx(
     }
 }
 
+/// Builds a CDT list/map *create* operation from the matching set-order operation, the way
+/// the Go/C/Java clients encode it.
+///
+/// aerospike-core's `lists::create` (always) and `maps::create` (with a ctx) send the create
+/// flag as an extra argument, where the server reads it as the order: every
+/// `ListOp::create` failed with PARAMETER_ERROR, and a create inside a ctx with
+/// OP_NOT_APPLICABLE. Without a ctx a create is just a set-order on the bin; with one the
+/// flag belongs on the last context element, telling the server to create that level.
+fn cdt_create(
+    set_order: aero::operations::Operation,
+    mut ctx: Vec<aero::operations::cdt_context::CdtContext>,
+    flag: u8,
+) -> aero::operations::Operation {
+    match ctx.last_mut() {
+        Some(last) => {
+            last.flags |= flag;
+            set_order.context(ctx)
+        }
+        None => set_order,
+    }
+}
+
 /// Coerce a `Vec<PHPValue>` to `Vec<aero::Value>` (cheap; consumes the input).
 fn php_values_to_aero(values: Vec<PHPValue>) -> Vec<aero::Value> {
     values.into_iter().map(Into::into).collect()
@@ -5013,7 +5135,8 @@ impl_from_zval_wrapper!(clone CdtListOperation);
 impl CdtListOperation {
     /// ListCreateOp creates list create operation.
     /// Server creates list at given context level. The context is allowed to be beyond list
-    /// boundaries only if pad is set to true. When `index` is true, the list is created with a
+    /// boundaries only if pad is set to true (`pad` only matters with a ctx: without one the
+    /// bin itself is (re)typed). When `index` is true, the list is created with a
     /// persisted index (and the `pad` argument is ignored — aero's `create_with_index` does not
     /// support padding).
     pub fn create(
@@ -5021,8 +5144,9 @@ impl CdtListOperation {
         order: ListOrderType,
         pad: bool,
         index: Option<bool>,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let index = index.unwrap_or(false);
         if index {
             // A persisted index lives on the bin itself: `create_with_index` ORs the
@@ -5045,10 +5169,16 @@ impl CdtListOperation {
                 _as: aero::operations::lists::create_with_index(&bin_name, order._as),
             });
         }
+        let flag = match order._as {
+            aero::operations::lists::ListOrderType::Ordered => 0xc0,
+            aero::operations::lists::ListOrderType::Unordered if pad => 0x80,
+            aero::operations::lists::ListOrderType::Unordered => 0x40,
+        };
         Ok(Operation {
-            _as: with_ctx(
-                aero::operations::lists::create(&bin_name, order._as, pad),
-                ctx,
+            _as: cdt_create(
+                aero::operations::lists::set_order(&bin_name, order._as),
+                ctx_to_aero(ctx),
+                flag,
             ),
         })
     }
@@ -5058,14 +5188,15 @@ impl CdtListOperation {
     pub fn set_order(
         bin_name: String,
         order: ListOrderType,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::set_order(&bin_name, order._as),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListAppendOp creates a list append operation.
@@ -5076,8 +5207,9 @@ impl CdtListOperation {
         policy: &CdtListPolicy,
         bin_name: String,
         values: Vec<PHPValue>,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         // The underlying aero builder asserts on empty input; validate here so PHP gets
         // a catchable exception instead of a panic across the FFI boundary.
         if values.is_empty() {
@@ -5105,8 +5237,9 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         values: Vec<PHPValue>,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         // See `append`: guard the upstream assert to avoid panicking across FFI.
         if values.is_empty() {
             return throw_msg(
@@ -5127,10 +5260,11 @@ impl CdtListOperation {
 
     /// ListPopOp creates list pop operation.
     /// Server returns item at specified index and removes item from list bin.
-    pub fn pop(bin_name: String, index: i64, ctx: Option<Vec<&CDTContext>>) -> Operation {
-        Operation {
+    pub fn pop(bin_name: String, index: i64, ctx: Option<&Zval>) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(aero::operations::lists::pop(&bin_name, index), ctx),
-        }
+        })
     }
 
     /// ListPopRangeOp creates a list pop range operation.
@@ -5139,14 +5273,15 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::pop_range(&bin_name, index, count),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListPopRangeFromOp creates a list pop range operation.
@@ -5154,14 +5289,15 @@ impl CdtListOperation {
     pub fn pop_range_from(
         bin_name: String,
         index: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::pop_range_from(&bin_name, index),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListRemoveByValueListOp creates list remove by value operation.
@@ -5169,17 +5305,19 @@ impl CdtListOperation {
     pub fn remove_values(
         bin_name: String,
         values: Vec<PHPValue>,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_value_list(
             &bin_name,
             php_values_to_aero(values),
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByValueRangeOp creates a list remove operation.
@@ -5190,19 +5328,22 @@ impl CdtListOperation {
     pub fn remove_by_value_range(
         bin_name: String,
         begin: PHPValue,
-        end: Option<PHPValue>,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        end: Option<&Zval>,
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let end: Option<PHPValue> = opt_arg(end, "$end", "a supported value")?;
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_value_range(
             &bin_name,
             list_return(return_type),
             begin.into(),
             end.map(Into::into).unwrap_or(aero::Value::Nil),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByValueRelativeRankRangeOp creates a list remove by value relative to rank range operation.
@@ -5222,18 +5363,20 @@ impl CdtListOperation {
         bin_name: String,
         value: PHPValue,
         rank: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_value_relative_rank_range(
             &bin_name,
             list_return(return_type),
             value.into(),
             rank,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByValueRelativeRankRangeCountOp creates a list remove by value relative to rank range operation.
@@ -5253,9 +5396,11 @@ impl CdtListOperation {
         value: PHPValue,
         rank: i64,
         count: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_value_relative_rank_range_count(
             &bin_name,
             list_return(return_type),
@@ -5263,9 +5408,9 @@ impl CdtListOperation {
             rank,
             count,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveRangeOp creates a list remove range operation.
@@ -5275,14 +5420,15 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::remove_range(&bin_name, index, count),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListRemoveRangeFromOp creates a list remove range operation.
@@ -5291,14 +5437,15 @@ impl CdtListOperation {
     pub fn remove_range_from(
         bin_name: String,
         index: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::remove_range_from(&bin_name, index),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListSetOp creates a list set operation.
@@ -5309,8 +5456,9 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         value: PHPValue,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let value: aero::Value = value.into();
         // The underlying aero builder asserts on nil; validate here so PHP gets a
         // catchable exception instead of a panic across the FFI boundary.
@@ -5333,20 +5481,22 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(aero::operations::lists::trim(&bin_name, index, count), ctx),
-        }
+        })
     }
 
     /// ListClearOp creates a list clear operation.
     /// Server removes all items in list bin.
     /// Server does not return a result by default.
-    pub fn clear(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
-        Operation {
+    pub fn clear(bin_name: String, ctx: Option<&Zval>) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(aero::operations::lists::clear(&bin_name), ctx),
-        }
+        })
     }
 
     /// ListIncrementOp creates a list increment operation.
@@ -5359,23 +5509,25 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         value: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let policy = aero::ListPolicy::default();
-        Operation {
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::increment(&policy, &bin_name, index, value),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListSizeOp creates a list size operation.
     /// Server returns size of list on bin name.
-    pub fn size(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
-        Operation {
+    pub fn size(bin_name: String, ctx: Option<&Zval>) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(aero::operations::lists::size(&bin_name), ctx),
-        }
+        })
     }
 
     /// ListSortOp creates list sort operation.
@@ -5387,14 +5539,15 @@ impl CdtListOperation {
     pub fn sort(
         bin_name: String,
         sort_flags: &CdtListSortFlags,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::lists::sort(&bin_name, sort_flags._as),
                 ctx,
             ),
-        }
+        })
     }
 
     /// ListRemoveByIndexOp creates a list remove operation.
@@ -5402,14 +5555,16 @@ impl CdtListOperation {
     pub fn remove_by_index(
         bin_name: String,
         index: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op =
             aero::operations::lists::remove_by_index(&bin_name, index, list_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByIndexRangeOp creates a list remove operation.
@@ -5418,17 +5573,19 @@ impl CdtListOperation {
     pub fn remove_by_index_range(
         bin_name: String,
         index: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_index_range(
             &bin_name,
             index,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByIndexRangeCountOp creates a list remove operation.
@@ -5437,18 +5594,20 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_index_range_count(
             &bin_name,
             index,
             count,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByRankOp creates a list remove operation.
@@ -5456,13 +5615,15 @@ impl CdtListOperation {
     pub fn remove_by_rank(
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_rank(&bin_name, rank, list_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByRankRangeOp creates a list remove operation.
@@ -5471,17 +5632,19 @@ impl CdtListOperation {
     pub fn remove_by_rank_range(
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_rank_range(
             &bin_name,
             rank,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListRemoveByRankRangeCountOp creates a list remove operation.
@@ -5490,18 +5653,20 @@ impl CdtListOperation {
         bin_name: String,
         rank: i64,
         count: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::remove_by_rank_range_count(
             &bin_name,
             rank,
             count,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByValueListOp creates a list get by value operation.
@@ -5509,17 +5674,19 @@ impl CdtListOperation {
     pub fn get_by_values(
         bin_name: String,
         values: Vec<PHPValue>,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_value_list(
             &bin_name,
             php_values_to_aero(values),
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByValueRangeOp creates a list get by value range operation.
@@ -5530,19 +5697,22 @@ impl CdtListOperation {
     pub fn get_by_value_range(
         bin_name: String,
         begin: PHPValue,
-        end: Option<PHPValue>,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        end: Option<&Zval>,
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let end: Option<PHPValue> = opt_arg(end, "$end", "a supported value")?;
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_value_range(
             &bin_name,
             begin.into(),
             end.map(Into::into).unwrap_or(aero::Value::Nil),
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByIndexOp creates list get by index operation.
@@ -5550,13 +5720,15 @@ impl CdtListOperation {
     pub fn get_by_index(
         bin_name: String,
         index: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_index(&bin_name, index, list_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByIndexRangeOp creates list get by index range operation.
@@ -5565,14 +5737,16 @@ impl CdtListOperation {
     pub fn get_by_index_range(
         bin_name: String,
         index: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op =
             aero::operations::lists::get_by_index_range(&bin_name, index, list_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByIndexRangeCountOp creates list get by index range operation.
@@ -5582,18 +5756,20 @@ impl CdtListOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_index_range_count(
             &bin_name,
             index,
             count,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByRankOp creates a list get by rank operation.
@@ -5601,13 +5777,15 @@ impl CdtListOperation {
     pub fn get_by_rank(
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_rank(&bin_name, rank, list_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByRankRangeOp creates a list get by rank range operation.
@@ -5616,14 +5794,16 @@ impl CdtListOperation {
     pub fn get_by_rank_range(
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op =
             aero::operations::lists::get_by_rank_range(&bin_name, rank, list_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByRankRangeCountOp creates a list get by rank range operation.
@@ -5632,18 +5812,20 @@ impl CdtListOperation {
         bin_name: String,
         rank: i64,
         count: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_rank_range_count(
             &bin_name,
             rank,
             count,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByValueRelativeRankRangeOp creates a list get by value relative to rank range operation.
@@ -5663,18 +5845,20 @@ impl CdtListOperation {
         bin_name: String,
         value: PHPValue,
         rank: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_value_relative_rank_range(
             &bin_name,
             value.into(),
             rank,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// ListGetByValueRelativeRankRangeCountOp creates a list get by value relative to rank range operation.
@@ -5695,9 +5879,11 @@ impl CdtListOperation {
         value: PHPValue,
         rank: i64,
         count: i64,
-        return_type: Option<CdtListReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a ListReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::lists::get_by_value_relative_rank_range_count(
             &bin_name,
             value.into(),
@@ -5705,9 +5891,9 @@ impl CdtListOperation {
             count,
             list_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 }
 
@@ -5974,8 +6160,10 @@ impl CdtMapPolicy {
         order: &MapOrderType,
         flags: Option<&Zval>,
         persist_index: Option<bool>,
-        write_mode: Option<&CdtMapWriteMode>,
+        write_mode: Option<&Zval>,
     ) -> PhpResult<Self> {
+        let write_mode: Option<&CdtMapWriteMode> =
+            opt_arg(write_mode, "$write_mode", "a MapWriteMode")?;
         let combined_flags: u8 = write_flags_arg::<CdtMapWriteFlags>(flags, "MapPolicy")?
             .iter()
             .fold(aero::MapWriteFlags::DEFAULT, |acc, f| acc | f._as);
@@ -6104,8 +6292,9 @@ impl CdtMapOperation {
         bin_name: String,
         order: &MapOrderType,
         with_index: Option<bool>,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         if with_index.unwrap_or(false) {
             // `create_with_index` ORs the persist bit into the type byte and hardcodes an
             // empty context — it cannot address a nested map. Previously the ctx was simply
@@ -6122,7 +6311,15 @@ impl CdtMapOperation {
             });
         }
         Ok(Operation {
-            _as: aero::operations::maps::create(&bin_name, order._as, ctx_to_aero(ctx)),
+            _as: cdt_create(
+                aero::operations::maps::set_order(&bin_name, order._as),
+                ctx_to_aero(ctx),
+                match order._as {
+                    aero::operations::maps::MapOrder::Unordered => 0x40,
+                    aero::operations::maps::MapOrder::KeyOrdered => 0x80,
+                    aero::operations::maps::MapOrder::KeyValueOrdered => 0xc0,
+                },
+            ),
         })
     }
 
@@ -6133,19 +6330,21 @@ impl CdtMapOperation {
     pub fn set_policy(
         policy: &CdtMapPolicy,
         bin_name: String,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: aero::operations::maps::set_policy(&policy._as, &bin_name, ctx_to_aero(ctx)),
-        }
+        })
     }
 
     /// MapSizeOp creates map size operation.
     /// Server returns size of map.
-    pub fn size(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
-        Operation {
+    pub fn size(bin_name: String, ctx: Option<&Zval>) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(aero::operations::maps::size(&bin_name), ctx),
-        }
+        })
     }
 
     /// MapPutOp creates map put-items operation.
@@ -6158,8 +6357,9 @@ impl CdtMapOperation {
         policy: &CdtMapPolicy,
         bin_name: String,
         map: &Zval,
-        ctx: Option<Vec<&CDTContext>>,
+        ctx: Option<&Zval>,
     ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let aero_map: HashMap<aero::Value, aero::Value> = php_array_as_map(map, "MapOp::put")?
             .into_iter()
             .map(|(k, v)| (k.into(), v.into()))
@@ -6178,17 +6378,18 @@ impl CdtMapOperation {
         bin_name: String,
         key: PHPValue,
         incr: PHPValue,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::increment_value(
             &policy._as,
             &bin_name,
             key.into(),
             incr.into(),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapDecrementOp creates map decrement operation.
@@ -6199,25 +6400,27 @@ impl CdtMapOperation {
         bin_name: String,
         key: PHPValue,
         decr: PHPValue,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::decrement_value(
             &policy._as,
             &bin_name,
             key.into(),
             decr.into(),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapClearOp creates map clear operation.
     /// Server removes all items in map. Server returns nil.
-    pub fn clear(bin_name: String, ctx: Option<Vec<&CDTContext>>) -> Operation {
-        Operation {
+    pub fn clear(bin_name: String, ctx: Option<&Zval>) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(aero::operations::maps::clear(&bin_name), ctx),
-        }
+        })
     }
 
     /// MapRemoveByKeyListOp creates map remove operation.
@@ -6225,17 +6428,19 @@ impl CdtMapOperation {
     pub fn remove_by_keys(
         bin_name: String,
         keys: Vec<PHPValue>,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_key_list(
             &bin_name,
             php_values_to_aero(keys),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByKeyRangeOp creates map remove operation.
@@ -6249,18 +6454,20 @@ impl CdtMapOperation {
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_key_range(
             &bin_name,
             begin.into(),
             end.into(),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByValueListOp creates map remove operation.
@@ -6269,17 +6476,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         values: Vec<PHPValue>,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_value_list(
             &bin_name,
             php_values_to_aero(values),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByValueRangeOp creates map remove operation.
@@ -6289,18 +6498,20 @@ impl CdtMapOperation {
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_value_range(
             &bin_name,
             begin.into(),
             end.into(),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByValueRelativeRankRangeOp creates a map remove by value relative to rank range operation.
@@ -6310,18 +6521,20 @@ impl CdtMapOperation {
         bin_name: String,
         value: PHPValue,
         rank: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_value_relative_rank_range(
             &bin_name,
             value.into(),
             rank,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByValueRelativeRankRangeCountOp creates a map remove by value relative to rank range operation.
@@ -6332,9 +6545,11 @@ impl CdtMapOperation {
         value: PHPValue,
         rank: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_value_relative_rank_range_count(
             &bin_name,
             value.into(),
@@ -6342,9 +6557,9 @@ impl CdtMapOperation {
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByIndexOp creates map remove operation.
@@ -6353,13 +6568,15 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_index(&bin_name, index, map_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByIndexRangeOp creates map remove operation.
@@ -6368,17 +6585,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_index_range_from(
             &bin_name,
             index,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByIndexRangeCountOp creates map remove operation.
@@ -6388,18 +6607,20 @@ impl CdtMapOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_index_range(
             &bin_name,
             index,
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByRankOp creates map remove operation.
@@ -6408,13 +6629,15 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_rank(&bin_name, rank, map_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByRankRangeOp creates map remove operation.
@@ -6423,17 +6646,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_rank_range_from(
             &bin_name,
             rank,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByRankRangeCountOp creates map remove operation.
@@ -6443,18 +6668,20 @@ impl CdtMapOperation {
         bin_name: String,
         rank: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_rank_range(
             &bin_name,
             rank,
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByKeyRelativeIndexRangeOp creates a map remove by key relative to index range operation.
@@ -6463,18 +6690,20 @@ impl CdtMapOperation {
         bin_name: String,
         key: PHPValue,
         index: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_key_relative_index_range(
             &bin_name,
             key.into(),
             index,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapRemoveByKeyRelativeIndexRangeCountOp creates map remove by key relative to index range operation.
@@ -6484,9 +6713,11 @@ impl CdtMapOperation {
         key: PHPValue,
         index: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::remove_by_key_relative_index_range_count(
             &bin_name,
             key.into(),
@@ -6494,9 +6725,9 @@ impl CdtMapOperation {
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByKeyListOp creates a map get by key list operation. Should be used with BatchRead.
@@ -6504,17 +6735,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         keys: Vec<PHPValue>,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_key_list(
             &bin_name,
             php_values_to_aero(keys),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByKeyRangeOp creates map get by key range operation.
@@ -6524,18 +6757,20 @@ impl CdtMapOperation {
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_key_range(
             &bin_name,
             begin.into(),
             end.into(),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByKeyRelativeIndexRangeOp creates a map get by key relative to index range operation.
@@ -6544,18 +6779,20 @@ impl CdtMapOperation {
         bin_name: String,
         key: PHPValue,
         index: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_key_relative_index_range(
             &bin_name,
             key.into(),
             index,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByKeyRelativeIndexRangeCountOp creates a map get by key relative to index range operation.
@@ -6565,9 +6802,11 @@ impl CdtMapOperation {
         key: PHPValue,
         index: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_key_relative_index_range_count(
             &bin_name,
             key.into(),
@@ -6575,9 +6814,9 @@ impl CdtMapOperation {
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByValueListOp creates a map get by value list operation. Should be used with BatchRead.
@@ -6585,17 +6824,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         values: Vec<PHPValue>,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_value_list(
             &bin_name,
             php_values_to_aero(values),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByValueRangeOp creates map get by value range operation. Should be used with BatchRead.
@@ -6604,18 +6845,20 @@ impl CdtMapOperation {
         bin_name: String,
         begin: PHPValue,
         end: PHPValue,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_value_range(
             &bin_name,
             begin.into(),
             end.into(),
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByValueRelativeRankRangeOp creates a map get by value relative to rank range operation.
@@ -6624,18 +6867,20 @@ impl CdtMapOperation {
         bin_name: String,
         value: PHPValue,
         rank: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_value_relative_rank_range(
             &bin_name,
             value.into(),
             rank,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByValueRelativeRankRangeCountOp creates a map get by value relative to rank range operation.
@@ -6645,9 +6890,11 @@ impl CdtMapOperation {
         value: PHPValue,
         rank: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_value_relative_rank_range_count(
             &bin_name,
             value.into(),
@@ -6655,9 +6902,9 @@ impl CdtMapOperation {
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByIndexOp creates map get by index operation. Should be used with BatchRead.
@@ -6665,13 +6912,15 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_index(&bin_name, index, map_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByIndexRangeOp creates map get by index range operation.
@@ -6684,17 +6933,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         index: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_index_range_from(
             &bin_name,
             index,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByIndexRangeCountOp creates map get by index range operation.
@@ -6706,18 +6957,20 @@ impl CdtMapOperation {
         bin_name: String,
         index: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_index_range(
             &bin_name,
             index,
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByRankOp creates map get by rank operation. Should be used with BatchRead.
@@ -6725,13 +6978,15 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_rank(&bin_name, rank, map_return(return_type));
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByRankRangeOp creates map get by rank range operation.
@@ -6742,17 +6997,19 @@ impl CdtMapOperation {
         _policy: &CdtMapPolicy,
         bin_name: String,
         rank: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_rank_range_from(
             &bin_name,
             rank,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// MapGetByRankRangeCountOp creates map get by rank range operation.
@@ -6764,18 +7021,20 @@ impl CdtMapOperation {
         bin_name: String,
         rank: i64,
         count: i64,
-        return_type: Option<CdtMapReturnType>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        return_type: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let return_type = opt_arg(return_type, "$return_type", "a MapReturnType")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::maps::get_by_rank_range(
             &bin_name,
             rank,
             count,
             map_return(return_type),
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 }
 
@@ -7260,18 +7519,21 @@ impl CdtBitwiseOperation {
         policy: &CdtBitwisePolicy,
         bin_name: String,
         byte_size: i64,
-        resize_flags: Option<CdtBitwiseResizeFlags>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        resize_flags: Option<&Zval>,
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let resize_flags: Option<CdtBitwiseResizeFlags> =
+            opt_arg(resize_flags, "$resize_flags", "a BitwiseResizeFlags")?;
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::resize(
             &bin_name,
             byte_size,
             resize_flags.map(|rf| rf._as),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitInsertOp creates byte "insert" operation. Server inserts value bytes into []byte bin
@@ -7281,17 +7543,18 @@ impl CdtBitwiseOperation {
         bin_name: String,
         byte_offset: i64,
         value: Vec<u8>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::insert(
             &bin_name,
             byte_offset,
             aero::Value::Blob(value),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitRemoveOp creates byte "remove" operation. Server removes bytes from []byte bin at
@@ -7301,12 +7564,13 @@ impl CdtBitwiseOperation {
         bin_name: String,
         byte_offset: i64,
         byte_size: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::remove(&bin_name, byte_offset, byte_size, &policy._as);
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitSetOp creates bit "set" operation. Server sets value on []byte bin at bitOffset for
@@ -7317,8 +7581,9 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: Vec<u8>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::set(
             &bin_name,
             bit_offset,
@@ -7326,9 +7591,9 @@ impl CdtBitwiseOperation {
             aero::Value::Blob(value),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitOrOp creates bit "or" operation.
@@ -7338,8 +7603,9 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: Vec<u8>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::or(
             &bin_name,
             bit_offset,
@@ -7347,9 +7613,9 @@ impl CdtBitwiseOperation {
             aero::Value::Blob(value),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitXorOp creates bit "exclusive or" operation.
@@ -7359,8 +7625,9 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: Vec<u8>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::xor(
             &bin_name,
             bit_offset,
@@ -7368,9 +7635,9 @@ impl CdtBitwiseOperation {
             aero::Value::Blob(value),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitAndOp creates bit "and" operation.
@@ -7380,8 +7647,9 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: Vec<u8>,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::and(
             &bin_name,
             bit_offset,
@@ -7389,9 +7657,9 @@ impl CdtBitwiseOperation {
             aero::Value::Blob(value),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitNotOp creates bit "not" operation. Server negates []byte bin starting at bitOffset
@@ -7401,12 +7669,13 @@ impl CdtBitwiseOperation {
         bin_name: String,
         bit_offset: i64,
         bit_size: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::not(&bin_name, bit_offset, bit_size, &policy._as);
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitLShiftOp creates bit "left shift" operation.
@@ -7416,13 +7685,14 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         shift: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op =
             aero::operations::bitwise::lshift(&bin_name, bit_offset, bit_size, shift, &policy._as);
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitRShiftOp creates bit "right shift" operation.
@@ -7432,13 +7702,14 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         shift: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op =
             aero::operations::bitwise::rshift(&bin_name, bit_offset, bit_size, shift, &policy._as);
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitAddOp creates bit "add" operation. Server adds value to []byte bin starting at
@@ -7451,8 +7722,9 @@ impl CdtBitwiseOperation {
         value: i64,
         signed: bool,
         action: CdtBitwiseOverflowAction,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::add(
             &bin_name,
             bit_offset,
@@ -7462,9 +7734,9 @@ impl CdtBitwiseOperation {
             action._as.clone(),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitSubtractOp creates bit "subtract" operation.
@@ -7476,8 +7748,9 @@ impl CdtBitwiseOperation {
         value: i64,
         signed: bool,
         action: CdtBitwiseOverflowAction,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op = aero::operations::bitwise::subtract(
             &bin_name,
             bit_offset,
@@ -7487,9 +7760,9 @@ impl CdtBitwiseOperation {
             action._as.clone(),
             &policy._as,
         );
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitSetIntOp creates bit "setInt" operation. Server sets value to []byte bin starting at
@@ -7500,13 +7773,14 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
         let op =
             aero::operations::bitwise::set_int(&bin_name, bit_offset, bit_size, value, &policy._as);
-        Operation {
+        Ok(Operation {
             _as: with_ctx(op, ctx),
-        }
+        })
     }
 
     /// BitGetOp creates bit "get" operation. Server returns bits from []byte bin starting at
@@ -7515,14 +7789,15 @@ impl CdtBitwiseOperation {
         bin_name: String,
         bit_offset: i64,
         bit_size: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::bitwise::get(&bin_name, bit_offset, bit_size),
                 ctx,
             ),
-        }
+        })
     }
 
     /// BitCountOp creates bit "count" operation. Server returns count of set bits from []byte
@@ -7531,14 +7806,15 @@ impl CdtBitwiseOperation {
         bin_name: String,
         bit_offset: i64,
         bit_size: i64,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::bitwise::count(&bin_name, bit_offset, bit_size),
                 ctx,
             ),
-        }
+        })
     }
 
     /// BitLScanOp creates bit "left scan" operation. Server returns offset of the first
@@ -7548,14 +7824,15 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: bool,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::bitwise::lscan(&bin_name, bit_offset, bit_size, value),
                 ctx,
             ),
-        }
+        })
     }
 
     /// BitRScanOp creates bit "right scan" operation. Server returns offset of the last
@@ -7565,14 +7842,15 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         value: bool,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::bitwise::rscan(&bin_name, bit_offset, bit_size, value),
                 ctx,
             ),
-        }
+        })
     }
 
     /// BitGetIntOp creates bit "get integer" operation. Server returns integer from []byte bin
@@ -7583,14 +7861,15 @@ impl CdtBitwiseOperation {
         bit_offset: i64,
         bit_size: i64,
         signed: bool,
-        ctx: Option<Vec<&CDTContext>>,
-    ) -> Operation {
-        Operation {
+        ctx: Option<&Zval>,
+    ) -> PhpResult<Operation> {
+        let ctx = ctx_arg(ctx)?;
+        Ok(Operation {
             _as: with_ctx(
                 aero::operations::bitwise::get_int(&bin_name, bit_offset, bit_size, signed),
                 ctx,
             ),
-        }
+        })
     }
 }
 
@@ -7611,6 +7890,8 @@ fn build_tls_config(
     cert_file: Option<&str>,
     key_file: Option<&str>,
 ) -> PhpResult<tokio_rustls::rustls::ClientConfig> {
+    // Thrown as AerospikeException, like every other client error (was a bare \Exception).
+    let tls_error = PhpException::from_class::<AerospikeException>;
     use std::fs::File;
     use std::io::BufReader;
     use tokio_rustls::rustls::pki_types::CertificateDer;
@@ -7620,21 +7901,21 @@ fn build_tls_config(
     match ca_file {
         Some(path) => {
             let file = File::open(path).map_err(|e| {
-                PhpException::default(format!("TLS: cannot open ca_file '{path}': {e}"))
+                tls_error(format!("TLS: cannot open ca_file '{path}': {e}"))
             })?;
             let mut reader = BufReader::new(file);
             let mut added = 0usize;
             for cert in rustls_pemfile::certs(&mut reader) {
                 let cert = cert.map_err(|e| {
-                    PhpException::default(format!("TLS: failed to parse ca_file '{path}': {e}"))
+                    tls_error(format!("TLS: failed to parse ca_file '{path}': {e}"))
                 })?;
                 roots.add(cert).map_err(|e| {
-                    PhpException::default(format!("TLS: rejected ca_file cert '{path}': {e}"))
+                    tls_error(format!("TLS: rejected ca_file cert '{path}': {e}"))
                 })?;
                 added += 1;
             }
             if added == 0 {
-                return Err(PhpException::default(format!(
+                return Err(tls_error(format!(
                     "TLS: ca_file '{path}' contained no PEM certificates"
                 )));
             }
@@ -7651,46 +7932,46 @@ fn build_tls_config(
         (Some(cert_path), Some(key_path)) => {
             // Client certificate chain.
             let cert_file = File::open(cert_path).map_err(|e| {
-                PhpException::default(format!("TLS: cannot open cert_file '{cert_path}': {e}"))
+                tls_error(format!("TLS: cannot open cert_file '{cert_path}': {e}"))
             })?;
             let mut cert_reader = BufReader::new(cert_file);
             let mut chain: Vec<CertificateDer<'static>> = Vec::new();
             for cert in rustls_pemfile::certs(&mut cert_reader) {
                 let cert = cert.map_err(|e| {
-                    PhpException::default(format!(
+                    tls_error(format!(
                         "TLS: failed to parse cert_file '{cert_path}': {e}"
                     ))
                 })?;
                 chain.push(cert);
             }
             if chain.is_empty() {
-                return Err(PhpException::default(format!(
+                return Err(tls_error(format!(
                     "TLS: cert_file '{cert_path}' contained no PEM certificates"
                 )));
             }
 
             // Private key — accept PKCS#8, PKCS#1, or SEC1.
             let key_file = File::open(key_path).map_err(|e| {
-                PhpException::default(format!("TLS: cannot open key_file '{key_path}': {e}"))
+                tls_error(format!("TLS: cannot open key_file '{key_path}': {e}"))
             })?;
             let mut key_reader = BufReader::new(key_file);
             let key = rustls_pemfile::private_key(&mut key_reader)
                 .map_err(|e| {
-                    PhpException::default(format!("TLS: failed to read key_file '{key_path}': {e}"))
+                    tls_error(format!("TLS: failed to read key_file '{key_path}': {e}"))
                 })?
                 .ok_or_else(|| {
-                    PhpException::default(format!(
+                    tls_error(format!(
                         "TLS: key_file '{key_path}' contained no parseable private key"
                     ))
                 })?;
 
             builder
                 .with_client_auth_cert(chain, key)
-                .map_err(|e| PhpException::default(format!("TLS: invalid client cert/key: {e}")))?
+                .map_err(|e| tls_error(format!("TLS: invalid client cert/key: {e}")))?
         }
         (None, None) => builder.with_no_client_auth(),
         (Some(_), None) | (None, Some(_)) => {
-            return Err(PhpException::default(
+            return Err(tls_error(
                 "TLS: cert_file and key_file must be provided together (or both omitted)"
                     .to_string(),
             ));
@@ -7920,8 +8201,9 @@ impl ClientPolicy {
     pub fn get_conn_pools_per_node(&self) -> u32 {
         u32::from(self._as.conn_pools_per_node)
     }
-    pub fn set_conn_pools_per_node(&mut self, n: u32) {
-        self._as.conn_pools_per_node = n.min(255) as u8;
+    pub fn set_conn_pools_per_node(&mut self, n: u32) -> PhpResult<()> {
+        self._as.conn_pools_per_node = positive_arg(n, "setConnPoolsPerNode")?.min(255) as u8;
+        Ok(())
     }
 
     /// Throw an exception if the initial host connection fails. Default `true`.
@@ -8353,8 +8635,9 @@ impl Client {
         &self,
         policy: &ReadPolicy,
         key: &Key,
-        bins: Option<Vec<String>>,
+        bins: Option<&Zval>,
     ) -> PhpResult<Option<Record>> {
+        let bins = bin_names_arg(bins, "$bins")?;
         let aero_bins = php_bins_to_aero(bins);
         match rt_call(|| self.client.get(&policy._as, &key._as, aero_bins))? {
             Ok(record) => Ok(Some(Record { _as: record })),
@@ -8482,8 +8765,9 @@ impl Client {
         policy: &InfoPolicy,
         namespace: &str,
         set_name: &str,
-        before_nanos: Option<i64>,
+        before_nanos: Option<&Zval>,
     ) -> PhpResult<()> {
+        let before_nanos: Option<i64> = opt_arg(before_nanos, "$before_nanos", "an int")?;
         let admin = admin_policy_with_timeout(policy.timeout);
         match rt_call(|| {
             self.client
@@ -8507,8 +8791,9 @@ impl Client {
         partition_filter: PartitionFilter,
         namespace: &str,
         set_name: &str,
-        bins: Option<Vec<String>>,
+        bins: Option<&Zval>,
     ) -> PhpResult<Recordset> {
+        let bins = bin_names_arg(bins, "$bins")?;
         let aero_bins = php_bins_to_aero(bins);
         let stmt = aero::Statement::new(namespace, set_name, aero_bins);
         let pf_arc = partition_filter._as.clone();
@@ -8570,10 +8855,14 @@ impl Client {
         bin_name: &str,
         index_name: &str,
         index_type: &IndexType,
-        cit: Option<&IndexCollectionType>,
-        ctx: Option<Vec<&CDTContext>>,
-        wait_timeout_ms: Option<u64>,
+        cit: Option<&Zval>,
+        ctx: Option<&Zval>,
+        wait_timeout_ms: Option<&Zval>,
     ) -> PhpResult<()> {
+        let cit: Option<&IndexCollectionType> = opt_arg(cit, "$cit", "an IndexCollectionType")?;
+        let ctx = ctx_arg(ctx)?;
+        let wait_timeout_ms: Option<u64> =
+            opt_arg(wait_timeout_ms, "$wait_timeout_ms", "a non-negative int")?;
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let cit_val = cit
             .map(|c| c._as.clone())
@@ -8614,8 +8903,10 @@ impl Client {
         namespace: &str,
         set_name: &str,
         index_name: &str,
-        wait_timeout_ms: Option<u64>,
+        wait_timeout_ms: Option<&Zval>,
     ) -> PhpResult<()> {
+        let wait_timeout_ms: Option<u64> =
+            opt_arg(wait_timeout_ms, "$wait_timeout_ms", "a non-negative int")?;
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let task = match rt_call(|| {
             self.client
@@ -8641,9 +8932,12 @@ impl Client {
         policy: &WritePolicy,
         udf_body: &str,
         package_name: &str,
-        language: Option<UdfLanguage>,
-        wait_timeout_ms: Option<u64>,
+        language: Option<&Zval>,
+        wait_timeout_ms: Option<&Zval>,
     ) -> PhpResult<()> {
+        let language: Option<UdfLanguage> = opt_arg(language, "$language", "a UdfLanguage")?;
+        let wait_timeout_ms: Option<u64> =
+            opt_arg(wait_timeout_ms, "$wait_timeout_ms", "a non-negative int")?;
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let lang = language.map(|l| l._as).unwrap_or(aero::UDFLang::Lua);
         let task = match rt_call(|| {
@@ -8673,8 +8967,10 @@ impl Client {
         &self,
         policy: &WritePolicy,
         package_name: &str,
-        wait_timeout_ms: Option<u64>,
+        wait_timeout_ms: Option<&Zval>,
     ) -> PhpResult<()> {
+        let wait_timeout_ms: Option<u64> =
+            opt_arg(wait_timeout_ms, "$wait_timeout_ms", "a non-negative int")?;
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         // Lua is the only UDF language the server supports, so `.lua` is the only
         // extension to recognise; a dot elsewhere is part of the module name.
@@ -9115,18 +9411,30 @@ fn aero_result_code_to_i32(rc: aero::ResultCode) -> i32 {
     }
 }
 
+/// The result code and in-doubt flag an `aero::Error` carries, if any.
+///
+/// `Error::Chain(context, cause)` wraps the error of every info command (`createIndex`,
+/// `dropIndex`, `registerUdf`, `dropUdf`, `truncate`) — the code lives in the cause, and
+/// flattening the chain turned e.g. INDEX_FOUND into COMMON_ERROR.
+fn aero_error_code(error: &aero::Error) -> Option<(i32, bool)> {
+    match error {
+        aero::Error::ServerError(rc, in_doubt, _node)
+        | aero::Error::BatchError(_, rc, in_doubt, _node)
+        | aero::Error::BatchLastError(_, rc, in_doubt, _node) => {
+            Some((aero_result_code_to_i32(*rc), *in_doubt))
+        }
+        aero::Error::UdfBadResponse(_) => Some((ResultCode::UDF_BAD_RESPONSE, false)),
+        aero::Error::Timeout(_) => Some((ResultCode::TIMEOUT, false)),
+        aero::Error::Chain(context, cause) => {
+            aero_error_code(cause).or_else(|| aero_error_code(context))
+        }
+        _ => None,
+    }
+}
+
 impl From<&aero::Error> for AerospikeException {
     fn from(error: &aero::Error) -> AerospikeException {
-        let (code, in_doubt) = match error {
-            aero::Error::ServerError(rc, in_doubt, _node) => {
-                (aero_result_code_to_i32(*rc), *in_doubt)
-            }
-            aero::Error::BatchError(_idx, rc, in_doubt, _node)
-            | aero::Error::BatchLastError(_idx, rc, in_doubt, _node) => {
-                (aero_result_code_to_i32(*rc), *in_doubt)
-            }
-            _ => (ResultCode::COMMON_ERROR, false),
-        };
+        let (code, in_doubt) = aero_error_code(error).unwrap_or((ResultCode::COMMON_ERROR, false));
         AerospikeException {
             message: error.to_string(),
             code,
@@ -9167,7 +9475,9 @@ impl Key {
         // cross the `extern "C"` boundary and abort the worker.
         match catch_panic(|| aero::Key::new(namespace.to_string(), set.to_string(), aero_value))? {
             Ok(k) => Ok(Key { _as: k }),
-            Err(e) => Err(format!("Invalid key: {e}").into()),
+            Err(e) => Err(PhpException::from_class::<AerospikeException>(format!(
+                "Invalid key: {e}"
+            ))),
         }
     }
 

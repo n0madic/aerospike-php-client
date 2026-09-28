@@ -89,6 +89,27 @@ All notable changes to this project will be documented in this file.
   mistyped nullable argument into `null` without an error — so `new MapPolicy($order,
   MapWriteFlags::updateOnly())` ran with default flags. All four now take a single flag or
   an array of flags, and throw on anything else.
+- **Every other nullable argument had the same flaw**: a mistyped `ctx`, `returnType`,
+  `cit`, filter, filter expression, bin list, range end, `waitTimeoutMs` or `beforeNanos`
+  became `null`. `setFilterExpression(Filter::equal(..))` cleared the filter, `new
+  Statement($ns, $set, [$filter])` ran a full scan, `Context::listIndex(0)` passed without
+  brackets was dropped, and `truncate($p, $ns, $set, "123")` truncated every record. All of
+  them now throw an `AerospikeException` on a value of the wrong type. `ctx` and bin lists
+  also accept a single `Context` / bin name instead of an array.
+- **`ListOp::create()` never worked, and `ListOp::create()`/`MapOp::create()` with a `ctx`
+  failed**: the crate sends the create flag as the list/map *order* argument, so the server
+  answered PARAMETER_ERROR (list, always) or OP_NOT_APPLICABLE (nested create). Both are now
+  encoded like the Go/C/Java clients: a set-order on the bin, or the flag on the last
+  context element.
+- **Server result codes were lost** (`$e->code` was COMMON_ERROR, -17) for `createIndex()`,
+  `dropIndex()`, `registerUdf()`, `dropUdf()` and `truncate()` — the crate wraps their
+  errors in a chain — and for UDF runtime errors (now UDF_BAD_RESPONSE, 100) and client /
+  task-wait timeouts (now TIMEOUT, 9). `in_doubt` is preserved the same way.
+- **`new Key()` with an unsupported key type and `ClientPolicy::setTls()` errors threw a
+  plain `\Exception`**, escaping `catch (AerospikeException $e)`.
+- **`setRecordQueueSize(0)` and `setConnPoolsPerNode(0)`** were accepted and then failed
+  with an opaque internal error (a crate panic at `scan()`/`query()`, a division by zero at
+  `connect()`); the setters now reject 0.
 - **`createIndex()` silently ignored `ctx`**, creating a CDT index on the top-level bin, so
   later queries with a matching `Filter` context returned nothing.
 - **`MapOp::create()` silently dropped `ctx`** when `withIndex` was set, retyping the
@@ -201,6 +222,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`Statement::getBinNames()` returns `null` for "all bins"** (it returned `[]` for both
+  "all bins" and "header only", so `setBinNames(getBinNames())` turned an all-bins query
+  into a header-only one). `setBinNames(null)` selects all bins again.
 - **Tokio runtime is capped at 2 worker threads** (was: one per logical CPU; override via
   `aerospike.worker_threads`). PHP drives the client synchronously, so the runtime threads
   only service I/O, timers and tend tasks; the previous default multiplied into hundreds of

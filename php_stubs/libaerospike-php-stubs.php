@@ -137,7 +137,7 @@ namespace Aerospike {
         public function setDurableDelete(bool $durable_delete): void {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -287,7 +287,7 @@ namespace Aerospike {
         public function setAllowInlineSsd(bool $allow_inline_ssd): void {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -354,9 +354,9 @@ namespace Aerospike {
         /**
          * @param \Aerospike\BatchReadPolicy $policy
          * @param \Aerospike\Key $key
-         * @param array|null $bins
+         * @param string|string[]|null $bins
          */
-        public function __construct(\Aerospike\BatchReadPolicy $policy, \Aerospike\Key $key, ?array $bins = null) {}
+        public function __construct(\Aerospike\BatchReadPolicy $policy, \Aerospike\Key $key, mixed $bins = null) {}
 
         /**
          * Read record header only (no bins).
@@ -398,7 +398,7 @@ namespace Aerospike {
         public function getReadTouchTtlPercent(): int {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -524,7 +524,7 @@ namespace Aerospike {
         public function setExpiration(mixed $expiration): void {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -614,7 +614,7 @@ namespace Aerospike {
         public function setExpiration(mixed $expiration): void {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -703,10 +703,10 @@ namespace Aerospike {
          * @param int $value
          * @param bool $signed
          * @param mixed $action
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function add(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $value, bool $signed, mixed $action, ?array $ctx = null): \Aerospike\Operation {}
+        public static function add(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $value, bool $signed, mixed $action, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitAndOp creates bit "and" operation.
@@ -716,10 +716,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param array $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function and(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function and(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitCountOp creates bit "count" operation. Server returns count of set bits from []byte
@@ -728,10 +728,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $bit_offset
          * @param int $bit_size
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function count(string $bin_name, int $bit_offset, int $bit_size, ?array $ctx = null): \Aerospike\Operation {}
+        public static function count(string $bin_name, int $bit_offset, int $bit_size, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitGetOp creates bit "get" operation. Server returns bits from []byte bin starting at
@@ -740,10 +740,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $bit_offset
          * @param int $bit_size
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function get(string $bin_name, int $bit_offset, int $bit_size, ?array $ctx = null): \Aerospike\Operation {}
+        public static function get(string $bin_name, int $bit_offset, int $bit_size, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitGetIntOp creates bit "get integer" operation. Server returns integer from []byte bin
@@ -754,10 +754,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param bool $signed
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getInt(string $bin_name, int $bit_offset, int $bit_size, bool $signed, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getInt(string $bin_name, int $bit_offset, int $bit_size, bool $signed, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitInsertOp creates byte "insert" operation. Server inserts value bytes into []byte bin
@@ -767,10 +767,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $byte_offset
          * @param array $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function insert(\Aerospike\BitwisePolicy $policy, string $bin_name, int $byte_offset, array $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function insert(\Aerospike\BitwisePolicy $policy, string $bin_name, int $byte_offset, array $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitLScanOp creates bit "left scan" operation. Server returns offset of the first
@@ -780,10 +780,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param bool $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function lscan(string $bin_name, int $bit_offset, int $bit_size, bool $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function lscan(string $bin_name, int $bit_offset, int $bit_size, bool $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitLShiftOp creates bit "left shift" operation.
@@ -793,10 +793,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param int $shift
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function lshift(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $shift, ?array $ctx = null): \Aerospike\Operation {}
+        public static function lshift(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $shift, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitNotOp creates bit "not" operation. Server negates []byte bin starting at bitOffset
@@ -806,10 +806,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $bit_offset
          * @param int $bit_size
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function not(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, ?array $ctx = null): \Aerospike\Operation {}
+        public static function not(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitOrOp creates bit "or" operation.
@@ -819,10 +819,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param array $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function or(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function or(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitRemoveOp creates byte "remove" operation. Server removes bytes from []byte bin at
@@ -832,10 +832,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $byte_offset
          * @param int $byte_size
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function remove(\Aerospike\BitwisePolicy $policy, string $bin_name, int $byte_offset, int $byte_size, ?array $ctx = null): \Aerospike\Operation {}
+        public static function remove(\Aerospike\BitwisePolicy $policy, string $bin_name, int $byte_offset, int $byte_size, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitResizeOp creates byte "resize" operation. Server resizes []byte to byteSize
@@ -844,11 +844,11 @@ namespace Aerospike {
          * @param \Aerospike\BitwisePolicy $policy
          * @param string $bin_name
          * @param int $byte_size
-         * @param mixed $resize_flags
-         * @param array|null $ctx
+         * @param \Aerospike\BitwiseResizeFlags|null $resize_flags
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function resize(\Aerospike\BitwisePolicy $policy, string $bin_name, int $byte_size, mixed $resize_flags = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function resize(\Aerospike\BitwisePolicy $policy, string $bin_name, int $byte_size, mixed $resize_flags = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitRScanOp creates bit "right scan" operation. Server returns offset of the last
@@ -858,10 +858,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param bool $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function rscan(string $bin_name, int $bit_offset, int $bit_size, bool $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function rscan(string $bin_name, int $bit_offset, int $bit_size, bool $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitRShiftOp creates bit "right shift" operation.
@@ -871,10 +871,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param int $shift
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function rshift(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $shift, ?array $ctx = null): \Aerospike\Operation {}
+        public static function rshift(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $shift, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitSetOp creates bit "set" operation. Server sets value on []byte bin at bitOffset for
@@ -885,10 +885,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param array $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function set(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function set(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitSetIntOp creates bit "setInt" operation. Server sets value to []byte bin starting at
@@ -899,10 +899,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param int $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function setInt(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function setInt(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitSubtractOp creates bit "subtract" operation.
@@ -914,10 +914,10 @@ namespace Aerospike {
          * @param int $value
          * @param bool $signed
          * @param mixed $action
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function subtract(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $value, bool $signed, mixed $action, ?array $ctx = null): \Aerospike\Operation {}
+        public static function subtract(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, int $value, bool $signed, mixed $action, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * BitXorOp creates bit "exclusive or" operation.
@@ -927,10 +927,10 @@ namespace Aerospike {
          * @param int $bit_offset
          * @param int $bit_size
          * @param array $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function xor(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function xor(\Aerospike\BitwisePolicy $policy, string $bin_name, int $bit_offset, int $bit_size, array $value, mixed $ctx = null): \Aerospike\Operation {}
     }
 
     /**
@@ -1147,7 +1147,7 @@ namespace Aerospike {
          * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function createIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $bin_name, string $index_name, \Aerospike\IndexType $index_type, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null, ?int $wait_timeout_ms = null): void {}
+        public function createIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $bin_name, string $index_name, \Aerospike\IndexType $index_type, mixed $cit = null, mixed $ctx = null, mixed $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1189,7 +1189,7 @@ namespace Aerospike {
          * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function dropIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $index_name, ?int $wait_timeout_ms = null): void {}
+        public function dropIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $index_name, mixed $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1211,7 +1211,7 @@ namespace Aerospike {
          * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function dropUdf(\Aerospike\WritePolicy $policy, string $package_name, ?int $wait_timeout_ms = null): void {}
+        public function dropUdf(\Aerospike\WritePolicy $policy, string $package_name, mixed $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1235,10 +1235,10 @@ namespace Aerospike {
          *
          * @param \Aerospike\ReadPolicy $policy
          * @param \Aerospike\Key $key
-         * @param array|null $bins
+         * @param string|string[]|null $bins
          * @return \Aerospike\Record|null
          */
-        public function get(\Aerospike\ReadPolicy $policy, \Aerospike\Key $key, ?array $bins = null): ?\Aerospike\Record {}
+        public function get(\Aerospike\ReadPolicy $policy, \Aerospike\Key $key, mixed $bins = null): ?\Aerospike\Record {}
 
         /**
          * Read record header (generation, expiration) only. No bins are returned.
@@ -1375,11 +1375,11 @@ namespace Aerospike {
          * @param \Aerospike\WritePolicy $policy
          * @param string $udf_body
          * @param string $package_name
-         * @param mixed $language
+         * @param \Aerospike\UdfLanguage|null $language
          * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function registerUdf(\Aerospike\WritePolicy $policy, string $udf_body, string $package_name, mixed $language = null, ?int $wait_timeout_ms = null): void {}
+        public function registerUdf(\Aerospike\WritePolicy $policy, string $udf_body, string $package_name, mixed $language = null, mixed $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1405,10 +1405,10 @@ namespace Aerospike {
          * @param mixed $partition_filter
          * @param string $namespace
          * @param string $set_name
-         * @param array|null $bins
+         * @param string|string[]|null $bins
          * @return \Aerospike\Recordset
          */
-        public function scan(\Aerospike\ScanPolicy $policy, mixed $partition_filter, string $namespace, string $set_name, ?array $bins = null): \Aerospike\Recordset {}
+        public function scan(\Aerospike\ScanPolicy $policy, mixed $partition_filter, string $namespace, string $set_name, mixed $bins = null): \Aerospike\Recordset {}
 
         /**
          * Returns the server build version string for each node in the cluster.
@@ -1453,7 +1453,7 @@ namespace Aerospike {
          * @param int|null $before_nanos
          * @return void
          */
-        public function truncate(\Aerospike\InfoPolicy $policy, string $namespace, string $set_name, ?int $before_nanos = null): void {}
+        public function truncate(\Aerospike\InfoPolicy $policy, string $namespace, string $set_name, mixed $before_nanos = null): void {}
 
         /**
          * @param \Aerospike\WritePolicy $policy
@@ -1649,6 +1649,7 @@ namespace Aerospike {
         /**
          * @param int $n
          * @return void
+         * @throws \Aerospike\AerospikeException if the value is 0
          */
         public function setConnPoolsPerNode(int $n): void {}
 
@@ -2708,10 +2709,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $value
          * @param \Aerospike\IndexCollectionType|null $cit
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function contains(string $bin_name, mixed $value, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): \Aerospike\Filter {}
+        public static function contains(string $bin_name, mixed $value, mixed $cit = null, mixed $ctx = null): \Aerospike\Filter {}
 
         /**
          * Creates a contains-range filter for queries on a collection index. Only integer values
@@ -2721,10 +2722,10 @@ namespace Aerospike {
          * @param mixed $begin
          * @param mixed $end
          * @param \Aerospike\IndexCollectionType|null $cit
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function containsRange(string $bin_name, mixed $begin, mixed $end, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): \Aerospike\Filter {}
+        public static function containsRange(string $bin_name, mixed $begin, mixed $end, mixed $cit = null, mixed $ctx = null): \Aerospike\Filter {}
 
         /**
          * Creates an equality filter for queries. Value can be an integer, string, or blob.
@@ -2732,10 +2733,10 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param mixed $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function equal(string $bin_name, mixed $value, ?array $ctx = null): \Aerospike\Filter {}
+        public static function equal(string $bin_name, mixed $value, mixed $ctx = null): \Aerospike\Filter {}
 
         /**
          * Creates a range filter for queries. Only integer ranges are supported.
@@ -2743,10 +2744,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function range(string $bin_name, mixed $begin, mixed $end, ?array $ctx = null): \Aerospike\Filter {}
+        public static function range(string $bin_name, mixed $begin, mixed $end, mixed $ctx = null): \Aerospike\Filter {}
 
         /**
          * Creates a geospatial "regions containing point" filter for query.
@@ -2755,10 +2756,10 @@ namespace Aerospike {
          * @param float $lat
          * @param float $lng
          * @param \Aerospike\IndexCollectionType|null $cit
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function regionsContainingPoint(string $bin_name, float $lat, float $lng, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): \Aerospike\Filter {}
+        public static function regionsContainingPoint(string $bin_name, float $lat, float $lng, mixed $cit = null, mixed $ctx = null): \Aerospike\Filter {}
 
         /**
          * Creates a geospatial "within radius" filter for query.
@@ -2768,10 +2769,10 @@ namespace Aerospike {
          * @param float $lng
          * @param float $radius
          * @param \Aerospike\IndexCollectionType|null $cit
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function withinRadius(string $bin_name, float $lat, float $lng, float $radius, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): \Aerospike\Filter {}
+        public static function withinRadius(string $bin_name, float $lat, float $lng, float $radius, mixed $cit = null, mixed $ctx = null): \Aerospike\Filter {}
 
         /**
          * Creates a geospatial "within region" filter for query. Argument must be a valid GeoJSON region.
@@ -2779,10 +2780,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param string $region
          * @param \Aerospike\IndexCollectionType|null $cit
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Filter
          */
-        public static function withinRegion(string $bin_name, string $region, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): \Aerospike\Filter {}
+        public static function withinRegion(string $bin_name, string $region, mixed $cit = null, mixed $ctx = null): \Aerospike\Filter {}
     }
 
     /**
@@ -3284,11 +3285,11 @@ namespace Aerospike {
          * @param \Aerospike\ListPolicy $policy
          * @param string $bin_name
          * @param array $values
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          * @throws \Aerospike\AerospikeException
          */
-        public static function append(\Aerospike\ListPolicy $policy, string $bin_name, array $values, ?array $ctx = null): \Aerospike\Operation {}
+        public static function append(\Aerospike\ListPolicy $policy, string $bin_name, array $values, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListClearOp creates a list clear operation.
@@ -3296,10 +3297,10 @@ namespace Aerospike {
          * Server does not return a result by default.
          *
          * @param string $bin_name
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function clear(string $bin_name, ?array $ctx = null): \Aerospike\Operation {}
+        public static function clear(string $bin_name, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListCreateOp creates list create operation.
@@ -3312,10 +3313,10 @@ namespace Aerospike {
          * @param mixed $order
          * @param bool $pad
          * @param bool|null $index
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function create(string $bin_name, mixed $order, bool $pad, ?bool $index = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function create(string $bin_name, mixed $order, bool $pad, ?bool $index = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByIndexOp creates list get by index operation.
@@ -3323,11 +3324,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByIndex(string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByIndex(string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByIndexRangeOp creates list get by index range operation.
@@ -3336,11 +3337,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByIndexRange(string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByIndexRange(string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByIndexRangeCountOp creates list get by index range operation.
@@ -3350,11 +3351,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByIndexRangeCount(string $bin_name, int $index, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByIndexRangeCount(string $bin_name, int $index, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByRankOp creates a list get by rank operation.
@@ -3362,11 +3363,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByRank(string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByRank(string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByRankRangeOp creates a list get by rank range operation.
@@ -3375,11 +3376,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByRankRange(string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByRankRange(string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByRankRangeCountOp creates a list get by rank range operation.
@@ -3388,11 +3389,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByRankRangeCount(string $bin_name, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByRankRangeCount(string $bin_name, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByValueRangeOp creates a list get by value range operation.
@@ -3404,11 +3405,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValueRange(string $bin_name, mixed $begin, mixed $end = null, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValueRange(string $bin_name, mixed $begin, mixed $end = null, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByValueRelativeRankRangeOp creates a list get by value relative to rank range operation.
@@ -3428,11 +3429,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $value
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValueRelativeRankRange(string $bin_name, mixed $value, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValueRelativeRankRange(string $bin_name, mixed $value, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByValueRelativeRankRangeCountOp creates a list get by value relative to rank range operation.
@@ -3453,11 +3454,11 @@ namespace Aerospike {
          * @param mixed $value
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValueRelativeRankRangeCount(string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValueRelativeRankRangeCount(string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListGetByValueListOp creates a list get by value operation.
@@ -3465,11 +3466,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $values
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValues(string $bin_name, array $values, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValues(string $bin_name, array $values, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListIncrementOp creates a list increment operation.
@@ -3482,10 +3483,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function increment(string $bin_name, int $index, int $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function increment(string $bin_name, int $index, int $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListInsertOp creates a list insert operation.
@@ -3497,11 +3498,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param array $values
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          * @throws \Aerospike\AerospikeException
          */
-        public static function insert(\Aerospike\ListPolicy $policy, string $bin_name, int $index, array $values, ?array $ctx = null): \Aerospike\Operation {}
+        public static function insert(\Aerospike\ListPolicy $policy, string $bin_name, int $index, array $values, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListPopOp creates list pop operation.
@@ -3509,10 +3510,10 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function pop(string $bin_name, int $index, ?array $ctx = null): \Aerospike\Operation {}
+        public static function pop(string $bin_name, int $index, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListPopRangeOp creates a list pop range operation.
@@ -3521,10 +3522,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function popRange(string $bin_name, int $index, int $count, ?array $ctx = null): \Aerospike\Operation {}
+        public static function popRange(string $bin_name, int $index, int $count, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListPopRangeFromOp creates a list pop range operation.
@@ -3532,10 +3533,10 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function popRangeFrom(string $bin_name, int $index, ?array $ctx = null): \Aerospike\Operation {}
+        public static function popRangeFrom(string $bin_name, int $index, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByIndexOp creates a list remove operation.
@@ -3543,11 +3544,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByIndex(string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByIndex(string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByIndexRangeOp creates a list remove operation.
@@ -3556,11 +3557,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByIndexRange(string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByIndexRange(string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByIndexRangeCountOp creates a list remove operation.
@@ -3569,11 +3570,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByIndexRangeCount(string $bin_name, int $index, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByIndexRangeCount(string $bin_name, int $index, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByRankOp creates a list remove operation.
@@ -3581,11 +3582,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByRank(string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByRank(string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByRankRangeOp creates a list remove operation.
@@ -3594,11 +3595,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByRankRange(string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByRankRange(string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByRankRangeCountOp creates a list remove operation.
@@ -3607,11 +3608,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByRankRangeCount(string $bin_name, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByRankRangeCount(string $bin_name, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByValueRangeOp creates a list remove operation.
@@ -3623,11 +3624,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValueRange(string $bin_name, mixed $begin, mixed $end = null, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValueRange(string $bin_name, mixed $begin, mixed $end = null, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByValueRelativeRankRangeOp creates a list remove by value relative to rank range operation.
@@ -3647,11 +3648,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $value
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValueRelativeRankRange(string $bin_name, mixed $value, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValueRelativeRankRange(string $bin_name, mixed $value, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByValueRelativeRankRangeCountOp creates a list remove by value relative to rank range operation.
@@ -3671,11 +3672,11 @@ namespace Aerospike {
          * @param mixed $value
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValueRelativeRankRangeCount(string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValueRelativeRankRangeCount(string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveRangeOp creates a list remove range operation.
@@ -3685,10 +3686,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeRange(string $bin_name, int $index, int $count, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeRange(string $bin_name, int $index, int $count, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveRangeFromOp creates a list remove range operation.
@@ -3697,10 +3698,10 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param int $index
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeRangeFrom(string $bin_name, int $index, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeRangeFrom(string $bin_name, int $index, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListRemoveByValueListOp creates list remove by value operation.
@@ -3708,11 +3709,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $values
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\ListReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeValues(string $bin_name, array $values, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeValues(string $bin_name, array $values, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListSetOp creates a list set operation.
@@ -3723,11 +3724,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param mixed $value
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          * @throws \Aerospike\AerospikeException
          */
-        public static function set(string $bin_name, int $index, mixed $value, ?array $ctx = null): \Aerospike\Operation {}
+        public static function set(string $bin_name, int $index, mixed $value, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListSetOrderOp creates a set list order operation.
@@ -3735,20 +3736,20 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param mixed $order
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function setOrder(string $bin_name, mixed $order, ?array $ctx = null): \Aerospike\Operation {}
+        public static function setOrder(string $bin_name, mixed $order, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListSizeOp creates a list size operation.
          * Server returns size of list on bin name.
          *
          * @param string $bin_name
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function size(string $bin_name, ?array $ctx = null): \Aerospike\Operation {}
+        public static function size(string $bin_name, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListSortOp creates list sort operation.
@@ -3757,10 +3758,10 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param \Aerospike\ListSortFlags $sort_flags
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function sort(string $bin_name, \Aerospike\ListSortFlags $sort_flags, ?array $ctx = null): \Aerospike\Operation {}
+        public static function sort(string $bin_name, \Aerospike\ListSortFlags $sort_flags, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * ListTrimOp creates a list trim operation.
@@ -3771,10 +3772,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function trim(string $bin_name, int $index, int $count, ?array $ctx = null): \Aerospike\Operation {}
+        public static function trim(string $bin_name, int $index, int $count, mixed $ctx = null): \Aerospike\Operation {}
     }
 
     /**
@@ -4028,10 +4029,10 @@ namespace Aerospike {
          * Server removes all items in map. Server returns nil.
          *
          * @param string $bin_name
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function clear(string $bin_name, ?array $ctx = null): \Aerospike\Operation {}
+        public static function clear(string $bin_name, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapCreateOp creates a map create operation.
@@ -4045,10 +4046,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param \Aerospike\MapOrderType $order
          * @param bool|null $with_index
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function create(string $bin_name, \Aerospike\MapOrderType $order, ?bool $with_index = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function create(string $bin_name, \Aerospike\MapOrderType $order, ?bool $with_index = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapDecrementOp creates map decrement operation.
@@ -4059,10 +4060,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $key
          * @param mixed $decr
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function decrement(\Aerospike\MapPolicy $policy, string $bin_name, mixed $key, mixed $decr, ?array $ctx = null): \Aerospike\Operation {}
+        public static function decrement(\Aerospike\MapPolicy $policy, string $bin_name, mixed $key, mixed $decr, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByIndexOp creates map get by index operation. Should be used with BatchRead.
@@ -4070,11 +4071,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByIndex(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByIndex(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByIndexRangeOp creates map get by index range operation.
@@ -4087,11 +4088,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByIndexRangeCountOp creates map get by index range operation.
@@ -4103,11 +4104,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByKeyRangeOp creates map get by key range operation.
@@ -4117,11 +4118,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByKeyRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByKeyRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByKeyRelativeIndexRangeOp creates a map get by key relative to index range operation.
@@ -4130,11 +4131,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $key
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByKeyRelativeIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByKeyRelativeIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByKeyRelativeIndexRangeCountOp creates a map get by key relative to index range operation.
@@ -4144,11 +4145,11 @@ namespace Aerospike {
          * @param mixed $key
          * @param int $index
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByKeyRelativeIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByKeyRelativeIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByKeyListOp creates a map get by key list operation. Should be used with BatchRead.
@@ -4156,11 +4157,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param array $keys
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByKeys(\Aerospike\MapPolicy $_policy, string $bin_name, array $keys, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByKeys(\Aerospike\MapPolicy $_policy, string $bin_name, array $keys, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByRankOp creates map get by rank operation. Should be used with BatchRead.
@@ -4168,11 +4169,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByRank(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByRank(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByRankRangeOp creates map get by rank range operation.
@@ -4183,11 +4184,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByRankRangeCountOp creates map get by rank range operation.
@@ -4199,11 +4200,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByValueRangeOp creates map get by value range operation. Should be used with BatchRead.
@@ -4212,11 +4213,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValueRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValueRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByValueRelativeRankRangeOp creates a map get by value relative to rank range operation.
@@ -4225,11 +4226,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $value
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValueRelativeRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValueRelativeRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByValueRelativeRankRangeCountOp creates a map get by value relative to rank range operation.
@@ -4239,11 +4240,11 @@ namespace Aerospike {
          * @param mixed $value
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValueRelativeRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValueRelativeRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapGetByValueListOp creates a map get by value list operation. Should be used with BatchRead.
@@ -4251,11 +4252,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param array $values
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function getByValues(\Aerospike\MapPolicy $_policy, string $bin_name, array $values, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function getByValues(\Aerospike\MapPolicy $_policy, string $bin_name, array $values, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapIncrementOp creates map increment operation.
@@ -4266,10 +4267,10 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $key
          * @param mixed $incr
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function increment(\Aerospike\MapPolicy $policy, string $bin_name, mixed $key, mixed $incr, ?array $ctx = null): \Aerospike\Operation {}
+        public static function increment(\Aerospike\MapPolicy $policy, string $bin_name, mixed $key, mixed $incr, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapPutOp creates map put-items operation.
@@ -4279,11 +4280,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $policy
          * @param string $bin_name
          * @param mixed $map
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          * @throws \Aerospike\AerospikeException
          */
-        public static function put(\Aerospike\MapPolicy $policy, string $bin_name, mixed $map, ?array $ctx = null): \Aerospike\Operation {}
+        public static function put(\Aerospike\MapPolicy $policy, string $bin_name, mixed $map, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByIndexOp creates map remove operation.
@@ -4292,11 +4293,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByIndex(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByIndex(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByIndexRangeOp creates map remove operation.
@@ -4305,11 +4306,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByIndexRangeCountOp creates map remove operation.
@@ -4319,11 +4320,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $index
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $index, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByKeyRangeOp creates map remove operation.
@@ -4337,11 +4338,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByKeyRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByKeyRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByKeyRelativeIndexRangeOp creates a map remove by key relative to index range operation.
@@ -4350,11 +4351,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $key
          * @param int $index
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByKeyRelativeIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByKeyRelativeIndexRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByKeyRelativeIndexRangeCountOp creates map remove by key relative to index range operation.
@@ -4364,11 +4365,11 @@ namespace Aerospike {
          * @param mixed $key
          * @param int $index
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByKeyRelativeIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByKeyRelativeIndexRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $key, int $index, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByKeyListOp creates map remove operation.
@@ -4376,11 +4377,11 @@ namespace Aerospike {
          *
          * @param string $bin_name
          * @param array $keys
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByKeys(string $bin_name, array $keys, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByKeys(string $bin_name, array $keys, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByRankOp creates map remove operation.
@@ -4389,11 +4390,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByRank(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByRank(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByRankRangeOp creates map remove operation.
@@ -4402,11 +4403,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByRankRangeCountOp creates map remove operation.
@@ -4416,11 +4417,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByValueRangeOp creates map remove operation.
@@ -4430,11 +4431,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $begin
          * @param mixed $end
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValueRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValueRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $begin, mixed $end, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByValueRelativeRankRangeOp creates a map remove by value relative to rank range operation.
@@ -4444,11 +4445,11 @@ namespace Aerospike {
          * @param string $bin_name
          * @param mixed $value
          * @param int $rank
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValueRelativeRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValueRelativeRankRange(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByValueRelativeRankRangeCountOp creates a map remove by value relative to rank range operation.
@@ -4459,11 +4460,11 @@ namespace Aerospike {
          * @param mixed $value
          * @param int $rank
          * @param int $count
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValueRelativeRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValueRelativeRankRangeCount(\Aerospike\MapPolicy $_policy, string $bin_name, mixed $value, int $rank, int $count, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapRemoveByValueListOp creates map remove operation.
@@ -4472,11 +4473,11 @@ namespace Aerospike {
          * @param \Aerospike\MapPolicy $_policy
          * @param string $bin_name
          * @param array $values
-         * @param mixed $return_type
-         * @param array|null $ctx
+         * @param \Aerospike\MapReturnType|null $return_type
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function removeByValues(\Aerospike\MapPolicy $_policy, string $bin_name, array $values, mixed $return_type = null, ?array $ctx = null): \Aerospike\Operation {}
+        public static function removeByValues(\Aerospike\MapPolicy $_policy, string $bin_name, array $values, mixed $return_type = null, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapSetPolicyOp creates set map policy operation.
@@ -4486,20 +4487,20 @@ namespace Aerospike {
          *
          * @param \Aerospike\MapPolicy $policy
          * @param string $bin_name
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function setPolicy(\Aerospike\MapPolicy $policy, string $bin_name, ?array $ctx = null): \Aerospike\Operation {}
+        public static function setPolicy(\Aerospike\MapPolicy $policy, string $bin_name, mixed $ctx = null): \Aerospike\Operation {}
 
         /**
          * MapSizeOp creates map size operation.
          * Server returns size of map.
          *
          * @param string $bin_name
-         * @param array|null $ctx
+         * @param \Aerospike\Context|\Aerospike\Context[]|null $ctx
          * @return \Aerospike\Operation
          */
-        public static function size(string $bin_name, ?array $ctx = null): \Aerospike\Operation {}
+        public static function size(string $bin_name, mixed $ctx = null): \Aerospike\Operation {}
     }
 
     /**
@@ -4556,7 +4557,7 @@ namespace Aerospike {
          * @param bool|null $persist_index
          * @param \Aerospike\MapWriteMode|null $write_mode
          */
-        public function __construct(\Aerospike\MapOrderType $order, mixed $flags = null, ?bool $persist_index = null, ?\Aerospike\MapWriteMode $write_mode = null) {}
+        public function __construct(\Aerospike\MapOrderType $order, mixed $flags = null, ?bool $persist_index = null, mixed $write_mode = null) {}
     }
 
     /**
@@ -5248,7 +5249,7 @@ namespace Aerospike {
         public function setExpectedDuration(mixed $expected_duration): void {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -5274,6 +5275,7 @@ namespace Aerospike {
         /**
          * @param int $record_queue_size
          * @return void
+         * @throws \Aerospike\AerospikeException if the value is 0
          */
         public function setRecordQueueSize(int $record_queue_size): void {}
 
@@ -5455,7 +5457,7 @@ namespace Aerospike {
         public function getTotalTimeout(): int {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -6307,7 +6309,7 @@ namespace Aerospike {
         public function getTotalTimeout(): int {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}
@@ -6339,6 +6341,7 @@ namespace Aerospike {
         /**
          * @param int $record_queue_size
          * @return void
+         * @throws \Aerospike\AerospikeException if the value is 0
          */
         public function setRecordQueueSize(int $record_queue_size): void {}
 
@@ -6371,17 +6374,19 @@ namespace Aerospike {
         /**
          * @param string $namespace
          * @param string $set_name
-         * @param mixed $filter
-         * @param array|null $bin_names
+         * @param \Aerospike\Filter|null $filter
+         * @param string|string[]|null $bin_names
          */
-        public function __construct(string $namespace, string $set_name, mixed $filter = null, ?array $bin_names = null) {}
+        public function __construct(string $namespace, string $set_name, mixed $filter = null, mixed $bin_names = null) {}
 
         /**
-         * Bin names to return (optional). Empty Vec is treated as Bins::None (header-only).
+         * Bin names to return: `null` = all bins, `[]` = header only (no bins), otherwise
+         * the listed bins. The same contract as the constructor, so
+         * `setBinNames(getBinNames())` is a no-op.
          *
-         * @return array
+         * @return string[]|null
          */
-        public function getBinNames(): array {}
+        public function getBinNames(): ?array {}
 
         /**
          * Query index filter (optional). Applied to the secondary index on query.
@@ -6406,13 +6411,16 @@ namespace Aerospike {
         public function getSetname(): string {}
 
         /**
-         * @param array $bin_names
+         * `null` selects all bins, `[]` header only (no bins).
+         *
+         * @param string|string[]|null $bin_names
          * @return void
+         * @throws \Aerospike\AerospikeException on anything else
          */
-        public function setBinNames(array $bin_names): void {}
+        public function setBinNames(mixed $bin_names = null): void {}
 
         /**
-         * @param mixed $filter
+         * @param \Aerospike\Filter|null $filter
          * @return void
          */
         public function setFilter(mixed $filter = null): void {}
@@ -6793,7 +6801,7 @@ namespace Aerospike {
         public function setExpiration(mixed $expiration): void {}
 
         /**
-         * @param mixed $filter_expression
+         * @param \Aerospike\Expression|null $filter_expression
          * @return void
          */
         public function setFilterExpression(mixed $filter_expression = null): void {}

@@ -91,7 +91,12 @@ const MAX_CACHED_CLIENTS_DEFAULT: usize = 8;
 // client operation (including once per record in `Recordset::next()`), so the hot path
 // must not take a lock: it is two atomic loads. Invariant: `TOKIO_RT_PID` is stored
 // (Release) only *after* `TOKIO_RT_PTR` (Release), so a reader that observes the current
-// pid (Acquire) is guaranteed to observe the matching runtime pointer.
+// pid (Acquire) is guaranteed to observe the matching runtime pointer. The runtime lives
+// until module shutdown: `take_tokio_rt()` (MSHUTDOWN only) is the single place that frees
+// it, and it clears the pid first. The `&'static` handed out by `tokio_rt()` is therefore
+// only sound because nothing may call into the extension concurrently with or after
+// MSHUTDOWN — PHP guarantees that for request threads, and no Tokio task calls
+// `tokio_rt()`. Keep it that way.
 static TOKIO_RT_PTR: AtomicPtr<tokio::runtime::Runtime> = AtomicPtr::new(std::ptr::null_mut());
 static TOKIO_RT_PID: AtomicU32 = AtomicU32::new(0);
 /// Serializes the slow path (first use / post-fork rebuild) only.
@@ -114,8 +119,9 @@ static TOKIO_RT_INIT: Mutex<()> = Mutex::new(());
 fn tokio_rt() -> PhpResult<&'static tokio::runtime::Runtime> {
     let pid = std::process::id();
     if TOKIO_RT_PID.load(Ordering::Acquire) == pid {
-        // SAFETY: a matching pid is stored only after a valid, never-freed (leaked)
-        // runtime pointer — see the invariant on TOKIO_RT_PTR/TOKIO_RT_PID above.
+        // SAFETY: a matching pid is stored only after a valid runtime pointer, which is
+        // freed only by `take_tokio_rt()` at MSHUTDOWN after clearing the pid — see the
+        // invariant on TOKIO_RT_PTR/TOKIO_RT_PID above.
         return Ok(unsafe { &*TOKIO_RT_PTR.load(Ordering::Acquire) });
     }
 
@@ -523,17 +529,17 @@ fn throw_aero_error<T>(e: &aero::Error, default: T) -> PhpResult<T> {
 /// aerospike crate stores timeouts as `u32`, and a silent `as u32` truncation would
 /// turn `u32::MAX + 1` into `0` (which the aerospike client interprets as no timeout),
 /// making large nonsensical values dangerously permissive.
-fn millis_u64_to_u32(timeout_millis: u64) -> PhpResult<u32> {
-    if timeout_millis > u32::MAX as u64 {
-        return throw_msg(
-            &format!(
-                "timeout_millis {timeout_millis} exceeds u32::MAX ({}); aerospike timeouts are u32 milliseconds",
-                u32::MAX
-            ),
-            0u32,
-        );
-    }
-    Ok(timeout_millis as u32)
+///
+/// Returns `Err` rather than throwing and yielding a sentinel: the callers are setters, and
+/// a sentinel `0` would be *assigned* before PHP saw the exception — a caught out-of-range
+/// call would then silently leave the policy at 0 instead of unchanged.
+fn millis_u64_to_u32(millis: u64, what: &str) -> PhpResult<u32> {
+    u32::try_from(millis).map_err(|_| {
+        PhpException::from_class::<AerospikeException>(format!(
+            "{what} {millis} exceeds u32::MAX ({}); aerospike stores it as u32 milliseconds",
+            u32::MAX
+        ))
+    })
 }
 
 /// Convert a plain error message to a PHP exception and throw it. Returns `Ok(default)`
@@ -542,6 +548,50 @@ fn throw_msg<T>(msg: &str, default: T) -> PhpResult<T> {
     let error = AerospikeException::new(msg);
     throw_object(error.into_zval(true)?)?;
     Ok(default)
+}
+
+/// Turns the exception a callee has already thrown (e.g. `from_zval` rejecting a nested
+/// value) into an `Err`, so `?` hands PHP that same exception. Returning a fresh
+/// `PhpException` instead would be thrown *on top* of the pending one — Zend chains the
+/// newer exception first, burying the specific message under `getPrevious()`. Falls back
+/// to an `AerospikeException` carrying `msg` when nothing is pending.
+fn pending_exception_or(msg: &str) -> PhpException {
+    let fallback = || PhpException::from_class::<AerospikeException>(msg.to_string());
+    let Some(obj) = ext_php_rs::zend::ExecutorGlobals::take_exception() else {
+        return fallback();
+    };
+    let mut zv = Zval::new();
+    if obj.set_zval(&mut zv, false).is_err() {
+        return fallback();
+    }
+    let mut e = fallback();
+    e.set_object(Some(zv));
+    e
+}
+
+/// Parses a write-flags constructor argument: `null`, a single flag object, or an array of
+/// flag objects (combined by the caller, usually with bitwise OR).
+///
+/// A `?array`-typed argument is not enough: ext-php-rs turns a nullable argument of the
+/// wrong type into `None` *without any error*, so the single-flag form
+/// `new BitwisePolicy(BitwiseWriteFlags::updateOnly())` silently ran with default flags.
+/// Taking the raw zval lets both forms work and makes anything else throw.
+fn write_flags_arg<T: for<'a> FromZval<'a>>(flags: Option<&Zval>, what: &str) -> PhpResult<Vec<T>> {
+    let invalid = || {
+        PhpException::from_class::<AerospikeException>(format!(
+            "{what}: flags must be null, a flag object or an array of flag objects"
+        ))
+    };
+    let Some(zv) = flags.map(Zval::dereference).filter(|z| !z.is_null()) else {
+        return Ok(Vec::new());
+    };
+    if let Some(arr) = zv.array() {
+        return arr
+            .iter()
+            .map(|(_, v)| T::from_zval(v.dereference()).ok_or_else(invalid))
+            .collect();
+    }
+    T::from_zval(zv).map(|f| vec![f]).ok_or_else(invalid)
 }
 
 /// Runs `f`, converting a Rust panic into a catchable `AerospikeException` instead of
@@ -619,18 +669,16 @@ macro_rules! impl_from_zval_wrapper {
 /// Parse a `readTouchTtlPercent` value: 0 = server default, -1 = don't reset,
 /// 1..=100 = percentage. Any other value throws an `AerospikeException` instead of
 /// silently falling back to the server default (which the getter reports as 0,
-/// hiding the mistake from the caller).
+/// hiding the mistake from the caller). Returns `Err` rather than throwing plus a
+/// sentinel, so the setter leaves the policy unchanged (see `millis_u64_to_u32`).
 fn read_touch_ttl_from_percent(percent: i32) -> PhpResult<aero::policy::ReadTouchTTL> {
     match percent {
         0 => Ok(aero::policy::ReadTouchTTL::ServerDefault),
         -1 => Ok(aero::policy::ReadTouchTTL::DontReset),
         p if (1..=100).contains(&p) => Ok(aero::policy::ReadTouchTTL::Percent(p as u8)),
-        _ => throw_msg(
-            &format!(
-                "readTouchTtlPercent must be 0 (server default), -1 (don't reset), or 1..=100, got {percent}"
-            ),
-            aero::policy::ReadTouchTTL::ServerDefault,
-        ),
+        _ => Err(PhpException::from_class::<AerospikeException>(format!(
+            "readTouchTtlPercent must be 0 (server default), -1 (don't reset), or 1..=100, got {percent}"
+        ))),
     }
 }
 
@@ -995,18 +1043,10 @@ impl Expression {
     /// which surfaced far from the cause as a TypeError inside whatever comparison consumed
     /// the expression.
     pub fn map_val(val: &Zval) -> PhpResult<Self> {
-        let m: HashMap<aero::Value, aero::Value> =
-            match php_array_as_map(val, "Expression::mapVal")? {
-                PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
-                _ => {
-                    return throw_msg(
-                        "Expression::mapVal requires an array",
-                        Expression {
-                            _as: aero::expressions::nil(),
-                        },
-                    )
-                }
-            };
+        let m: HashMap<aero::Value, aero::Value> = php_array_as_map(val, "Expression::mapVal")?
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         Ok(Expression {
             _as: aero::expressions::map_val(m),
         })
@@ -1428,11 +1468,13 @@ impl RegexFlag {
 //
 ////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Replica determines which node a single-record or batch command targets.
+/// Replica determines which node serves a read.
 ///
-/// Only single-record and batch commands honour this — scans and queries always visit every
-/// node. `PreferRack` additionally requires `ClientPolicy::setRackIds()` and matching server
-/// rack configuration; without them it behaves like `Sequence`.
+/// Settable on `ReadPolicy` and `BatchPolicy` (the node a single-record or batch command
+/// targets) and on `QueryPolicy`/`ScanPolicy` (which copy of each partition a scan or query
+/// reads — every partition is still visited once). Writes are not affected. `PreferRack`
+/// additionally requires `ClientPolicy::setRackIds()` and matching server rack
+/// configuration; without them it behaves like `Sequence`.
 #[php_class]
 #[php(name = "Aerospike\\Replica")]
 #[derive(Clone, Copy)]
@@ -2206,7 +2248,8 @@ macro_rules! php_policy_impl {
                 u64::from(self._as.base_policy.total_timeout)
             }
             pub fn set_total_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-                self._as.base_policy.total_timeout = millis_u64_to_u32(timeout_millis)?;
+                self._as.base_policy.total_timeout =
+                    millis_u64_to_u32(timeout_millis, "total_timeout")?;
                 Ok(())
             }
 
@@ -2215,7 +2258,8 @@ macro_rules! php_policy_impl {
                 u64::from(self._as.base_policy.socket_timeout)
             }
             pub fn set_socket_timeout(&mut self, timeout_millis: u64) -> PhpResult<()> {
-                self._as.base_policy.socket_timeout = millis_u64_to_u32(timeout_millis)?;
+                self._as.base_policy.socket_timeout =
+                    millis_u64_to_u32(timeout_millis, "socket_timeout")?;
                 Ok(())
             }
 
@@ -2236,7 +2280,8 @@ macro_rules! php_policy_impl {
                 u64::from(self._as.base_policy.sleep_between_retries)
             }
             pub fn set_sleep_between_retries(&mut self, sleep_millis: u64) -> PhpResult<()> {
-                self._as.base_policy.sleep_between_retries = millis_u64_to_u32(sleep_millis)?;
+                self._as.base_policy.sleep_between_retries =
+                    millis_u64_to_u32(sleep_millis, "sleep_between_retries")?;
                 Ok(())
             }
 
@@ -2248,7 +2293,8 @@ macro_rules! php_policy_impl {
                 u64::from(self._as.base_policy.timeout_delay)
             }
             pub fn set_timeout_delay(&mut self, delay_millis: u64) -> PhpResult<()> {
-                self._as.base_policy.timeout_delay = millis_u64_to_u32(delay_millis)?;
+                self._as.base_policy.timeout_delay =
+                    millis_u64_to_u32(delay_millis, "timeout_delay")?;
                 Ok(())
             }
 
@@ -2535,6 +2581,17 @@ php_policy_impl!(QueryPolicy, filter_in: _as.base_policy, {
     pub fn set_records_per_second(&mut self, records_per_second: u32) {
         self._as.records_per_second = records_per_second;
     }
+
+    /// Replica algorithm used to pick which node serves each partition. Defaults to
+    /// `Replica::sequence()`; use `Replica::preferRack()` to keep reads on the client's rack.
+    pub fn get_replica(&self) -> Replica {
+        Replica {
+            _as: self._as.replica,
+        }
+    }
+    pub fn set_replica(&mut self, replica: Replica) {
+        self._as.replica = replica._as;
+    }
 });
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -2591,6 +2648,17 @@ php_policy_impl!(ScanPolicy, filter_in: _as.base_policy, {
     }
     pub fn set_records_per_second(&mut self, records_per_second: u32) {
         self._as.records_per_second = records_per_second;
+    }
+
+    /// Replica algorithm used to pick which node serves each partition. Defaults to
+    /// `Replica::sequence()`; use `Replica::preferRack()` to keep reads on the client's rack.
+    pub fn get_replica(&self) -> Replica {
+        Replica {
+            _as: self._as.replica,
+        }
+    }
+    pub fn set_replica(&mut self, replica: Replica) {
+        self._as.replica = replica._as;
     }
 });
 
@@ -2818,17 +2886,18 @@ fn filter_with_ctx(f: aero::query::Filter, ctx: Option<Vec<&CDTContext>>) -> aer
 /// `Filter::equal("bin", Value::infinity())`), and a panic there would cross the
 /// `extern "C"` boundary and abort the worker — so the check happens here, with a message
 /// naming the offending argument.
+///
+/// Must return `Err`, never throw-and-return-a-sentinel: the caller builds the filter from
+/// whatever comes back, and a sentinel `Nil` hits exactly the `assert!` this guards
+/// against (it did — the worker still aborted on `Filter::equal("bin", 3.14)`).
 fn filter_value(value: PHPValue, arg: &str) -> PhpResult<aero::Value> {
     let v: aero::Value = value.into();
     match v {
         aero::Value::Int(_) | aero::Value::String(_) | aero::Value::Blob(_) => Ok(v),
-        other => throw_msg(
-            &format!(
-                "Filter argument `{arg}` must be an integer, string or blob, got {}",
-                aero_value_type_name(&other)
-            ),
-            aero::Value::Nil,
-        ),
+        other => Err(PhpException::from_class::<AerospikeException>(format!(
+            "Filter argument `{arg}` must be an integer, string or blob, got {}",
+            aero_value_type_name(&other)
+        ))),
     }
 }
 
@@ -3251,11 +3320,6 @@ pub struct Recordset {
 /// strictly better than blocking the worker forever.
 const RECORDSET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long `sync_partition_filter_back` waits for the recordset's tracker lock before
-/// concluding a reader task is parked holding it. Short: this runs on the request path,
-/// and the fallback (drain, skip the cursor update) is cheap and safe.
-const RECORDSET_CURSOR_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// Backoff bounds used while waiting on the recordset queue.
 ///
 /// The upstream `Iterator for &aero::Recordset` calls `block_on(yield_now())` between
@@ -3274,6 +3338,17 @@ fn recordset_backoff(backoff: &mut std::time::Duration) {
     *backoff = (*backoff * 2).min(RECORDSET_POLL_MAX);
 }
 
+/// True once no reader can touch the recordset again, given that the caller holds exactly
+/// one `Arc` to it.
+///
+/// The node-reader tasks and the scan/query driver task each hold an `Arc` until they
+/// return, so when the caller's is the only one left nothing can push another record or
+/// write the partition tracker. `is_active()` is *not* that signal: `close()` flips it
+/// immediately while the readers keep streaming — they never check it.
+fn recordset_readers_finished(rs: &Arc<aero::Recordset>) -> bool {
+    Arc::strong_count(rs) == 1
+}
+
 /// Drains a recordset's queue in the background until every reader task has finished.
 ///
 /// Reader tasks block in `push().await` on a bounded queue *while holding the recordset's
@@ -3286,17 +3361,18 @@ fn recordset_backoff(backoff: &mut std::time::Duration) {
 /// the rest of the scan, and a script that abandons recordsets in a loop (paginating with
 /// `maxRecords(1)`, say) would otherwise pay that cost on every destructor.
 ///
-/// The `Arc` is moved into the task, so `strong_count == 1` inside it means every reader
-/// has gone. `RECORDSET_DRAIN_TIMEOUT` keeps the task from becoming immortal if a node
-/// stops responding; giving up leaks exactly what the old code always leaked.
+/// Takes the caller's *only* reference (see `recordset_readers_finished`) — only `Drop`
+/// calls this, after taking the PHP object's `Arc`. `RECORDSET_DRAIN_TIMEOUT` keeps the
+/// task from becoming immortal if a node stops responding; giving up leaks exactly what
+/// the old code always leaked.
 fn drain_recordset(rs: Arc<aero::Recordset>) {
-    let Ok(rt) = tokio_rt() else { return };
-    if Arc::strong_count(&rs) == 1 {
+    if recordset_readers_finished(&rs) {
         return;
     }
+    let Ok(rt) = tokio_rt() else { return };
     rt.spawn(async move {
         let deadline = Instant::now() + RECORDSET_DRAIN_TIMEOUT;
-        while Arc::strong_count(&rs) > 1 {
+        while !recordset_readers_finished(&rs) {
             if Instant::now() >= deadline {
                 trace!("recordset drain timed out; reader tasks may still hold connections");
                 return;
@@ -3337,8 +3413,11 @@ impl Recordset {
     /// Close the recordset. Background tasks finish at their next safe point.
     ///
     /// To stop a paginated scan/query early *and* keep the pagination cursor, drain the
-    /// recordset after closing: keep calling `next()` until it returns `null`. Draining
-    /// consumes the records the server already delivered and then writes the cursor back
+    /// recordset after closing: keep calling `next()` until it returns `null`. `close()`
+    /// stops further retry rounds, but the node readers already running finish their
+    /// current partitions (the crate gives them no way to stop), so the drain keeps
+    /// returning those records and only ends once every reader has exited — bound the
+    /// amount with `setMaxRecords()` when paginating. The cursor is then written back
     /// into the originating `PartitionFilter`, so the next scan resumes exactly after the
     /// consumed records. Abandoning the recordset right after `close()` leaves the
     /// cursor at the previous page boundary (already-seen records are returned again on
@@ -3371,7 +3450,9 @@ impl Recordset {
     /// originating `PartitionFilter` is updated so paginated scans resume from the last
     /// digest.
     pub fn next(&mut self) -> PhpResult<Option<Record>> {
-        let Some(rs) = self._as.clone() else {
+        // Borrowed, not cloned: `recordset_readers_finished` relies on the PHP object's
+        // `Arc` being the only one outside the reader tasks.
+        let Some(rs) = self._as.as_ref() else {
             return Ok(None);
         };
         let next = rt_call(|| {
@@ -3380,11 +3461,15 @@ impl Recordset {
                 if let Some(rec) = rs.next_record() {
                     return Some(rec);
                 }
-                if !rs.is_active() {
-                    // Re-check after observing the flag: a reader task may have queued a
-                    // record between the `try_recv` above and the flag load. Returning
-                    // `None` while records are still buffered would lose them and move the
-                    // pagination cursor past records the caller never saw.
+                // End of stream means the readers are *gone*, not merely that `active` is
+                // false: after `close()` they keep streaming their current partitions.
+                // Stopping early would let the cursor (synced below) count records pushed
+                // after this check that the caller never receives, and extracting it while
+                // a reader still runs makes that reader panic on the taken filter
+                // (aerospike-core partition_tracker.rs `set_digest`).
+                if !rs.is_active() && recordset_readers_finished(rs) {
+                    // The last reader may have queued a record between the `try_recv`
+                    // above and its exit; nothing can be pushed after this point.
                     return rs.next_record();
                 }
                 recordset_backoff(&mut backoff);
@@ -3405,9 +3490,10 @@ impl Recordset {
     /// Copy the post-scan partition cursor from the underlying `aero::Recordset` into the
     /// originating PHP `PartitionFilter` wrapper.
     ///
-    /// Attempted on every end-of-stream; the flag is set only once the cursor has actually
-    /// been written back, so a `next()` that failed (or found the tracker still busy) is
-    /// retried instead of silently leaving the filter on the previous page.
+    /// Only called once `next()` has established that every reader task has finished, so
+    /// the tracker lock is free and no reader can observe the extracted filter. The flag is
+    /// set only after a completed attempt, so a `next()` that failed is retried instead of
+    /// silently leaving the filter on the previous page.
     fn sync_partition_filter_back(&mut self) -> PhpResult<()> {
         if self.pf_synced {
             return Ok(());
@@ -3418,29 +3504,15 @@ impl Recordset {
             self.pf_synced = true;
             return Ok(());
         };
-        // `partition_filter()` takes the recordset's tracker lock — and a reader task holds
-        // that same lock across `push().await` (aerospike-core stream_command.rs). After a
-        // `close()` mid-stream nobody drains the queue, so that task parks holding the lock
-        // and an unbounded wait here hangs the PHP worker forever. Bound the wait; if it
-        // expires, drain the queue to unpark the readers and give up on the cursor rather
-        // than moving it past records the caller never received.
-        let updated = rt_block_on(async {
-            tokio::time::timeout(RECORDSET_CURSOR_TIMEOUT, rs.partition_filter()).await
-        })?;
-        let Ok(updated) = updated else {
-            trace!("partition cursor unavailable (readers still busy); leaving filter unchanged");
-            drain_recordset(rs.clone());
-            return Ok(());
-        };
         // Errors must surface: silently dropping one leaves the PHP `PartitionFilter`
         // holding the pre-scan cursor, so the next page of a paginated scan would silently
         // re-read the same range.
+        let updated = rt_block_on(rs.partition_filter())?;
+        // `None` means the crate already handed the filter out; there is nothing newer.
         if let Some(new_pf) = updated {
-            if let Ok(mut guard) = pf_arc.lock() {
-                *guard = new_pf;
-                self.pf_synced = true;
-            }
+            *pf_arc.lock().unwrap_or_else(PoisonError::into_inner) = new_pf;
         }
+        self.pf_synced = true;
         Ok(())
     }
 }
@@ -3462,12 +3534,13 @@ pub struct Bin {
 #[php_impl]
 impl Bin {
     pub fn __construct(name: &str, value: &Zval) -> PhpResult<Self> {
-        let v_op: Option<PHPValue> = from_zval(value);
-        match v_op {
+        match from_zval(value) {
             Some(v) => Ok(Bin {
                 _as: aero::Bin::new(name.to_string(), v.into()),
             }),
-            _ => Err("Invalid input for argument `value`".to_string().into()),
+            // `from_zval` usually threw already (non-UTF-8 string, unsupported object, ...);
+            // surface that specific exception rather than a generic one on top of it.
+            None => Err(pending_exception_or("Invalid input for argument `value`")),
         }
     }
 
@@ -4836,19 +4909,19 @@ pub struct CdtListPolicy {
 #[php_impl]
 impl CdtListPolicy {
     /// NewListPolicy creates a policy with directives when creating a list and writing list items.
-    /// Flags are ListWriteFlags. You can specify multiple by passing multiple values in the array;
-    /// they are combined with a bitwise OR.
-    pub fn __construct(order: ListOrderType, flags: Option<Vec<CdtListWriteFlags>>) -> Self {
-        let flags_bitmask: u8 = flags
-            .map(|flags| flags.iter().fold(0u8, |acc, f| acc | f._as as u8))
-            .unwrap_or(0);
+    /// Flags are ListWriteFlags: pass one, or several in an array — they are combined with
+    /// a bitwise OR. Throws for anything else (see `write_flags_arg`).
+    pub fn __construct(order: ListOrderType, flags: Option<&Zval>) -> PhpResult<Self> {
+        let flags_bitmask: u8 = write_flags_arg::<CdtListWriteFlags>(flags, "ListPolicy")?
+            .iter()
+            .fold(0u8, |acc, f| acc | f._as as u8);
 
-        CdtListPolicy {
+        Ok(CdtListPolicy {
             _as: aero::ListPolicy {
                 attributes: order._as,
                 flags: flags_bitmask,
             },
-        }
+        })
     }
 }
 
@@ -5880,16 +5953,16 @@ pub struct CdtMapPolicy {
 #[php_impl]
 impl CdtMapPolicy {
     /// Creates a MapPolicy with optional write flags (server >= 4.3) or defaults to
-    /// `MapWriteMode::Update` when no flags are supplied (servers < 4.3).
+    /// `MapWriteMode::Update` when no flags are supplied (servers < 4.3). `flags` is one
+    /// MapWriteFlags or an array of them (combined with bitwise OR); anything else throws.
     pub fn __construct(
         order: &MapOrderType,
-        flags: Option<Vec<&CdtMapWriteFlags>>,
+        flags: Option<&Zval>,
         persist_index: Option<bool>,
         write_mode: Option<&CdtMapWriteMode>,
-    ) -> Self {
-        let combined_flags: u8 = flags
-            .unwrap_or_default()
-            .into_iter()
+    ) -> PhpResult<Self> {
+        let combined_flags: u8 = write_flags_arg::<CdtMapWriteFlags>(flags, "MapPolicy")?
+            .iter()
             .fold(aero::MapWriteFlags::DEFAULT, |acc, f| acc | f._as);
 
         // Flags (server >= 4.3) win when present; `write_mode` is the pre-4.3 encoding and
@@ -5903,7 +5976,7 @@ impl CdtMapPolicy {
         };
         policy.persist_index = persist_index.unwrap_or(false);
 
-        Self { _as: policy }
+        Ok(Self { _as: policy })
     }
 }
 
@@ -6072,13 +6145,10 @@ impl CdtMapOperation {
         map: &Zval,
         ctx: Option<Vec<&CDTContext>>,
     ) -> PhpResult<Operation> {
-        let aero_map: HashMap<aero::Value, aero::Value> = match php_array_as_map(map, "MapOp::put")?
-        {
-            PHPValue::HashMap(h) => h.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
-            // `php_array_as_map` only ever yields a HashMap on the success path; anything
-            // else means it threw, and that exception has to win.
-            _ => return throw_msg("MapOp::put requires an array", Operation::get(None)),
-        };
+        let aero_map: HashMap<aero::Value, aero::Value> = php_array_as_map(map, "MapOp::put")?
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         let op = aero::operations::maps::put_items(&policy._as, &bin_name, aero_map);
         Ok(Operation {
             _as: with_ctx(op, ctx),
@@ -6771,18 +6841,20 @@ pub struct CdtHllPolicy {
 #[php_impl]
 impl CdtHllPolicy {
     /// new HLLPolicy uses the specified optional HLLWriteFlags when performing HLL
-    /// operations. Pass several in the array to combine them (bitwise OR) — e.g.
-    /// `[HllWriteFlags::allowFold(), HllWriteFlags::noFail()]`, which a single flag could
-    /// not express.
-    pub fn __construct(flags: Option<Vec<CdtHllWriteFlags>>) -> Self {
-        let write_flags: Vec<aero::operations::hll::HLLWriteFlags> = flags
-            .map(|f| f.iter().map(|x| x._as).collect())
-            .unwrap_or_default();
+    /// operations. Pass a single flag, or several in an array to combine them (bitwise
+    /// OR) — e.g. `[HllWriteFlags::allowFold(), HllWriteFlags::noFail()]`. Anything else
+    /// throws (see `write_flags_arg`).
+    pub fn __construct(flags: Option<&Zval>) -> PhpResult<Self> {
+        let write_flags: Vec<aero::operations::hll::HLLWriteFlags> =
+            write_flags_arg::<CdtHllWriteFlags>(flags, "HllPolicy")?
+                .into_iter()
+                .map(|x| x._as)
+                .collect();
 
-        // DefaultHLLPolicy uses the default policy when performing HLL operations.
-        CdtHllPolicy {
+        // No flags is the default policy.
+        Ok(CdtHllPolicy {
             _as: aero::operations::hll::HLLPolicy::new_with_flags(write_flags),
-        }
+        })
     }
 }
 
@@ -7121,17 +7193,20 @@ pub struct CdtBitwisePolicy {
 #[php_impl]
 impl CdtBitwisePolicy {
     /// new BitwisePolicy(flags) will return a BitPolicy with the provided write flags.
-    /// Pass several in the array to combine them (bitwise OR) — e.g.
-    /// `[BitwiseWriteFlags::updateOnly(), BitwiseWriteFlags::noFail()]`, which a single
-    /// flag could not express.
-    pub fn __construct(flags: Option<Vec<CdtBitwiseWriteFlags>>) -> Self {
-        let flag_byte = flags
-            .map(|f| f.iter().fold(0u8, |acc, x| acc | x._as.clone() as u8))
-            .unwrap_or(aero::operations::bitwise::BitwiseWriteFlags::Default as u8);
+    /// Pass a single flag, or several in an array to combine them (bitwise OR) — e.g.
+    /// `[BitwiseWriteFlags::updateOnly(), BitwiseWriteFlags::noFail()]`. Anything else
+    /// throws (see `write_flags_arg`).
+    pub fn __construct(flags: Option<&Zval>) -> PhpResult<Self> {
+        let flag_byte = write_flags_arg::<CdtBitwiseWriteFlags>(flags, "BitwisePolicy")?
+            .into_iter()
+            .fold(
+                aero::operations::bitwise::BitwiseWriteFlags::Default as u8,
+                |acc, x| acc | x._as as u8,
+            );
 
-        CdtBitwisePolicy {
+        Ok(CdtBitwisePolicy {
             _as: aero::operations::bitwise::BitPolicy::new(flag_byte),
-        }
+        })
     }
 }
 
@@ -8023,15 +8098,21 @@ fn admin_policy_with_timeout(timeout_ms: u32) -> aero::AdminPolicy {
     ap
 }
 
-/// Deadline for `IndexTask`/`RegisterTask` completion polling, derived from the caller's
-/// `total_timeout`.
+/// Deadline for `IndexTask`/`RegisterTask` completion polling (`createIndex`, `dropIndex`,
+/// `registerUdf`, `dropUdf`), taken from their explicit `$waitTimeoutMs` argument.
 ///
-/// `wait_till_complete(&task, None)` polls forever, so a stuck index build or a node that
-/// never reports completion pins the PHP worker indefinitely and `setTotalTimeout()` has no
-/// effect on it. A zero (unset) timeout keeps the previous unbounded behaviour, since index
-/// builds and UDF propagation on a large cluster legitimately outlast any request timeout.
-fn task_wait_timeout(timeout_ms: u32) -> Option<std::time::Duration> {
-    (timeout_ms > 0).then(|| std::time::Duration::from_millis(u64::from(timeout_ms)))
+/// Deliberately *not* derived from the policy's `total_timeout`: that is a per-command
+/// network timeout and defaults to 1000 ms, while an index build or UDF propagation on a
+/// large cluster legitimately takes far longer — deriving it made every default-policy
+/// `createIndex()` throw "Task timeout reached" after the first poll while the server kept
+/// building the index. `null`/`0` waits until the task completes (the upstream default);
+/// a positive value bounds the wait so a stuck task cannot pin the worker. The crate polls
+/// once per second and stops once another poll would pass the deadline, so a bound below
+/// about two seconds allows a single poll.
+fn task_wait_timeout(wait_timeout_ms: Option<u64>) -> Option<std::time::Duration> {
+    wait_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
 }
 
 /// Single conversion point from a PHP bin-name list to an `aero::Bins` selector.
@@ -8456,11 +8537,14 @@ impl Client {
         }
     }
 
-    /// Create a secondary index on a bin.
+    /// Create a secondary index on a bin and wait until the build completes.
     ///
     /// `ctx` scopes the index to a path inside a CDT (e.g. a map key or list index), so the
     /// index covers the nested collection rather than the top-level bin. Queries must then
     /// use the same context on their `Filter`.
+    ///
+    /// `wait_timeout_ms` bounds the wait for the build (null/0 = until complete); the
+    /// policy's `total_timeout` applies to the create command only.
     pub fn create_index(
         &self,
         policy: &WritePolicy,
@@ -8471,6 +8555,7 @@ impl Client {
         index_type: &IndexType,
         cit: Option<&IndexCollectionType>,
         ctx: Option<Vec<&CDTContext>>,
+        wait_timeout_ms: Option<u64>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let cit_val = cit
@@ -8497,20 +8582,22 @@ impl Client {
         };
         if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
             &task,
-            task_wait_timeout(policy._as.base_policy.total_timeout),
+            task_wait_timeout(wait_timeout_ms),
         ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
     }
 
-    /// Delete a secondary index.
+    /// Delete a secondary index and wait until every node has dropped it.
+    /// `wait_timeout_ms` bounds that wait (null/0 = until complete).
     pub fn drop_index(
         &self,
         policy: &WritePolicy,
         namespace: &str,
         set_name: &str,
         index_name: &str,
+        wait_timeout_ms: Option<u64>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let task = match rt_call(|| {
@@ -8522,20 +8609,23 @@ impl Client {
         };
         if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
             &task,
-            task_wait_timeout(policy._as.base_policy.total_timeout),
+            task_wait_timeout(wait_timeout_ms),
         ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
     }
 
-    /// RegisterUDF registers a package containing user defined functions with server.
+    /// RegisterUDF registers a package containing user defined functions with server and
+    /// waits until every node has it. `wait_timeout_ms` bounds that wait (null/0 = until
+    /// complete).
     pub fn register_udf(
         &self,
         policy: &WritePolicy,
         udf_body: &str,
         package_name: &str,
         language: Option<UdfLanguage>,
+        wait_timeout_ms: Option<u64>,
     ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
         let lang = language.map(|l| l._as).unwrap_or(aero::UDFLang::Lua);
@@ -8548,21 +8638,30 @@ impl Client {
         };
         if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
             &task,
-            task_wait_timeout(policy._as.base_policy.total_timeout),
+            task_wait_timeout(wait_timeout_ms),
         ))? {
             return throw_aero_error(&e, ());
         }
         Ok(())
     }
 
-    /// Drops a registered UDF module.
+    /// Drops a registered UDF module and waits until every node has removed it.
     ///
     /// `package_name` is the server-side file name, e.g. "udf1.lua". A bare module name is
     /// accepted too and gets the ".lua" suffix, so feeding `UdfMeta::getPackageName()`
-    /// straight back in works instead of failing with "file not found".
-    pub fn drop_udf(&self, policy: &WritePolicy, package_name: &str) -> PhpResult<()> {
+    /// straight back in works instead of failing with "file not found" — including module
+    /// names that themselves contain dots ("my.mod"). `wait_timeout_ms` bounds the wait
+    /// (null/0 = until complete).
+    pub fn drop_udf(
+        &self,
+        policy: &WritePolicy,
+        package_name: &str,
+        wait_timeout_ms: Option<u64>,
+    ) -> PhpResult<()> {
         let admin = admin_policy_with_timeout(policy._as.base_policy.total_timeout);
-        let filename = if package_name.contains('.') {
+        // Lua is the only UDF language the server supports, so `.lua` is the only
+        // extension to recognise; a dot elsewhere is part of the module name.
+        let filename = if package_name.ends_with(".lua") {
             package_name.to_string()
         } else {
             format!("{package_name}.lua")
@@ -8574,7 +8673,7 @@ impl Client {
         };
         if let Err(e) = rt_block_on(AeroTask::wait_till_complete(
             &task,
-            task_wait_timeout(policy._as.base_policy.total_timeout),
+            task_wait_timeout(wait_timeout_ms),
         ))? {
             return throw_aero_error(&e, ());
         }
@@ -9603,9 +9702,6 @@ impl IntoZval for PHPValue {
     }
 }
 
-/// Converts a `Zval` into a `PHPValue`. Returns `None` (and may throw a PHP exception)
-/// for objects we don't recognise or values whose contents cannot be extracted; the caller
-/// must propagate the `None` so PHP sees the thrown exception.
 /// Interprets a PHP array as an Aerospike map, whatever its keys look like.
 ///
 /// `from_zval` has to guess between list and map, and it guesses "list" for sequential
@@ -9613,30 +9709,32 @@ impl IntoZval for PHPValue {
 /// wherever a map is what the caller asked for: `['a', 'b']` is a legal map with integer
 /// keys 0 and 1, and `[]` is a legal empty map. Callers that need a map convert here so
 /// those two cases stop being rejected as "not an associative array".
-fn php_array_as_map(zval: &Zval, what: &str) -> PhpResult<PHPValue> {
+fn php_array_as_map(zval: &Zval, what: &str) -> PhpResult<HashMap<PHPValue, PHPValue>> {
     match from_zval(zval) {
-        Some(PHPValue::HashMap(hm)) => Ok(PHPValue::HashMap(hm)),
+        Some(PHPValue::HashMap(hm)) => Ok(hm),
         // A list is a map keyed 0..N-1; an empty array arrives here too.
-        Some(PHPValue::List(items)) => Ok(PHPValue::HashMap(
-            items
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| (PHPValue::Int(i as i64), v))
-                .collect(),
-        )),
-        Some(PHPValue::Json(h)) => Ok(PHPValue::HashMap(
-            h.into_iter()
-                .map(|(k, v)| (PHPValue::String(k), v))
-                .collect(),
-        )),
-        // `None` means a nested value already threw; keep that exception.
-        None => Err(PhpException::from_class::<AerospikeException>(format!(
+        Some(PHPValue::List(items)) => Ok(items
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (PHPValue::Int(i as i64), v))
+            .collect()),
+        Some(PHPValue::Json(h)) => Ok(h
+            .into_iter()
+            .map(|(k, v)| (PHPValue::String(k), v))
+            .collect()),
+        // `None` means a nested value already threw; hand that exception back unchanged.
+        None => Err(pending_exception_or(&format!(
             "{what} received an unusable array"
         ))),
-        Some(_) => throw_msg(&format!("{what} requires an array"), PHPValue::Nil),
+        Some(_) => Err(PhpException::from_class::<AerospikeException>(format!(
+            "{what} requires an array"
+        ))),
     }
 }
 
+/// Converts a `Zval` into a `PHPValue`. Returns `None` (and may throw a PHP exception)
+/// for objects we don't recognise or values whose contents cannot be extracted; the caller
+/// must propagate the `None` so PHP sees the thrown exception.
 fn from_zval(zval: &Zval) -> Option<PHPValue> {
     // Top-level arguments are dereferenced by the argument parser, but array *elements*
     // are not: `zval.get_type()` reports `Reference` and would fall through to the
@@ -9879,8 +9977,26 @@ impl Value {
         PHPValue::List(val)
     }
 
+    /// Map value for a bin. Takes an array with at least one non-sequential key.
+    ///
+    /// The result is a plain PHP array, and a PHP array whose keys are exactly 0..N-1 —
+    /// including `[]` — is indistinguishable from a list: used as a bin value it is stored
+    /// as a list. Accepting such input here would silently write a list where a map was
+    /// asked for, so it is rejected instead. Use `MapOp::put()` (which does accept them) to
+    /// write list-shaped or empty maps.
     pub fn map(val: &Zval) -> PhpResult<PHPValue> {
-        php_array_as_map(val, "Value::map")
+        match from_zval(val) {
+            Some(v @ (PHPValue::HashMap(_) | PHPValue::Json(_))) => Ok(v),
+            Some(PHPValue::List(_)) => Err(PhpException::from_class::<AerospikeException>(
+                "Value::map: an array keyed 0..N-1 (including []) would be stored as a list; \
+                 use MapOp::put() to write it as a map"
+                    .into(),
+            )),
+            None => Err(pending_exception_or("Value::map received an unusable array")),
+            Some(_) => Err(PhpException::from_class::<AerospikeException>(
+                "Value::map requires an array".into(),
+            )),
+        }
     }
 
     pub fn blob(zval: &Zval) -> PhpResult<PHPValue> {

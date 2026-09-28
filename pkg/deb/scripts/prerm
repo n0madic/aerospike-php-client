@@ -13,15 +13,23 @@ case "${1:-remove}" in
     *) exit 0 ;;
 esac
 
+# PHP minor release this package was built for, substituted at package build time.
+# The extension only loads under exactly this minor version.
+PHP_VERSION="@PHP_VERSION@"
+case "$PHP_VERSION" in
+    *@*) PHP_VERSION="" ;; # not substituted: a hand-built package, no pinned version
+esac
+PHP_BIN="php${PHP_VERSION}"
+
 # Best effort from here on: a half-removed PHP must never block package removal,
 # so every step degrades to a no-op instead of failing the transaction.
-if ! command -v php > /dev/null; then
-    echo "PHP not found — skipping Aerospike extension cleanup."
+if ! command -v "$PHP_BIN" > /dev/null; then
+    echo "$PHP_BIN not found — skipping Aerospike extension cleanup."
     exit 0
 fi
 
-EXT_DIR=$(php -r 'echo ini_get("extension_dir");' 2>/dev/null) || EXT_DIR=""
-PHP_INI_PATH=$(php -r 'echo php_ini_loaded_file();' 2>/dev/null) || PHP_INI_PATH=""
+EXT_DIR=$("$PHP_BIN" -r 'echo ini_get("extension_dir");' 2>/dev/null) || EXT_DIR=""
+PHP_INI_PATH=$("$PHP_BIN" -r 'echo php_ini_loaded_file();' 2>/dev/null) || PHP_INI_PATH=""
 
 # Mirror of the postinst copy: the .so inside PHP's extension_dir is not owned by
 # the package manager, so nothing else would ever delete it.
@@ -37,14 +45,32 @@ EXT_DIRECTIVE_RE='^[[:space:]]*extension[[:space:]]*=[[:space:]]*libaerospike_ph
 if [[ -n "$PHP_INI_PATH" && -f "$PHP_INI_PATH" ]] \
     && grep -Eq "$EXT_DIRECTIVE_RE" "$PHP_INI_PATH"; then
     echo "Removing 'extension=libaerospike_php.so' from $PHP_INI_PATH"
-    # Filtered through a temp file and copied back rather than `sed -i`: writing
-    # into the original inode keeps php.ini's owner, mode and any hard links —
-    # it is a package-manager conffile, not ours to replace.
+    # Filtered through a temp file and written back into the original inode rather than
+    # `sed -i`: that keeps php.ini's owner, mode and any hard links — it is a
+    # package-manager conffile, not ours to replace. Writing in place truncates first,
+    # so a failed write (ENOSPC, ...) would leave php.ini empty: take a backup before
+    # touching it and restore from it on failure, and leave php.ini alone whenever any
+    # step before the write fails.
     tmp_ini=$(mktemp) || tmp_ini=""
     if [[ -n "$tmp_ini" ]]; then
-        # grep exits 1 when every line matched; that is a valid (empty) result.
-        grep -Ev "$EXT_DIRECTIVE_RE" "$PHP_INI_PATH" > "$tmp_ini" || true
-        cat "$tmp_ini" > "$PHP_INI_PATH" || true
+        # grep exits 1 when every line matched — a valid (empty) result; >1 is an error.
+        grep_rc=0
+        grep -Ev "$EXT_DIRECTIVE_RE" "$PHP_INI_PATH" > "$tmp_ini" || grep_rc=$?
+        backup_ini="$PHP_INI_PATH.aerospike-prerm.bak"
+        if (( grep_rc > 1 )); then
+            echo "Could not filter $PHP_INI_PATH; leaving it unchanged." >&2
+        elif ! cp -p "$PHP_INI_PATH" "$backup_ini"; then
+            echo "Could not back up $PHP_INI_PATH; leaving it unchanged." >&2
+        elif cat "$tmp_ini" > "$PHP_INI_PATH"; then
+            rm -f "$backup_ini"
+        else
+            echo "Failed to rewrite $PHP_INI_PATH; restoring it from $backup_ini." >&2
+            if cat "$backup_ini" > "$PHP_INI_PATH"; then
+                rm -f "$backup_ini"
+            else
+                echo "Restore failed; the original is kept at $backup_ini." >&2
+            fi
+        fi
         rm -f "$tmp_ini"
     fi
 fi

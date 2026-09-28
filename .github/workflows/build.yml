@@ -77,15 +77,19 @@ jobs:
           latest_tag=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/v//') || latest_tag="2.0.0"
           echo "tag=${latest_tag:-2.0.0}" >> "$GITHUB_OUTPUT"
 
-      - name: Substitute placeholders in deb control
+      - name: Substitute placeholders in deb control and maintainer scripts
         env:
           VERSION: ${{ steps.get_tag.outputs.tag }}
           DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           sed -i "s/@VERSION@/${VERSION}/g" pkg/deb/control
           sed -i "s/@ARCH@/${DEB_ARCH}/g" pkg/deb/control
-          sed -i "s/@PHP_VERSION@/${PHP_VERSION}/g" pkg/deb/control
+          # postinst/prerm drive /usr/bin/php$PHP_VERSION and refuse any other minor.
+          # (The rpm scripts get the same substitution in the spec's %install.)
+          sed -i "s/@PHP_VERSION@/${PHP_VERSION}/g" \
+            pkg/deb/control pkg/deb/scripts/postinst pkg/deb/scripts/prerm
           cat pkg/deb/control
+          grep -n 'PHP_VERSION=' pkg/deb/scripts/postinst pkg/deb/scripts/prerm
 
       - name: Package for deb (${{ matrix.deb_arch }})
         env:

@@ -971,13 +971,13 @@ namespace Aerospike {
     class BitwisePolicy {
         /**
          * new BitwisePolicy(flags) will return a BitPolicy with the provided write flags.
-         * Pass several in the array to combine them (bitwise OR) — e.g.
-         * `[BitwiseWriteFlags::updateOnly(), BitwiseWriteFlags::noFail()]`, which a single
-         * flag could not express.
+         * Pass a single flag, or several in an array to combine them (bitwise OR) — e.g.
+         * `[BitwiseWriteFlags::updateOnly(), BitwiseWriteFlags::noFail()]`. Anything else
+         * throws an AerospikeException.
          *
-         * @param \Aerospike\BitwiseWriteFlags[]|null $flags
+         * @param \Aerospike\BitwiseWriteFlags|\Aerospike\BitwiseWriteFlags[]|null $flags
          */
-        public function __construct(?array $flags = null) {}
+        public function __construct(mixed $flags = null) {}
     }
 
     /**
@@ -1127,10 +1127,14 @@ namespace Aerospike {
         public static function connect(string $hosts, ?\Aerospike\ClientPolicy $policy = null): mixed {}
 
         /**
-         * Create a secondary index on a bin.
+         * Create a secondary index on a bin and wait until the build completes.
          *
-         * v2 BREAKING: `ctx` is currently ignored; the underlying aerospike crate does not yet
-         * expose ctx-aware index creation through `create_index_on_bin`.
+         * `ctx` scopes the index to a path inside a CDT (e.g. a map key or list index), so the
+         * index covers the nested collection rather than the top-level bin. Queries must then
+         * use the same context on their `Filter`.
+         *
+         * `wait_timeout_ms` bounds the wait for the build (null/0 = until complete); the
+         * policy's `total_timeout` applies to the create command only.
          *
          * @param \Aerospike\WritePolicy $policy
          * @param string $namespace
@@ -1140,9 +1144,10 @@ namespace Aerospike {
          * @param \Aerospike\IndexType $index_type
          * @param \Aerospike\IndexCollectionType|null $cit
          * @param \Aerospike\Context[]|null $ctx
+         * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function createIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $bin_name, string $index_name, \Aerospike\IndexType $index_type, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null): void {}
+        public function createIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $bin_name, string $index_name, \Aerospike\IndexType $index_type, ?\Aerospike\IndexCollectionType $cit = null, ?array $ctx = null, ?int $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1174,15 +1179,17 @@ namespace Aerospike {
         public function delete(\Aerospike\WritePolicy $policy, \Aerospike\Key $key): bool {}
 
         /**
-         * Delete a secondary index.
+         * Delete a secondary index and wait until every node has dropped it.
+         * `wait_timeout_ms` bounds that wait (null/0 = until complete).
          *
          * @param \Aerospike\WritePolicy $policy
          * @param string $namespace
          * @param string $set_name
          * @param string $index_name
+         * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function dropIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $index_name): void {}
+        public function dropIndex(\Aerospike\WritePolicy $policy, string $namespace, string $set_name, string $index_name, ?int $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1192,11 +1199,19 @@ namespace Aerospike {
         public function dropRole(\Aerospike\AdminPolicy $policy, string $role_name): void {}
 
         /**
+         * Drops a registered UDF module and waits until every node has removed it.
+         *
+         * `package_name` is the server-side file name, e.g. "udf1.lua". A bare module name is
+         * accepted too and gets the ".lua" suffix, so `UdfMeta::getPackageName()` can be fed
+         * straight back in — including module names that contain dots. `wait_timeout_ms`
+         * bounds the wait (null/0 = until complete).
+         *
          * @param \Aerospike\WritePolicy $policy
          * @param string $package_name
+         * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function dropUdf(\Aerospike\WritePolicy $policy, string $package_name): void {}
+        public function dropUdf(\Aerospike\WritePolicy $policy, string $package_name, ?int $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -1353,15 +1368,18 @@ namespace Aerospike {
         public function queryUsers(\Aerospike\AdminPolicy $policy, ?string $user = null): array {}
 
         /**
-         * RegisterUDF registers a package containing user defined functions with server.
+         * RegisterUDF registers a package containing user defined functions with server and
+         * waits until every node has it. `wait_timeout_ms` bounds that wait (null/0 = until
+         * complete).
          *
          * @param \Aerospike\WritePolicy $policy
          * @param string $udf_body
          * @param string $package_name
          * @param mixed $language
+         * @param int|null $wait_timeout_ms
          * @return void
          */
-        public function registerUdf(\Aerospike\WritePolicy $policy, string $udf_body, string $package_name, mixed $language = null): void {}
+        public function registerUdf(\Aerospike\WritePolicy $policy, string $udf_body, string $package_name, mixed $language = null, ?int $wait_timeout_ms = null): void {}
 
         /**
          * @param \Aerospike\AdminPolicy $policy
@@ -2991,13 +3009,13 @@ namespace Aerospike {
     class HllPolicy {
         /**
          * new HLLPolicy uses the specified optional HLLWriteFlags when performing HLL
-         * operations. Pass several in the array to combine them (bitwise OR) — e.g.
-         * `[HllWriteFlags::allowFold(), HllWriteFlags::noFail()]`, which a single flag
-         * could not express.
+         * operations. Pass a single flag, or several in an array to combine them (bitwise
+         * OR) — e.g. `[HllWriteFlags::allowFold(), HllWriteFlags::noFail()]`. Anything else
+         * throws an AerospikeException.
          *
-         * @param \Aerospike\HllWriteFlags[]|null $flags
+         * @param \Aerospike\HllWriteFlags|\Aerospike\HllWriteFlags[]|null $flags
          */
-        public function __construct(?array $flags = null) {}
+        public function __construct(mixed $flags = null) {}
     }
 
     /**
@@ -3793,13 +3811,13 @@ namespace Aerospike {
     class ListPolicy {
         /**
          * NewListPolicy creates a policy with directives when creating a list and writing list items.
-         * Flags are ListWriteFlags. You can specify multiple by passing multiple values in the array;
-         * they are combined with a bitwise OR.
+         * Flags are ListWriteFlags: pass one, or several in an array — they are combined with
+         * a bitwise OR. Anything else throws an AerospikeException.
          *
          * @param mixed $order
-         * @param array|null $flags
+         * @param \Aerospike\ListWriteFlags|\Aerospike\ListWriteFlags[]|null $flags
          */
-        public function __construct(mixed $order, ?array $flags = null) {}
+        public function __construct(mixed $order, mixed $flags = null) {}
     }
 
     /**
@@ -4530,13 +4548,15 @@ namespace Aerospike {
     class MapPolicy {
         /**
          * Creates a MapPolicy with optional write flags (server >= 4.3) or defaults to
-         * `MapWriteMode::Update` when no flags are supplied (servers < 4.3).
+         * `MapWriteMode::Update` when no flags are supplied (servers < 4.3). `flags` is one
+         * MapWriteFlags or an array of them (combined with bitwise OR); anything else throws.
          *
          * @param \Aerospike\MapOrderType $order
-         * @param array|null $flags
+         * @param \Aerospike\MapWriteFlags|\Aerospike\MapWriteFlags[]|null $flags
          * @param bool|null $persist_index
+         * @param \Aerospike\MapWriteMode|null $write_mode
          */
-        public function __construct(\Aerospike\MapOrderType $order, ?array $flags = null, ?bool $persist_index = null, ?\Aerospike\MapWriteMode $write_mode = null) {}
+        public function __construct(\Aerospike\MapOrderType $order, mixed $flags = null, ?bool $persist_index = null, ?\Aerospike\MapWriteMode $write_mode = null) {}
     }
 
     /**
@@ -5159,6 +5179,20 @@ namespace Aerospike {
          */
         public function setRecordsPerSecond(int $records_per_second): void {}
 
+        /**
+         * Replica algorithm used to pick which node serves each partition. Defaults to
+         * `Replica::sequence()`; use `Replica::preferRack()` to keep reads on the client's rack.
+         *
+         * @return \Aerospike\Replica
+         */
+        public function getReplica(): \Aerospike\Replica {}
+
+        /**
+         * @param mixed $replica
+         * @return void
+         */
+        public function setReplica(mixed $replica): void {}
+
         public function __construct() {}
 
         /**
@@ -5598,8 +5632,11 @@ namespace Aerospike {
          * Close the recordset. Background tasks finish at their next safe point.
          *
          * To stop a paginated scan/query early AND keep the pagination cursor, drain the
-         * recordset after closing: keep calling next() until it returns null. Draining
-         * consumes the records already delivered and then writes the cursor back into the
+         * recordset after closing: keep calling next() until it returns null. close()
+         * stops further retry rounds, but node readers already running finish their current
+         * partitions (the underlying crate cannot stop them), so the drain keeps returning
+         * those records and ends only once every reader has exited — bound the amount with
+         * setMaxRecords() when paginating. The cursor is then written back into the
          * originating PartitionFilter, so the next scan resumes exactly after the consumed
          * records. Abandoning the recordset right after close() leaves the cursor at the
          * previous page boundary (already-seen records are returned again on resume).
@@ -6202,6 +6239,20 @@ namespace Aerospike {
          */
         public function setRecordsPerSecond(int $records_per_second): void {}
 
+        /**
+         * Replica algorithm used to pick which node serves each partition. Defaults to
+         * `Replica::sequence()`; use `Replica::preferRack()` to keep reads on the client's rack.
+         *
+         * @return \Aerospike\Replica
+         */
+        public function getReplica(): \Aerospike\Replica {}
+
+        /**
+         * @param mixed $replica
+         * @return void
+         */
+        public function setReplica(mixed $replica): void {}
+
         public function __construct() {}
 
         /**
@@ -6558,6 +6609,13 @@ namespace Aerospike {
         public static function list(array $val): mixed {}
 
         /**
+         * Map value for a bin. Takes an array with at least one non-sequential key.
+         *
+         * The result is a plain PHP array, and a PHP array whose keys are exactly 0..N-1 —
+         * including `[]` — is indistinguishable from a list: used as a bin value it is stored
+         * as a list. Such input therefore throws an AerospikeException; use `MapOp::put()`
+         * (which does accept them) to write list-shaped or empty maps.
+         *
          * @param mixed $val
          * @return mixed
          */
@@ -6791,11 +6849,13 @@ namespace Aerospike {
     }
 
     /**
-     * Replica determines which node a single-record or batch command targets.
+     * Replica determines which node serves a read.
      *
-     * Only single-record and batch commands honour this — scans and queries always visit
-     * every node. PreferRack additionally requires ClientPolicy::setRackIds() and matching
-     * server rack configuration; without them it behaves like Sequence.
+     * Settable on ReadPolicy and BatchPolicy (the node a single-record or batch command
+     * targets) and on QueryPolicy/ScanPolicy (which copy of each partition a scan or query
+     * reads — every partition is still visited once). Writes are not affected. PreferRack
+     * additionally requires ClientPolicy::setRackIds() and matching server rack
+     * configuration; without them it behaves like Sequence.
      */
     class Replica {
         public function __construct() {}

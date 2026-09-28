@@ -209,6 +209,44 @@ class ScanTest extends TestCase
         );
     }
 
+    /**
+     * Regression: close() + drain with the readers still streaming.
+     *
+     * With a one-slot queue the node readers are always mid-stream when close() lands.
+     * `next()` used to report end-of-stream as soon as the queue was momentarily empty
+     * and then read the cursor while a reader still ran: either the cursor wait timed
+     * out and the page was not advanced at all (every record of the page came back again
+     * on resume), or it was extracted under the reader's feet — counting records pushed
+     * after the caller's last `next()` (skipped on resume) and making the reader panic on
+     * the taken filter. The drain now ends only once every reader has exited.
+     */
+    public function testScanPaginateWithEarlyCloseWhileReadersStream()
+    {
+        $pf = PartitionFilter::all();
+        $sp = new ScanPolicy();
+        $sp->setMaxRecords(25);
+        $sp->setRecordQueueSize(1);
+
+        $seen = [];
+        for ($page = 0; $page < self::$keyCount + 5; $page++) {
+            $rs = self::$client->scan($sp, $pf, self::$namespace, self::$set);
+            $thisPage = 0;
+            while ($rec = $rs->next()) {
+                $digest = $rec->getKey()->getDigest();
+                $this->assertArrayNotHasKey($digest, $seen, "record returned twice on page $page");
+                $seen[$digest] = true;
+                if (++$thisPage === 2) {
+                    $rs->close();
+                }
+            }
+            if ($thisPage === 0) {
+                break;
+            }
+        }
+
+        $this->assertCount(self::$keyCount, $seen, "every record exactly once across close()+drain pages");
+    }
+
     public function testScanAllPartitionsOneByOne()
     {
         $pf = PartitionFilter::all();

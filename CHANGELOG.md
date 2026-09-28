@@ -7,8 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **`Replica` policy class**: `Replica::master()`, `Replica::sequence()` (default) and
-  `Replica::preferRack()`, settable on `ReadPolicy` and `BatchPolicy` via
-  `setReplica()`/`getReplica()`. Rack-aware deployments could not select `PreferRack` before.
+  `Replica::preferRack()`, settable on `ReadPolicy`, `BatchPolicy`, `QueryPolicy` and
+  `ScanPolicy` via `setReplica()`/`getReplica()` (for scans/queries it picks which copy of
+  each partition is read). Rack-aware deployments could not select `PreferRack` before.
 - **`RegexFlag` constants** for `Expression::regexCompare()` — `none`, `extended`, `icase`,
   `nosub`, `newline`, combined with the bitwise OR operator. Previously callers had to pass
   magic numbers.
@@ -29,7 +30,10 @@ All notable changes to this project will be documented in this file.
 - **`Client::serverVersion(?ReadPolicy $policy)`** now honours the caller's timeout instead
   of pinning the 3s admin default.
 - **`HllPolicy` and `BitwisePolicy` accept an array of flags**, so combinations such as
-  `ALLOW_FOLD | NO_FAIL` are expressible (they take a single flag no longer).
+  `ALLOW_FOLD | NO_FAIL` are expressible. A single flag object is still accepted.
+- **Optional `$waitTimeoutMs` on `createIndex()`, `dropIndex()`, `registerUdf()` and
+  `dropUdf()`**: bounds the wait for the server-side task (`null`/`0`, the default, waits
+  until it completes). The policy's `total_timeout` applies to the command itself only.
 
 - **`Client::close()` re-introduced**: closes the pooled connection (stopping its connection
   pool and background cluster-tend task) and evicts it from the per-process client cache.
@@ -66,8 +70,22 @@ All notable changes to this project will be documented in this file.
 - **`Recordset::next()` burned a full CPU core** for the duration of a scan — the crate's
   iterator "yields" via a `block_on(yield_now())` that spins outside a scheduler context.
   Replaced with a bounded backoff; buffered records now also survive `close()`.
-- **The pagination cursor was extracted while reader tasks were still writing**, truncating
-  it and panicking those tasks; it is now read only after they finish.
+- **The pagination cursor was extracted while reader tasks were still writing**: after
+  `close()`, `next()` reported end-of-stream as soon as the queue was momentarily empty,
+  although the readers keep streaming their current partitions. The cursor then either
+  counted records the caller never received (skipped on resume) or, when a reader was
+  parked on a full queue, was not advanced at all (the page repeated) — and extracting it
+  under a live reader made that reader panic. `next()` now ends the stream only once every
+  reader has exited, so `close()` + drain returns their remaining records and the cursor is
+  exact.
+- **Out-of-range setters** (`setTotalTimeout()`, `setSocketTimeout()`,
+  `setSleepBetweenRetries()`, `setTimeoutDelay()`, `setReadTouchTtlPercent()`) threw *and*
+  reset the field to its zero/default value; the policy is now left unchanged.
+- **Write-flag arguments of the wrong type were silently ignored**: `ListPolicy`,
+  `MapPolicy`, `HllPolicy` and `BitwisePolicy` took `?array $flags`, and ext-php-rs turns a
+  mistyped nullable argument into `null` without an error — so `new MapPolicy($order,
+  MapWriteFlags::updateOnly())` ran with default flags. All four now take a single flag or
+  an array of flags, and throw on anything else.
 - **`createIndex()` silently ignored `ctx`**, creating a CDT index on the top-level bin, so
   later queries with a matching `Filter` context returned nothing.
 - **`MapOp::create()` silently dropped `ctx`** when `withIndex` was set, retyping the
@@ -75,18 +93,21 @@ All notable changes to this project will be documented in this file.
   combination rather than doing something else.
 - **Numeric-string map keys (`"1"`) produced unreachable PHP array entries** — neither
   `$m["1"]` nor `$m[1]` found them. Same for bin names like `"0"`.
-- **`MapOp::put()`, `Value::map()` and `Expression::mapVal()` rejected valid maps**: an empty
-  array and an array keyed `0..N-1` are both legal Aerospike maps. `mapVal()` also returned
-  PHP `null` on bad input, surfacing as a TypeError far from the cause.
+- **`MapOp::put()` and `Expression::mapVal()` rejected valid maps**: an empty array and an
+  array keyed `0..N-1` are both legal Aerospike maps. `mapVal()` also returned PHP `null` on
+  bad input, surfacing as a TypeError far from the cause. `Value::map()` keeps rejecting such
+  arrays — its result is a plain PHP array, which a bin would store as a *list* — but now
+  says so and points at `MapOp::put()`.
 - **Reading a float32 written by another client panicked** (Go/Java/C write msgpack float32
   into lists and maps), making such records unreadable — and unrecoverable inside a scan,
   where the panic fired in a background task.
 - **PHP references inside arrays were rejected** as "unsupported value type", breaking the
   ordinary `foreach ($data as &$v)` idiom.
-- **Non-UTF-8 strings** now report what is wrong and point at `Value::blob()`.
+- **Non-UTF-8 strings** now report what is wrong and point at `Value::blob()` — as the
+  exception itself, not buried under a generic "Invalid input for argument" one.
 - **Index and UDF task waits could hang forever**: `wait_till_complete` polled without a
-  deadline, so `setTotalTimeout()` had no effect on `createIndex`/`dropIndex`/`registerUdf`/
-  `dropUdf`.
+  deadline. The new `$waitTimeoutMs` argument bounds it. (It is deliberately not derived from
+  `total_timeout`, whose 1000 ms default would abort any index build longer than a second.)
 - **`ini_set()` on an `aerospike.*` directive leaked across threads in ZTS builds**; values
   are per-thread now.
 - **The Tokio runtime outlived `dlclose()`**: MSHUTDOWN now shuts it down, instead of leaving
@@ -100,11 +121,24 @@ All notable changes to this project will be documented in this file.
 - **`ClientPolicy::fingerprint()` is no longer exposed to PHP**: it is an internal cache key,
   and its value was an unsalted SipHash of the password. The password component is now keyed
   per-process.
-- **`dropUdf()` accepts what `listUdf()` returns** — a bare module name gets the `.lua`
-  suffix instead of failing with "file not found".
+- **`dropUdf()` accepts what `listUdf()` returns** — a module name without the `.lua`
+  suffix gets it (including names that contain dots) instead of failing with "file not
+  found".
 - **`new PartitionStatus($id)` validates the id** rather than truncating it to 16 bits
   (65537 silently became partition 1).
 - **`ResultCode::XDR_KEY_BUSY` (32)** was missing, so that code could not be compared against.
+- **Packages installed the extension into the wrong PHP**: the deb/rpm maintainer scripts
+  drove whatever `php` was first on `PATH` — and installed the distro-default PHP when there
+  was none — although the extension only loads under the PHP minor it was built for. They
+  now use exactly that PHP (`php8.3` on Debian/Ubuntu), refuse any other minor version, and
+  never install PHP themselves; the packages depend on its CLI (`php8.3-cli`,
+  `/usr/bin/php`).
+- **Upgrading from a v1 rpm deleted the new extension**: the v1 `%postun` removes
+  `%{_libdir}/libaerospike_php.so` unconditionally and runs after the new package's `%post`.
+  The rpm payload now lives in `/usr/libexec/aerospike-php-client/`.
+- **Package removal could truncate `php.ini`**: `prerm` rewrote it in place and ignored
+  write errors. It now keeps a backup, restores it on failure and leaves `php.ini` untouched
+  when any earlier step fails.
 
 - **Fork safety**: the Tokio runtime and the client cache now detect `fork()` (pid change)
   and rebuild themselves in the child process. Previously a connection opened before fork —

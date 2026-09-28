@@ -13,9 +13,13 @@
 %global php_ver %{?PHP_VERSION}%{!?PHP_VERSION:8.3}
 %global php_ver_next %(echo %{php_ver} | awk -F. '{print $1"."$2+1}')
 
-# Package-private helper directory. The maintainer scripts used to be installed
-# as %%{_libdir}/postinst — a generic name in a directory shared with every other
-# package on the system.
+# Package-private directory for the payload and the maintainer scripts. The scripts
+# used to be installed as %%{_libdir}/postinst — a generic name in a directory shared
+# with every other package. The .so lives here too, not in %%{_libdir}: the v1 packages'
+# %%postun deletes %%{_libdir}/libaerospike_php.so unconditionally, and on an upgrade
+# that old scriptlet runs *after* this package's %%post — it would delete the file this
+# package had just installed. (The copy PHP loads is the one %%post places in PHP's
+# extension_dir.) pkg/scripts/generate-postinst.sh hardcodes the same path.
 %global helperdir %{_libexecdir}/aerospike-php-client
 
 Name: aerospike-php-client
@@ -29,6 +33,9 @@ Source0: aerospike-php-client-%{?VERSION}.tar.gz
 
 Requires: php(language) >= %{php_ver}
 Requires: php(language) < %{php_ver_next}
+# %%post drives the PHP CLI to locate extension_dir and php.ini; php(language) alone
+# can be satisfied by php-common without it.
+Requires: /usr/bin/php
 
 %description
 The Aerospike PHP client library enables PHP applications to interact with
@@ -45,16 +52,18 @@ This build targets PHP %{php_ver}.
 
 %install
 rm -rf $RPM_BUILD_ROOT
-mkdir -p $RPM_BUILD_ROOT%{_libdir}
 mkdir -p $RPM_BUILD_ROOT%{helperdir}
 
-install -m 755 libaerospike_php.so $RPM_BUILD_ROOT%{_libdir}/libaerospike_php.so
+# The maintainer scripts check that they drive exactly the PHP minor this build targets.
+sed -i "s/@PHP_VERSION@/%{php_ver}/g" postinst prerm
+
+install -m 755 libaerospike_php.so $RPM_BUILD_ROOT%{helperdir}/libaerospike_php.so
 install -m 755 postinst $RPM_BUILD_ROOT%{helperdir}/postinst
 install -m 755 prerm $RPM_BUILD_ROOT%{helperdir}/prerm
 
 %files
-%{_libdir}/libaerospike_php.so
 %dir %{helperdir}
+%{helperdir}/libaerospike_php.so
 %{helperdir}/postinst
 %{helperdir}/prerm
 

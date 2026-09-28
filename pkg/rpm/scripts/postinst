@@ -13,24 +13,36 @@ log_error_and_exit() {
     exit 1
 }
 
-# Ensure PHP 8 is installed
-if ! command -v php > /dev/null; then
-    echo "PHP not found. Installing default PHP 8..."
-    if command -v dnf > /dev/null; then
-        dnf install -y php php-fpm || log_error_and_exit "Failed to install PHP."
-    else
-        yum install -y php php-fpm || log_error_and_exit "Failed to install PHP."
+# PHP minor release this package was built for, substituted at package build time.
+# The extension only loads under exactly this minor version.
+PHP_VERSION="@PHP_VERSION@"
+case "$PHP_VERSION" in
+    *@*) PHP_VERSION="" ;; # not substituted: a hand-built package, no pinned version
+esac
+PHP_BIN="php"
+
+# The package depends on this PHP's CLI, so it must be present. Never install a PHP
+# from here: the distro default may be a different minor version, and the extension
+# cannot load under it.
+if ! command -v "$PHP_BIN" > /dev/null; then
+    log_error_and_exit "$PHP_BIN not found; this package needs the PHP ${PHP_VERSION:-8.x} CLI."
+fi
+
+if [[ -n "$PHP_VERSION" ]]; then
+    PHP_ACTUAL=$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;') \
+        || log_error_and_exit "Failed to run $PHP_BIN."
+    if [[ "$PHP_ACTUAL" != "$PHP_VERSION" ]]; then
+        log_error_and_exit "$PHP_BIN is PHP $PHP_ACTUAL, but this package was built for PHP $PHP_VERSION and cannot load under another minor version."
     fi
 fi
 
-EXT_DIR=$(php -r 'echo ini_get("extension_dir");') \
+EXT_DIR=$("$PHP_BIN" -r 'echo ini_get("extension_dir");') \
     || log_error_and_exit "Failed to determine PHP extension directory."
 
-PHP_INI_PATH=$(php -r 'echo php_ini_loaded_file();') \
+PHP_INI_PATH=$("$PHP_BIN" -r 'echo php_ini_loaded_file();') \
     || log_error_and_exit "Failed to determine PHP INI file."
 
-SO_FILE_PATH="/usr/lib64/libaerospike_php.so"
-[ -f "$SO_FILE_PATH" ] || SO_FILE_PATH="/usr/lib/libaerospike_php.so"
+SO_FILE_PATH="/usr/libexec/aerospike-php-client/libaerospike_php.so"
 
 if [[ ! -f "$SO_FILE_PATH" ]]; then
     log_error_and_exit "Aerospike PHP extension not found at $SO_FILE_PATH."

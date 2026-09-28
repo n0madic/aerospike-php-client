@@ -118,6 +118,26 @@ end';
         });
     }
 
+    // Regression test: dropUdf() used to add ".lua" only to names without any dot, so the
+    // package name listUdf() reports for "a.b.lua" ("a.b") failed with "file not found".
+    public function testDropUdfByDottedPackageName(){
+        $package = "phpunit.dotted." . self::randomString(8);
+        $wp = new WritePolicy();
+        self::$client->registerUdf($wp, self::$udfBody, "$package.lua", UdfLanguage::lua(), 60000);
+        $this->assertContains("$package.lua", self::listUdfFilenames());
+
+        $rp = new ReadPolicy();
+        $mine = array_values(array_filter(
+            self::$client->listUdf($rp),
+            fn (UdfMeta $u) => $u->getFilename() === "$package.lua"
+        ));
+        $this->assertCount(1, $mine);
+        $this->assertSame($package, $mine[0]->getPackageName());
+
+        self::$client->dropUdf($wp, $mine[0]->getPackageName(), 60000);
+        $this->assertNotContains("$package.lua", self::listUdfFilenames());
+    }
+
     public function testDropUdf(){
         $package = "phpunit_udf_" . self::randomString(8);
         $wp = new WritePolicy();

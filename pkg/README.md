@@ -29,10 +29,11 @@ Starting with v2.0.0 the package no longer ships the Go-based
 
 All four scripts under `pkg/deb/scripts/` and `pkg/rpm/scripts/` are generated
 files. The two `postinst` variants carry identical extension-enabling logic and
-differ only in the PHP install command (apt vs dnf/yum) and the `.so` search
-path (`/usr/lib` vs `/usr/lib64`); the two `prerm` variants carry identical
-cleanup logic and differ only in the upgrade guard (dpkg passes an action name,
-rpm passes the number of remaining instances). Edit the shared logic in
+differ only in the PHP binary they drive (`php<phpver>` vs `php`) and the `.so`
+path (`/usr/lib` vs `/usr/libexec/aerospike-php-client`); the two `prerm`
+variants carry identical cleanup logic and differ in the same PHP binary and the
+upgrade guard (dpkg passes an action name, rpm passes the number of remaining
+instances). Edit the shared logic in
 `pkg/scripts/postinst-common.sh` / `pkg/scripts/prerm-common.sh` and the
 per-format bits in `pkg/scripts/generate-postinst.sh`, then regenerate and
 commit the output:
@@ -43,6 +44,13 @@ bash pkg/scripts/generate-postinst.sh
 
 Do not hand-edit the generated files directly — the next regeneration would
 silently discard the change.
+
+The generated scripts keep an `@PHP_VERSION@` placeholder: the PHP minor is only
+known when a package is built. `build.yml` substitutes it for the deb, the spec's
+`%install` for the rpm. Both hooks then drive exactly that PHP — `postinst` refuses
+to run against any other minor version and never installs PHP itself (the distro
+default may be a different minor, which cannot load the extension). A hand-built
+package without the substitution falls back to the `php` on `PATH`.
 
 ### Install / removal symmetry
 
@@ -82,9 +90,15 @@ The *package* name inside the archives stays `aerospike-php-client` (unversioned
 so `apt`/`dnf` treat a newer release as an upgrade rather than a second package,
 see below);
 `<version>` and `php<phpver>` appear in the file name only. The PHP minor is also
-recorded in the package metadata: `Depends: php<phpver>-cli | …` for the deb,
-`Requires: php(language) >= <phpver>` (and `< <phpver+1>`) plus the
-`1.php<phpver>` release tag for the rpm.
+recorded in the package metadata: `Depends: php<phpver>-cli` for the deb,
+`Requires: php(language) >= <phpver>` (and `< <phpver+1>`), `Requires: /usr/bin/php`
+plus the `1.php<phpver>` release tag for the rpm. The CLI is required because the
+maintainer scripts ask it for `extension_dir` and the loaded `php.ini`.
+
+The rpm installs its payload under `/usr/libexec/aerospike-php-client/`, not
+`%{_libdir}`: the v1 rpm's `%postun` deletes `%{_libdir}/libaerospike_php.so`
+unconditionally, and on an upgrade that old scriptlet runs after the new
+package's `%post`.
 
 ### Upgrading from the v1 packages (deb only)
 

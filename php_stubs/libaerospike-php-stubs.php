@@ -5629,17 +5629,22 @@ namespace Aerospike {
         public function __construct() {}
 
         /**
-         * Close the recordset. Background tasks finish at their next safe point.
+         * Close the recordset.
          *
-         * To stop a paginated scan/query early AND keep the pagination cursor, drain the
-         * recordset after closing: keep calling next() until it returns null. close()
-         * stops further retry rounds, but node readers already running finish their current
-         * partitions (the underlying crate cannot stop them), so the drain keeps returning
-         * those records and ends only once every reader has exited — bound the amount with
-         * setMaxRecords() when paginating. The cursor is then written back into the
-         * originating PartitionFilter, so the next scan resumes exactly after the consumed
-         * records. Abandoning the recordset right after close() leaves the cursor at the
-         * previous page boundary (already-seen records are returned again on resume).
+         * close() stops further retry rounds, but node readers already running finish their
+         * current partitions (the underlying crate cannot stop them). What happens next
+         * depends on whether the stream is bounded:
+         *
+         * - Unbounded (maxRecords 0): the stream ends here and next() returns null; the
+         *   rest is drained in the background. The cursor in the originating
+         *   PartitionFilter is left unchanged, so a later scan with it starts over from the
+         *   previous page boundary.
+         * - Bounded (setMaxRecords()): to stop a page early AND keep the pagination cursor,
+         *   drain after closing — keep calling next() until it returns null. The drain
+         *   returns what the readers still deliver (at most the page) and ends once every
+         *   reader has exited; the cursor is then written back, so the next scan resumes
+         *   exactly after the consumed records. Abandoning the recordset right after
+         *   close() leaves the cursor at the previous page boundary.
          *
          * @return void
          */

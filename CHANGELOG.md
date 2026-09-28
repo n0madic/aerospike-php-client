@@ -76,8 +76,11 @@ All notable changes to this project will be documented in this file.
   counted records the caller never received (skipped on resume) or, when a reader was
   parked on a full queue, was not advanced at all (the page repeated) — and extracting it
   under a live reader made that reader panic. `next()` now ends the stream only once every
-  reader has exited, so `close()` + drain returns their remaining records and the cursor is
-  exact.
+  reader has exited, so `close()` + drain of a bounded (`setMaxRecords()`) page returns
+  their remaining records and the cursor is exact. On an unbounded scan/query the readers
+  would stream everything that is left, so there `close()` ends the stream at once
+  (`next()` returns `null`, the rest is drained in the background) and leaves the cursor
+  unchanged.
 - **Out-of-range setters** (`setTotalTimeout()`, `setSocketTimeout()`,
   `setSleepBetweenRetries()`, `setTimeoutDelay()`, `setReadTouchTtlPercent()`) threw *and*
   reset the field to its zero/default value; the policy is now left unchanged.

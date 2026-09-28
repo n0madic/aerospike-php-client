@@ -247,6 +247,41 @@ class ScanTest extends TestCase
         $this->assertCount(self::$keyCount, $seen, "every record exactly once across close()+drain pages");
     }
 
+    /**
+     * Regression: close() inside the loop did not stop an unbounded scan.
+     *
+     * `next()` ends the stream only once every node reader has exited, and close() cannot
+     * stop the readers — so on a scan without maxRecords the loop kept going through every
+     * remaining record. close() now ends an unbounded stream at once and leaves the cursor
+     * where it was, so a later scan with the same filter still returns everything.
+     */
+    public function testUnboundedScanStopsAtClose()
+    {
+        $pf = PartitionFilter::all();
+        $sp = new ScanPolicy();
+        // One slot keeps the readers mid-stream when close() lands.
+        $sp->setRecordQueueSize(1);
+
+        $rs = self::$client->scan($sp, $pf, self::$namespace, self::$set);
+        $closeAfter = 10;
+        $seen = 0;
+        while ($rec = $rs->next()) {
+            if (++$seen === $closeAfter) {
+                $rs->close();
+            }
+        }
+        $this->assertSame($closeAfter, $seen, "next() must return null right after close()");
+        $this->assertFalse($rs->getActive());
+        $this->assertNull($rs->next(), "a closed recordset stays exhausted");
+
+        $rs = self::$client->scan(new ScanPolicy(), $pf, self::$namespace, self::$set);
+        $all = 0;
+        while ($rs->next()) {
+            $all++;
+        }
+        $this->assertSame(self::$keyCount, $all, "the cursor must not advance past an early close()");
+    }
+
     public function testScanAllPartitionsOneByOne()
     {
         $pf = PartitionFilter::all();

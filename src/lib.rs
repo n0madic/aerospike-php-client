@@ -3296,10 +3296,13 @@ impl_from_zval_wrapper!(clone PartitionFilter);
 #[php(name = "Aerospike\\Recordset")]
 #[derive(Default)]
 pub struct Recordset {
-    /// `None` only when this Recordset is a sentinel default returned together with a
-    /// pending `AerospikeException` from `scan()`/`query()`. PHP never observes such a
-    /// sentinel because the pending exception takes precedence.
+    /// `None` when this Recordset is a sentinel default returned together with a pending
+    /// `AerospikeException` from `scan()`/`query()` (PHP never observes it: the pending
+    /// exception takes precedence), or after `close()` detached an unbounded stream.
     _as: Option<Arc<aero::Recordset>>,
+    /// The policy's `max_records` (0 = unbounded). Decides what `close()` does with
+    /// readers that are still streaming — see there.
+    max_records: u64,
     /// Original PHP `PartitionFilter` Arc. When the stream is exhausted, we extract the
     /// updated cursor from `aero::Recordset` and write it back here so the user's PHP
     /// `$pf` reflects progress and subsequent scans can resume.
@@ -3361,8 +3364,8 @@ fn recordset_readers_finished(rs: &Arc<aero::Recordset>) -> bool {
 /// the rest of the scan, and a script that abandons recordsets in a loop (paginating with
 /// `maxRecords(1)`, say) would otherwise pay that cost on every destructor.
 ///
-/// Takes the caller's *only* reference (see `recordset_readers_finished`) — only `Drop`
-/// calls this, after taking the PHP object's `Arc`. `RECORDSET_DRAIN_TIMEOUT` keeps the
+/// Takes the caller's *only* reference (see `recordset_readers_finished`): `Drop` and
+/// `close()` call this after taking the PHP object's `Arc` out of it. `RECORDSET_DRAIN_TIMEOUT` keeps the
 /// task from becoming immortal if a node stops responding; giving up leaks exactly what
 /// the old code always leaked.
 fn drain_recordset(rs: Arc<aero::Recordset>) {
@@ -3410,23 +3413,35 @@ impl Drop for Recordset {
 
 #[php_impl]
 impl Recordset {
-    /// Close the recordset. Background tasks finish at their next safe point.
+    /// Close the recordset.
     ///
-    /// To stop a paginated scan/query early *and* keep the pagination cursor, drain the
-    /// recordset after closing: keep calling `next()` until it returns `null`. `close()`
-    /// stops further retry rounds, but the node readers already running finish their
-    /// current partitions (the crate gives them no way to stop), so the drain keeps
-    /// returning those records and only ends once every reader has exited — bound the
-    /// amount with `setMaxRecords()` when paginating. The cursor is then written back
-    /// into the originating `PartitionFilter`, so the next scan resumes exactly after the
-    /// consumed records. Abandoning the recordset right after `close()` leaves the
-    /// cursor at the previous page boundary (already-seen records are returned again on
-    /// resume). The cursor is deliberately NOT extracted here: the upstream tracker
-    /// records *delivered* records, not consumed ones, so syncing at close time would
-    /// silently skip everything still sitting in the buffer.
+    /// `close()` stops further retry rounds, but node readers that are already running
+    /// finish their current partitions — the crate gives them no way to stop. What
+    /// happens next depends on whether the stream is bounded:
+    ///
+    /// - Unbounded (`maxRecords` 0): the stream ends here and `next()` returns `null`.
+    ///   Waiting for the readers would mean streaming every remaining record of the scan,
+    ///   so the recordset is detached and drained in the background instead. The cursor in
+    ///   the originating `PartitionFilter` is left unchanged: it cannot be extracted while
+    ///   a reader still runs, so a later scan with it starts over from the previous page
+    ///   boundary.
+    /// - Bounded (`setMaxRecords()`): to stop a page early *and* keep the pagination
+    ///   cursor, drain after closing — keep calling `next()` until it returns `null`. The
+    ///   drain returns what the readers still deliver (at most the page) and ends once
+    ///   every reader has exited. The cursor is then written back, so the next scan resumes
+    ///   exactly after the consumed records. Abandoning the recordset right after `close()`
+    ///   leaves the cursor at the previous page boundary.
+    ///
+    /// The cursor is deliberately NOT extracted here: the upstream tracker records
+    /// *delivered* records, not consumed ones, so syncing at close time would silently
+    /// skip everything still sitting in the buffer.
     pub fn close(&mut self) {
-        if let Some(rs) = self._as.as_ref() {
-            rs.close();
+        let Some(rs) = self._as.as_ref() else { return };
+        rs.close();
+        if self.max_records == 0 && !recordset_readers_finished(rs) {
+            if let Some(rs) = self._as.take() {
+                drain_recordset(rs);
+            }
         }
     }
 
@@ -8504,6 +8519,7 @@ impl Client {
         match rt_call(|| self.client.query(&policy._as, pf, stmt))? {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
+                max_records: policy._as.max_records,
                 partition_filter: Some(pf_arc),
                 pf_synced: false,
                 _client: Some(self.client.clone()),
@@ -8529,6 +8545,7 @@ impl Client {
         match rt_call(|| self.client.query(&policy._as, pf, stmt))? {
             Ok(arc_rs) => Ok(Recordset {
                 _as: Some(arc_rs),
+                max_records: policy._as.max_records,
                 partition_filter: Some(pf_arc),
                 pf_synced: false,
                 _client: Some(self.client.clone()),

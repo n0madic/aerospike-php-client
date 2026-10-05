@@ -7,11 +7,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [
-          # x86_64 — `macos-14-large` is a paid GitHub Actions runner. Re-enable
+          # x86_64 — `macos-15-large` is a paid GitHub Actions runner. Re-enable
           # once billing is configured.
-          # macos-14-large,
+          # macos-15-large,
           # ARM64 (free)
-          macos-14
+          macos-15
         ]
         php-version: [
           '8.1',
